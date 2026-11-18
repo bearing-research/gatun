@@ -46,7 +46,7 @@ On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which
 
 ### Protocol Handshake
 Format: `[4 bytes: version][4 bytes: arena_epoch][8 bytes: memory size][2 bytes: shm_path_len][N bytes: shm_path]`
-- Protocol version (currently 2) is verified on connect
+- Protocol version (currently 3) is verified on connect
 - Version mismatch raises RuntimeError with upgrade instructions
 - SHM path is the per-client shared memory file path (e.g., `/tmp/gatun.sock.1.shm`)
 
@@ -109,7 +109,8 @@ The shadow JAR relocates Netty (`gatun.shaded.io.netty`) so it can coexist with 
 - Java 22+ required. 22 is the first release where the Foreign Function & Memory API (`java.lang.foreign`, used to map the shared memory) is final; on 21 it needed `--enable-preview`. The Gradle toolchain and `--release` are pinned to 22 so the JAR runs on 22 and later, and CI runs on 22 to exercise that floor. Do not raise it casually.
 - Python 3.13+ required (3.14 also supported)
 - Arrow memory requires JVM flags: `--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED`
-- Python client uses `weakref.finalize` for automatic Java object cleanup
+- Python client uses `weakref.finalize` for automatic Java object cleanup. The finalizer only queues the object ID (`GatunClient._queue_free`); the queue is sent as chunked `FreeObject` commands just before the next request, because a finalizer can fire in the middle of another exchange. Never send on the socket from a finalizer. An explicit `client.free_object(id)` is sent immediately.
+- `_build_value` must not make Java calls: the outer command is half-built in a pooled builder and the channel carries one request at a time. Values that need a Java-side object are encoded on the wire instead (see `TemporalVal` for `datetime` / `date` / `time`).
 - Socket path: Generated randomly in `/tmp/gatun_<pid>_<random>.sock` by default
 - Use `T | None` syntax instead of `Optional[T]`
 - No fallback imports (e.g., no `tomli` for older Python)
@@ -562,6 +563,7 @@ print(Array.get(java_array, 0))  # "modified"
 - `JavaArray` -> Java primitive arrays (`int[]`, `double[]`, etc.)
 - `pyarrow.Array` -> Java arrays (int32->int[], int64->long[], float64->double[], bool->boolean[], string->String[])
 - `array.array` -> Java arrays (typecode 'i'->int[], 'q'->long[], 'd'->double[])
+- `datetime.datetime` / `date` / `time` -> `java.sql.Timestamp` / `Date` / `Time` (arguments only; returned values stay `JavaObject`s). Naive datetimes are local time.
 - Object references (returned as `JavaObject` wrappers, including Object arrays)
 - `null`/`None`
 

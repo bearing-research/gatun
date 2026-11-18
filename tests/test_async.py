@@ -412,6 +412,22 @@ class TestAsyncFieldOperations:
         assert result == "test"
 
 
+class TestAsyncDatetimeArguments:
+    """datetime values are encoded on the wire, as in the sync client."""
+
+    async def test_datetime_arguments(self, async_client):
+        import datetime
+
+        arr = await async_client.jvm.java.util.ArrayList()
+        await arr.add(datetime.date(2026, 1, 2))
+        await arr.add(datetime.time(1, 2, 3))
+        await arr.add(datetime.datetime(2026, 1, 2, 3, 4, 5, 123456))
+
+        assert (
+            await arr.toString() == "[2026-01-02, 01:02:03, 2026-01-02 03:04:05.123456]"
+        )
+
+
 class TestAsyncObjectLifecycle:
     """Test async object lifecycle methods."""
 
@@ -422,7 +438,7 @@ class TestAsyncObjectLifecycle:
         obj_id = arr.object_id
         # Free the object explicitly
         await async_client.free_object(obj_id)
-        # Double free should not raise (fire-and-forget)
+        # Double free should not raise (the server ignores unknown IDs)
         await async_client.free_object(obj_id)
 
     @pytest.mark.asyncio

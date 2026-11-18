@@ -58,7 +58,8 @@ union Value {
   MapVal,
   ArrayVal,
   CallbackRef,  // Reference to a Python callback function
-  CharVal       // Java char (single UTF-16 code unit)
+  CharVal,      // Java char (single UTF-16 code unit)
+  TemporalVal   // Date/time value, Python -> Java only
 }
 
 table StringVal { v:string; }
@@ -68,6 +69,15 @@ table BoolVal { v:bool; }
 table ObjectRef { id:long; }
 table NullVal {}
 table CharVal { v:ushort; }   // Java char is 16-bit unsigned
+
+// A Python datetime/date/time argument. The server turns it into the matching
+// java.sql type, so the client needs no extra round trips to build one.
+enum TemporalKind : byte {
+  Timestamp = 0,  // v = microseconds since the Unix epoch  -> java.sql.Timestamp
+  Date = 1,       // v = days since the Unix epoch          -> java.sql.Date
+  Time = 2        // v = seconds since midnight             -> java.sql.Time
+}
+table TemporalVal { kind:TemporalKind; v:long; }
 
 // Reference to a Python callback function
 // When Java invokes this, it triggers a callback request to Python

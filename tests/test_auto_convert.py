@@ -1,5 +1,9 @@
 """Tests for auto-convert between Java collections and Python list/dict."""
 
+import pytest
+
+from gatun import JavaArray
+
 
 def test_java_list_to_python_list(client):
     """Test that Java List returned from method is auto-converted to Python list."""
@@ -125,3 +129,43 @@ def test_map_with_list_values(client):
     assert isinstance(result, dict)
     assert result["name"] == "test"
     assert result["numbers"] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [[1, 2], [3, 4]],
+        [["a", "b"], ["c", "d"]],
+        [[1], [2], [3]],
+        [[], [1], []],
+        [[1, "a"], [2.5, True]],
+        [[[1, 2], [3]], [[4]]],
+        {"a": {"x": 1, "y": 5}, "b": 2},
+        {"a": {"x": 1}, "b": 2},
+        [{"k": [1, 2]}, {"k": [3]}],
+        {"outer": [[1, 2], [3]], "n": 1},
+    ],
+    ids=repr,
+)
+def test_nested_collection_argument_roundtrip(client, value):
+    """Nested lists/dicts passed as arguments arrive intact.
+
+    Regression: the server reused one FlatBuffers wrapper per container type
+    across recursion, so after converting the first inner collection the outer
+    loop kept reading from it ([[1, 2], [3, 4]] arrived as [[1, 2], 2]).
+    """
+    holder = client.jvm.java.util.ArrayList()
+    holder.add(value)
+    assert holder.get(0) == value
+
+
+def test_nested_array_argument(client):
+    """An Object[] whose elements are themselves arrays converts element by element."""
+    nested = JavaArray(
+        [
+            JavaArray([1, 2], element_type="Int"),
+            JavaArray([3, 4], element_type="Int"),
+        ],
+        element_type="Object",
+    )
+    assert client.jvm.java.util.Arrays.deepToString(nested) == "[[1, 2], [3, 4]]"
