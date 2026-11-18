@@ -777,18 +777,9 @@ export GATUN_LOG_LEVEL=FINE
 
 ## PySpark Integration
 
-Use Gatun as the JVM communication backend for PySpark:
+Gatun can load and drive Spark's JVM classes directly (pass the Spark JARs via `connect(classpath=...)`), and ships a `BridgeAdapter` abstraction designed as the contract between PySpark and a JVM backend. Stock PySpark releases talk to the JVM through Py4J and do not use Gatun; running PySpark itself on Gatun requires a PySpark build ported to the `BridgeAdapter` interface (see [docs/bridge_adapter_spec.md](docs/bridge_adapter_spec.md)).
 
-```bash
-# Enable Gatun backend
-export PYSPARK_USE_GATUN=true
-export GATUN_MEMORY=256MB
-
-# Run PySpark normally
-python my_spark_app.py
-```
-
-Or use the BridgeAdapter API directly:
+The BridgeAdapter API can be used directly:
 
 ```python
 from gatun.bridge_adapters import GatunAdapter
@@ -929,25 +920,24 @@ See [Arrow Memory Architecture](#arrow-memory-architecture) for details on the e
 ## Development
 
 ```bash
-cd python
 JAVA_HOME=/opt/homebrew/opt/openjdk uv sync  # Install deps and build JAR
 uv run pytest              # Run tests
 uv run ruff check .        # Lint
 uv run ruff format .       # Format
 ```
 
-The `uv sync` command automatically builds the Java JAR via the custom build backend.
+The `uv sync` command automatically builds the Java JAR via the custom build backend. It needs `flatc` (the FlatBuffers compiler) on `PATH` and a JDK 22+; `JAVA_HOME` is also used at runtime to find `java`.
 
 ### Project Structure
 
 ```
 gatun/
-├── python/
-│   └── src/gatun/         # Python client library
-│       ├── client.py      # Sync client
-│       ├── async_client.py# Async client
-│       ├── launcher.py    # Server process management
-│       └── bridge.py      # BridgeAdapter interface
+├── src/gatun/             # Python client library
+│   ├── client.py          # Sync client
+│   ├── async_client.py    # Async client
+│   ├── launcher.py        # Server process management
+│   └── bridge.py          # BridgeAdapter interface
+├── tests/                 # pytest suite (exercises the Java server too)
 ├── gatun-core/
 │   └── src/main/java/org/gatun/server/
 │       ├── GatunServer.java       # Main server

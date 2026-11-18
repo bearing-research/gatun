@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2025-01-17
+### Added
+- `classpath` argument to `connect()`, `aconnect()` and `launch_gateway()` for loading external JARs (e.g. Spark)
+- Spark integration tests (run when a Spark distribution is present in the repo root)
+- `client.arrow_context()` scoped context manager for Arrow transfers, with an async variant
+- `estimate_arrow_size()` and up-front size validation raising `PayloadTooLargeError`
+- Direction field on Arrow batch descriptors
+- Arrow memory architecture documentation
+
+### Fixed
+- `pytest` no longer collects tests from an extracted Spark distribution (`testpaths`)
+- `spotlessCheck` no longer fails on generated FlatBuffers code
+- CI now runs the Python 3.14 job on Python 3.14
+
+## [0.2.1] - 2026-01-17
+
+### Added
+- `ping()` health check method
+- Pre-commit hooks and workflow
+
+### Changed
+- Moved the Python project to the repository root
+
+## [0.2.0] - 2026-01-16
 
 ### Added
 - Initial public release on PyPI
@@ -27,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Stricter mypy type checking with explicit casts
 
-## [0.1.0] - 2025-01-15
+## [0.1.0] - 2026-01-15
 
 ### Added
 - Initial development release
@@ -35,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared memory communication with per-client SHM files
 - Basic object creation and method invocation
 
-[Unreleased]: https://github.com/forge-labs-dev/gatun/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/forge-labs-dev/gatun/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/forge-labs-dev/gatun/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/forge-labs-dev/gatun/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/forge-labs-dev/gatun/releases/tag/v0.1.0
