@@ -1,8 +1,8 @@
 namespace org.gatun.protocol;
 
-// Protocol version - increment when making breaking changes
-// This should be checked during handshake to ensure client/server compatibility
-// Current version: 1
+// Protocol version - increment when making breaking changes.
+// It is checked during the handshake to ensure client/server compatibility.
+// The current value lives in PROTOCOL_VERSION (GatunServer.java and client.py).
 
 enum Action : byte {
   Ping = 0,
