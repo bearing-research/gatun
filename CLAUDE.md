@@ -25,9 +25,24 @@ Gatun is a high-performance Python-to-Java bridge using shared memory (mmap) and
 7. On disconnect, server cleans up the client's shared memory file
 
 ### Memory Layout
-- Command zone: offset 0
-- Payload zone (Arrow data): offset 4096
-- Response zone: last 4KB of shared memory
+- Command zone: offset 0, 64KB
+- Payload zone (Arrow data): offset 65536 up to the response zone. Split in half: first half is Python -> Java, second half is Java -> Python
+- Response zone: last 64KB of shared memory
+
+These sizes are hardcoded on both sides and must stay in sync: `PAYLOAD_OFFSET` / `RESPONSE_ZONE_SIZE` in `GatunServer.java`, `COMMAND_ZONE_SIZE` / `RESPONSE_ZONE_SIZE` in `client.py`, and the literal `65536` offsets in the `connect()` paths of both `client.py` and `async_client.py`.
+
+### Where Changes Must Be Mirrored
+The protocol is implemented several times over, so a wire-level change usually touches all of these:
+- `schemas/commands.fbs` — add the `Action` / table / field
+- `GatunServer.handleClient` — top-level dispatch (an `if/else if` chain on `cmd.action()`)
+- `GatunServer.executeCommand` — a second, separate dispatch used only for sub-commands inside `Action.Batch`; an action missing here works standalone but fails in `client.batch()`
+- `src/gatun/client.py` — sync client, plus `BatchContext` if the action should be batchable
+- `src/gatun/async_client.py` — has its own copies of `_build_value` / `_unpack_value` / `_read_response` rather than sharing the sync ones, and implements only a subset of the sync API (no `batch`, `cancel`, `reflect`, static-field access, or `send_arrow_buffers` / `get_arrow_data`)
+- `PROTOCOL_VERSION` in both `GatunServer.java` and `client.py` for breaking changes
+
+Java-side responsibilities are split: `GatunServer` (dispatch, object/callback registries, allowlist, value packing), `MethodResolver` (overload scoring, varargs), `ReflectionCache` (class/method/field/handle caches), `ArrowMemoryHandler` (Arrow IPC + buffer-descriptor transfer, epoch checks), `ResourceLimits` + `SessionQuota` (per-session limits), `observability/` (logging, metrics, JFR).
+
+On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which asks the server (`Action.Reflect`) whether a dotted path is a class, method, or field and caches the answer in a process-global LRU. An `ALL_UPPERCASE` attribute on a capitalized parent is fetched eagerly as a static field.
 
 ### Protocol Handshake
 Format: `[4 bytes: version][4 bytes: arena_epoch][8 bytes: memory size][2 bytes: shm_path_len][N bytes: shm_path]`
@@ -47,7 +62,18 @@ uv run pytest tests/test_gatun_core.py::test_name  # Run single test
 uv run pytest --no-cov               # Run without coverage (faster)
 uv run ruff check .                  # Lint
 uv run ruff format .                 # Format
+uv run mypy src --config-file=pyproject.toml  # Type check (same as the pre-commit hook)
 ```
+
+Prerequisites: `flatc` on `PATH` (`brew install flatbuffers`) and a JDK 22+. `JAVA_HOME` matters twice — Gradle uses it at build time, and `launcher.py` runs `$JAVA_HOME/bin/java` (falling back to `java` on `PATH`) at test time.
+
+### Testing notes
+- There are no Java unit tests. All Java behavior is exercised through pytest against the packaged JAR in `src/gatun/jars/`, so after editing Java or the schema you must run `uv sync --reinstall-package gatun` before tests will see the change. A plain `uv sync` does not rebuild.
+- `tests/conftest.py` starts one server per pytest session on a fixed socket (`<tmpdir>/gatun_test.sock`, 64MB), so two pytest runs cannot overlap on one machine. The `client` fixture gives each test a fresh connection to it; `make_client` is a factory for tests that need several connections in sequence.
+- Tests that need non-default server settings (`test_resource_limits.py`, `test_observability.py`, `test_connect.py`) launch their own server via `connect(...)` instead of using the fixtures.
+- `tests/test_spark_integration.py` is skipped unless a Spark distribution is extracted at `spark-4.1.1-bin-hadoop3/` in the repo root (gitignored).
+- `tests/test_readme_examples.py` mirrors the README examples; keep the two in step.
+- `asyncio_mode = "auto"`: async tests need no marker.
 
 Coverage reports are generated automatically:
 - Terminal: shows missing lines after test run
@@ -59,6 +85,7 @@ Coverage reports are generated automatically:
 ./gradlew :gatun-core:build          # Build the Java server
 ./gradlew :gatun-core:shadowJar      # Build fat JAR (gatun-server-all.jar)
 ./gradlew :gatun-core:run            # Run the server directly
+./gradlew spotlessApply              # Format Java (google-java-format); spotlessCheck to verify
 ```
 
 ## Generated Code
@@ -67,11 +94,19 @@ FlatBuffers code is generated from `schemas/commands.fbs`:
 - Java: `gatun-core/src/main/java/org/gatun/protocol/`
 - Python: `src/gatun/generated/org/gatun/protocol/`
 
-The build backend (`gatun_build_backend.py`) automatically regenerates FlatBuffers code when the schema changes.
+Both directories are gitignored, as is the built JAR in `src/gatun/jars/` — never edit or commit them; a fresh clone has none of them until the first `uv sync`.
+
+`gatun_build_backend.py` is a PEP 517 backend wrapping setuptools. On every wheel/sdist/editable build it:
+1. Runs `flatc` if the schema is newer than the generated files (mtime comparison), then patches the output: Python imports are rewritten from `org.gatun.protocol.*` to `gatun.generated.org.gatun.protocol.*`, and the Java `ValidateVersion()` call is rewritten to `FLATBUFFERS_RUNTIME_VERSION`.
+2. Runs `./gradlew :gatun-core:shadowJar` if any file under `gatun-core/src` or `gatun-core/build.gradle.kts` is newer than the packaged JAR, and copies the result to `src/gatun/jars/gatun-server-all.jar`.
+
+`FLATBUFFERS_RUNTIME_VERSION` in the backend must match the `flatbuffers-java` version in `gatun-core/build.gradle.kts`; bump them together.
+
+The shadow JAR relocates Netty (`gatun.shaded.io.netty`) so it can coexist with Spark's Netty, and pins Jackson to Spark 4.x's version unshaded so the two share classes. Keep that in mind when changing Java dependencies.
 
 ## Key Implementation Details
 
-- Java 22+ required
+- Java 22+ required. 22 is the first release where the Foreign Function & Memory API (`java.lang.foreign`, used to map the shared memory) is final; on 21 it needed `--enable-preview`. The Gradle toolchain and `--release` are pinned to 22 so the JAR runs on 22 and later, and CI runs on 22 to exercise that floor. Do not raise it casually.
 - Python 3.13+ required (3.14 also supported)
 - Arrow memory requires JVM flags: `--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED`
 - Python client uses `weakref.finalize` for automatic Java object cleanup
@@ -544,12 +579,16 @@ Java exceptions are mapped to Python exceptions:
 - `java.lang.IndexOutOfBoundsException` -> `JavaIndexOutOfBoundsException`
 - `java.lang.NumberFormatException` -> `JavaNumberFormatException`
 - `java.lang.InterruptedException` -> `CancelledException`
-- Other exceptions -> `JavaRuntimeException`
+- `java.lang.RuntimeException` -> `JavaRuntimeException`
+- Anything else -> the base `JavaException`
 
 Python-side exceptions:
 - `ReentrancyError` - Raised when attempting nested Java calls from within a callback
 - `PayloadTooLargeError` - Raised when data exceeds shared memory capacity
 - `StaleArenaError` - Raised when using an arena after client reconnected
+- `CallbackTimeoutError` - Raised when a callback runs longer than the callback timeout
+- `SocketTimeoutError` / `ProtocolDesyncError` / `DeadConnectionError` - Transport failures; after a desync the client is marked dead and further calls raise `DeadConnectionError`
+- `UnsupportedArrowTypeError` - Raised when a table's schema contains an Arrow type the buffer-transfer path cannot handle (currently dictionary-encoded columns)
 
 ## Security
 
@@ -557,11 +596,18 @@ Python-side exceptions:
 Only these classes can be instantiated or used for static methods (hardcoded in GatunServer.java):
 - Collections: `java.util.ArrayList`, `LinkedList`, `HashMap`, `LinkedHashMap`, `TreeMap`, `HashSet`, `LinkedHashSet`, `TreeSet`, `Collections`, `Arrays`
 - Strings: `java.lang.String`, `StringBuilder`, `StringBuffer`
-- Primitives: `java.lang.Integer`, `Long`, `Double`, `Float`, `Boolean`, `Byte`, `Short`, `Math`
+- Primitives: `java.lang.Integer`, `Long`, `Double`, `Float`, `Boolean`, `Byte`, `Short`, `Character`, `Math`
+- System: `java.lang.System` (for setting system properties such as `spark.master`)
 - Reflection: `java.lang.Class`, `java.lang.reflect.Array` (for array operations)
-- Spark/Scala: Classes under `org.apache.spark.*` and `scala.*` prefixes are allowed
+- Date/time: `java.sql.Timestamp`, `Date`, `Time`
+- Prefixes: anything under `org.apache.spark.`, `org.apache.log4j.`, or `scala.`
 
 Attempting to use non-allowlisted classes (e.g., `Runtime`, `ProcessBuilder`) raises `SecurityException`.
+
+To use a new class in a test or feature, add it to `ALLOWED_CLASSES` / `ALLOWED_PREFIXES` in `GatunServer.java` and rebuild. The allowlist gates object creation and static method/field access.
+
+### Resource Limits
+Per-session limits (object count, string length, list entries, nesting depth, batch size, Arrow bytes, idle timeout) are defined in `ResourceLimits.java` as `gatun.limits.*` system properties read once at JVM start. Override them per server with `connect(extra_jvm_flags=["-Dgatun.limits.max_objects=5"])`; see `tests/test_resource_limits.py`.
 
 ### Session Isolation
 - Each client session gets its own shared memory file (per-client SHM)
@@ -657,13 +703,21 @@ Configure via `pyproject.toml`:
 [tool.gatun]
 memory = "64MB"
 socket_path = "/tmp/gatun.sock"  # Optional: fixed path instead of random
+jvm_flags = ["-Xmx512m"]         # Appended to the launcher's default flags
+connect_timeout = 5.0            # seconds
+startup_timeout = 5.0            # seconds to wait for the server socket
 ```
 
 Or environment variables:
 ```bash
 GATUN_MEMORY=64MB
 GATUN_SOCKET_PATH=/tmp/gatun.sock
+GATUN_CONNECT_TIMEOUT=5
+GATUN_STARTUP_TIMEOUT=5
+GATUN_DEBUG=true   # Stream Java server stdout/stderr instead of capturing it
 ```
+
+Precedence: function arguments > environment variables > `pyproject.toml` > defaults (memory defaults to `16MB`). The config is found by walking up from the current directory and is cached process-wide; call `reset_config()` in tests that change it.
 
 ## BridgeAdapter (PySpark Integration)
 
@@ -700,13 +754,7 @@ bridge.is_instance_of(obj, "java.util.List")  # True
 ```
 
 ### PySpark Usage
-To use Gatun with PySpark, set the environment variable before importing PySpark:
-```bash
-export PYSPARK_USE_GATUN=true
-export GATUN_MEMORY=256MB
-```
-
-Then use PySpark normally - it will use Gatun for JVM communication.
+Nothing in this repo or in stock PySpark switches PySpark over to Gatun; there is no `PYSPARK_USE_GATUN` switch. Running PySpark on Gatun needs a PySpark build ported to the `BridgeAdapter` interface (`docs/bridge_adapter_spec.md`). What this repo tests is driving Spark's JVM classes directly via `connect(classpath=<spark jars>)` (`tests/test_spark_integration.py`), which needs a JDK Spark supports: it passes on 22 and fails on 27.
 
 ## Logging
 
