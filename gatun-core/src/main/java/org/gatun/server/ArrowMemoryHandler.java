@@ -486,8 +486,8 @@ public class ArrowMemoryHandler {
    * @param root The VectorSchemaRoot containing the data to write
    * @param payloadShm Memory segment for the payload shared memory
    * @param pythonSchemaCache Set of schema hashes that Python has cached
-   * @param useFullZone If true, use the full zone [0, size) instead of just [size/2, size).
-   *     Only use this when you know Python's zone is not in use.
+   * @param useFullZone If true, use the full zone [0, size) instead of just [size/2, size). Only
+   *     use this when you know Python's zone is not in use.
    * @return ArrowWriteResult containing buffer descriptors and metadata
    */
   public ArrowWriteResult writeArrowBuffers(

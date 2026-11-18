@@ -64,9 +64,15 @@ gatun = ["jars/*.jar"]
 where = ["src"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--cov=gatun --cov-report=term-missing --cov-report=html"
+
+[tool.ruff]
+# Newer ruff also formats Python code blocks inside Markdown, which would flatten the
+# aligned comments in the README examples.
+extend-exclude = ["*.md"]
 
 [tool.mypy]
 python_version = "3.13"

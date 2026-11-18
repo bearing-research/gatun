@@ -239,18 +239,17 @@ public class GatunServer {
     // --- Register shutdown hook for cleanup ---
     Runtime.getRuntime()
         .addShutdownHook(
-            new Thread(
-                () -> {
-                  LOG.info("Shutting down...");
-                  threadPool.shutdownNow();
-                  allocator.close();
-                  try {
-                    Files.deleteIfExists(socketPath);
-                    // Note: Per-session SHM files are cleaned up when each session ends
-                  } catch (IOException e) {
-                    // Ignore cleanup errors on shutdown
-                  }
-                }));
+            new Thread(() -> {
+              LOG.info("Shutting down...");
+              threadPool.shutdownNow();
+              allocator.close();
+              try {
+                Files.deleteIfExists(socketPath);
+                // Note: Per-session SHM files are cleaned up when each session ends
+              } catch (IOException e) {
+                // Ignore cleanup errors on shutdown
+              }
+            }));
 
     // --- START SOCKET SERVER ---
     try (ServerSocketChannel serverChannel =

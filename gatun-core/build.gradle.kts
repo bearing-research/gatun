@@ -1,7 +1,7 @@
 plugins {
     `java-library`
     `application` // Adds the 'run' task
-    id("com.gradleup.shadow") version "9.3.0"
+    id("com.gradleup.shadow") version "9.6.1"
 }
 
 repositories {
@@ -16,6 +16,9 @@ java {
 
 dependencies {
     implementation("com.google.flatbuffers:flatbuffers-java:25.2.10")
+    // Held at 18.3.0: Arrow 19.0.0 depends on Jackson 2.21, which overrides the 2.20.1
+    // pin below and makes Spark 4.1 fail ("Scala module 2.20.0 requires Jackson
+    // Databind version >= 2.20.0 and < 2.21.0"). Revisit when the Spark target moves.
     implementation("org.apache.arrow:arrow-vector:18.3.0")
     implementation("org.apache.arrow:arrow-memory-netty:18.3.0")
 
