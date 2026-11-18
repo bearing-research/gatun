@@ -4,12 +4,11 @@ import pytest
 
 from gatun import (
     JavaException,
-    JavaSecurityException,
+    JavaIndexOutOfBoundsException,
     JavaNoSuchFieldException,
     JavaNumberFormatException,
-    JavaIndexOutOfBoundsException,
+    JavaSecurityException,
 )
-
 
 # Uses the shared `client` fixture from conftest.py
 

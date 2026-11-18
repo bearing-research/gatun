@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Test script to verify Spark classes can be loaded and used via Gatun.
 
 This script tests:

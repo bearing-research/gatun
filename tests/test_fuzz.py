@@ -17,15 +17,15 @@ import tempfile
 import time
 from pathlib import Path
 
-import pytest
-from hypothesis import given, strategies as st, settings, assume, HealthCheck
-
 import flatbuffers
-from gatun.generated.org.gatun.protocol import Command as Cmd
-from gatun.generated.org.gatun.protocol import Action as Act
-from gatun.launcher import launch_gateway
-from gatun.client import GatunClient
+import pytest
+from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import strategies as st
 
+from gatun.client import GatunClient
+from gatun.generated.org.gatun.protocol import Action as Act
+from gatun.generated.org.gatun.protocol import Command as Cmd
+from gatun.launcher import launch_gateway
 
 logger = logging.getLogger("gatun.tests.fuzz")
 
@@ -99,7 +99,7 @@ def make_client(fuzz_gateway):
             try:
                 if current_client[0].sock:
                     current_client[0].sock.close()
-            except Exception:
+            except OSError:
                 pass
 
         c = _create_fuzz_client(socket_str)
@@ -113,7 +113,7 @@ def make_client(fuzz_gateway):
         try:
             if current_client[0].sock:
                 current_client[0].sock.close()
-        except Exception:
+        except OSError:
             pass
 
 
@@ -125,7 +125,7 @@ def client(fuzz_gateway):
     try:
         if c.sock:
             c.sock.close()
-    except Exception:
+    except OSError:
         pass
 
 
@@ -313,11 +313,9 @@ class TestObjectIdFuzzing:
 
         client = make_client()
         # Try to invoke method on arbitrary ID
-        from gatun.client import JavaException
-
         try:
             client.invoke_method(object_id, "toString")
-        except (JavaException, Exception):
+        except Exception:  # noqa: BLE001, S110 - fuzzing: any clean failure is fine, the server must survive
             pass  # Expected - object doesn't exist
 
         # Session should still work
@@ -473,7 +471,7 @@ class TestArgumentFuzzing:
         try:
             for arg in args:
                 arr.add(arg)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - fuzzing: any clean failure is fine, the server must survive
             pass  # Some args may not be serializable
 
         # Session should still work
@@ -497,7 +495,7 @@ class TestArgumentFuzzing:
 
         try:
             arr.add(nested)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - fuzzing: any clean failure is fine, the server must survive
             pass  # May fail to serialize
 
         # Session should still work

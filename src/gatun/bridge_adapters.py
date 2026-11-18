@@ -5,23 +5,29 @@ This module provides BridgeAdapter implementations for different backends.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
+from gatun import connect as gatun_connect
 from gatun.bridge import (
+    JAVA_EXCEPTION_MAP,
     BridgeAdapter,
     JavaException,
     JVMRef,
     JVMView,
-    JAVA_EXCEPTION_MAP,
 )
 from gatun.client import (
     GatunClient,
     JavaObject,
-    JVMView as GatunJVMView,
-    java_import as gatun_java_import,
+)
+from gatun.client import (
     JavaException as GatunJavaException,
 )
-from gatun import connect as gatun_connect
+from gatun.client import (
+    JVMView as GatunJVMView,
+)
+from gatun.client import (
+    java_import as gatun_java_import,
+)
 
 
 class GatunAdapter(BridgeAdapter):
@@ -128,7 +134,7 @@ class GatunAdapter(BridgeAdapter):
     # === Arrays ===
 
     # Mapping of primitive type names to their wrapper class TYPE field
-    _PRIMITIVE_TYPES = {
+    _PRIMITIVE_TYPES: ClassVar[dict[str, tuple[str, str]]] = {
         "int": ("java.lang.Integer", "TYPE"),
         "long": ("java.lang.Long", "TYPE"),
         "double": ("java.lang.Double", "TYPE"),
@@ -228,7 +234,7 @@ class _GatunJVMViewAdapter(JVMView):
         self._jvm_view = jvm_view
         self._client = client
 
-    def __getattr__(self, name: str) -> "_GatunJVMViewAdapter | JVMRef | Any":
+    def __getattr__(self, name: str) -> _GatunJVMViewAdapter | JVMRef | Any:
         """Navigate to package, class, or access static member."""
         result = getattr(self._jvm_view, name)
 

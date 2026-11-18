@@ -6,7 +6,8 @@ without creating massive objects.
 """
 
 import pytest
-from gatun import connect, JavaException
+
+from gatun import JavaException, connect
 
 
 class TestObjectCountLimit:
@@ -141,10 +142,9 @@ class TestBatchSizeLimit:
             arr = client.create_object("java.util.ArrayList")
 
             # Create a batch with more than 5 commands
-            with pytest.raises(JavaException) as exc_info:
-                with client.batch() as b:
-                    for i in range(10):
-                        b.call(arr, "add", i)
+            with pytest.raises(JavaException) as exc_info, client.batch() as b:
+                for i in range(10):
+                    b.call(arr, "add", i)
 
             assert "Batch too large" in str(exc_info.value)
         finally:

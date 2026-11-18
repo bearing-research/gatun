@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Benchmark Python callback performance.
 
 This script measures the overhead of Python callbacks invoked from Java:

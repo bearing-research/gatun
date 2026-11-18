@@ -1,9 +1,8 @@
-#!/usr/bin/env python
 """Profile Gatun hot paths to identify optimization opportunities."""
 
-import time
 import cProfile
 import pstats
+import time
 from io import StringIO
 
 from gatun import connect
@@ -131,10 +130,11 @@ def profile_string_return(client, iterations=5000):
 
 def profile_breakdown():
     """Profile individual components to identify bottlenecks."""
-    from gatun.generated.org.gatun.protocol import Command as Cmd
-    from gatun.generated.org.gatun.protocol import Action as Act
-    from gatun.generated.org.gatun.protocol import Response
     import struct
+
+    from gatun.generated.org.gatun.protocol import Action as Act
+    from gatun.generated.org.gatun.protocol import Command as Cmd
+    from gatun.generated.org.gatun.protocol import Response
 
     client = connect()
     arr = client.create_object("java.util.ArrayList")

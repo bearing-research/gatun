@@ -2,9 +2,8 @@
 
 import array
 
-import pytest
-
 import pyarrow as pa
+import pytest
 
 
 def test_array_fill(client):

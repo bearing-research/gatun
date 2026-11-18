@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Benchmark vectorized APIs vs individual calls.
 
 This script compares the performance of:

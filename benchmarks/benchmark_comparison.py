@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Comprehensive performance benchmarks comparing Gatun vs Py4J.
 
 This script measures latency and throughput for all JVM bridge operations
@@ -35,7 +34,7 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Callable
+from collections.abc import Callable
 
 # Benchmark configuration - can be modified by --quick flag
 WARMUP_SECONDS = 2.0  # Time-based warmup for JIT + classloading
@@ -61,6 +60,7 @@ def get_cpu_info() -> str:
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
                 capture_output=True,
                 text=True,
+                check=False,
             )
             if result.returncode == 0:
                 return result.stdout.strip()
@@ -69,7 +69,7 @@ def get_cpu_info() -> str:
                 for line in f:
                     if line.startswith("model name"):
                         return line.split(":")[1].strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError, IndexError):
         pass
     return "Unknown"
 
@@ -83,11 +83,12 @@ def get_jvm_version() -> str:
             [java_cmd, "-version"],
             capture_output=True,
             text=True,
+            check=False,
         )
         # Java outputs version to stderr
         lines = result.stderr.strip().split("\n")
         return lines[0] if lines else "Unknown"
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return "Unknown"
 
 
@@ -109,7 +110,7 @@ def print_environment():
         config = load_config()
         print(f"Gatun memory:  {config.memory}")
         print("Gatun socket:  Unix domain socket (default)")
-    except Exception as e:
+    except (OSError, ValueError) as e:
         print(f"Gatun config:  Error loading: {e}")
 
     # Py4J version
@@ -117,7 +118,7 @@ def print_environment():
         import py4j
 
         print(f"Py4J module:   {py4j.__version__}")
-    except Exception:
+    except (ImportError, AttributeError):
         print("Py4J module:   Not installed or version unavailable")
 
     print()
@@ -375,7 +376,6 @@ def run_batch_benchmark(
 
 def _noop():
     """Empty function for measuring call overhead."""
-    pass
 
 
 def measure_baseline() -> dict:
@@ -539,7 +539,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     Returns:
         Tuple of (results list, baseline dict)
     """
-    from gatun import connect
+    from gatun import JavaException, connect
 
     client = connect()
     results = []
@@ -845,7 +845,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     def catch_bridge_exception():
         try:
             client.jvm.java.lang.Integer.parseInt("not_a_number")
-        except Exception:
+        except JavaException:
             pass
 
     results.append(
@@ -1755,6 +1755,7 @@ def run_py4j_benchmarks() -> dict:
         [sys.executable, "-c", PY4J_BENCHMARK_SCRIPT],
         capture_output=True,
         text=True,
+        check=False,  # returncode is inspected below
         env={**os.environ},
         cwd=cwd,
         timeout=1800,  # 30 minutes for full benchmark suite with warmup

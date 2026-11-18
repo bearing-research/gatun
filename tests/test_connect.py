@@ -2,7 +2,7 @@
 
 import pytest
 
-from gatun import connect, aconnect, GatunClient
+from gatun import GatunClient, aconnect, connect
 from gatun.async_client import AsyncGatunClient
 
 

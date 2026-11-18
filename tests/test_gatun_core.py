@@ -3,9 +3,9 @@ import pytest
 from gatun import (
     PROTOCOL_VERSION,
     JavaException,
-    JavaSecurityException,
     JavaNoSuchFieldException,
     JavaNumberFormatException,
+    JavaSecurityException,
 )
 
 
@@ -756,6 +756,7 @@ def test_multi_client_isolation(java_gateway):
 def test_multi_client_concurrent_operations(java_gateway):
     """Test concurrent operations from multiple clients don't interfere."""
     import threading
+
     from gatun import GatunClient
 
     socket_path = str(java_gateway.socket_path)
@@ -780,7 +781,7 @@ def test_multi_client_concurrent_operations(java_gateway):
             results[client_id] = size
 
             client.close()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - collect any worker failure for the main-thread assert
             errors.append(f"Client {client_id} error: {e}")
 
     # Run 3 clients concurrently
@@ -806,6 +807,7 @@ def test_multi_client_shm_cleanup(java_gateway):
     """Test that SHM files are cleaned up when clients disconnect."""
     import os
     import time
+
     from gatun import GatunClient
 
     socket_path = str(java_gateway.socket_path)
