@@ -36,7 +36,7 @@ jobs:
           java-version: "22"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: "latest"
           # Sets UV_PYTHON; without it .python-version (3.13) wins for every job
