@@ -30,7 +30,9 @@ enum Action : byte {
   GetFields = 21,          // Get multiple fields from one object: target_id + field_names
   InvokeMethods = 22,      // Invoke multiple methods on same target: target_id + method_calls
   CreateObjects = 23,      // Create multiple objects: class_names + args per object
-  GetMetrics = 24          // Get server metrics (request counts, latencies, object counts, etc.)
+  GetMetrics = 24,         // Get server metrics (request counts, latencies, object counts, etc.)
+  ArrowToObject = 25,      // Turn the IPC stream at arrow_stream into a VectorSchemaRoot object
+  ArrowFromObject = 26     // Write the VectorSchemaRoot target_id as an IPC stream; see Response.arrow_stream
 }
 
 // Element types for arrays
@@ -237,6 +239,8 @@ table Command {
   get_fields: GetFieldsRequest;
   invoke_methods: InvokeMethodsRequest;
   create_objects: CreateObjectsRequest;
+  // For Action.ArrowToObject: where in the payload zone the Arrow IPC stream is
+  arrow_stream: BufferDescriptor;
 }
 
 // Batch of commands to execute sequentially
@@ -279,6 +283,9 @@ table Response {
   // For GetFields: list of field values
   // For InvokeMethods: list of method return values
   // For CreateObjects: list of ObjectRef for created objects
+
+  // For Action.ArrowFromObject: where in the payload zone the Arrow IPC stream was written
+  arrow_stream: BufferDescriptor;
 }
 
 // Batch of responses (one per command in BatchCommand)

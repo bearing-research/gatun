@@ -137,7 +137,8 @@ public final class ResourceLimits {
       super(
           String.format(
               "Arrow buffer limit exceeded: %d bytes (max: %d). "
-                  + "Reset arena or increase gatun.limits.max_arrow_bytes.",
+                  + "Reset the arena, release Arrow tables held as objects, or increase"
+                  + " gatun.limits.max_arrow_bytes.",
               current, max));
     }
   }

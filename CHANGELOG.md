@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `estimate_arrow_size()` and up-front size validation raising `PayloadTooLargeError`
 - Direction field on Arrow batch descriptors
 - Arrow memory architecture documentation
+- `client.arrow_to_java(table)` and `client.arrow_from_java(obj)`, on both clients. A sent table becomes an `org.apache.arrow.vector.VectorSchemaRoot` object that any Java method can receive, and any `VectorSchemaRoot` the JVM holds, including one Java code produced, can be fetched as a `pyarrow.Table`. Before this, sent Arrow data could only be read back by the client that sent it
 - `allowed_classes` and `allowed_prefixes` arguments to `connect()`, `aconnect()`, `launch_gateway()` and `GatunAdapter`, also settable in `pyproject.toml` and through `GATUN_ALLOWED_CLASSES` / `GATUN_ALLOWED_PREFIXES`. Using a library outside the built-in allowlist no longer needs a source edit and a rebuild
 
 ### Changed
@@ -50,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_metrics()` reports real object counts, Arrow transfers and callback invocations (these always read 0), counts `Batch` and `GetArrowData` requests, and counts a response that was too large to send as an error
 - A constructor or callback registration that fails no longer uses up one of the session's `max_objects` slots, and `create_objects()` / `invoke_methods()` / `get_fields()` release the objects they registered before failing part-way
 - `close()` closes the socket even when the shared memory mapping cannot be released yet
+- Concurrent `send_arrow_table()` calls on one async client no longer overwrite each other's data: the payload zone is written only once the request holds the channel
+- A table from `get_arrow_data()` raises `StaleArenaError` once a later transfer has written over the memory it points at (a larger send, or a newer `get_arrow_data()`), instead of returning that transfer's bytes
 - `GatunAdapter(classpath=...)` passes the classpath on
 
 ## [0.2.1] - 2026-01-17

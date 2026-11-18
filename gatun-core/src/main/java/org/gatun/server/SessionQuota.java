@@ -20,6 +20,7 @@ public class SessionQuota {
 
   // Arrow buffer tracking
   private final AtomicLong arrowBytesAllocated = new AtomicLong(0);
+  private final AtomicLong heldArrowBytes = new AtomicLong(0);
   private final AtomicLong peakArrowBytes = new AtomicLong(0);
   private final AtomicLong totalArrowBytesTransferred = new AtomicLong(0);
 
@@ -115,7 +116,7 @@ public class SessionQuota {
    * @throws ResourceLimits.ArrowBufferLimitExceededException if limit would be exceeded
    */
   public void allocateArrowBytes(long bytes) {
-    long current = arrowBytesAllocated.get();
+    long current = arrowBytesAllocated.get() + heldArrowBytes.get();
     ResourceLimits.checkArrowBufferLimit(current + bytes);
 
     long newTotal = arrowBytesAllocated.addAndGet(bytes);
@@ -140,6 +141,29 @@ public class SessionQuota {
   public void resetArrowBytes() {
     arrowBytesAllocated.set(0);
     touchActivity();
+  }
+
+  /**
+   * Count the memory of an Arrow table kept as an object. Unlike {@link #allocateArrowBytes}, this
+   * is not cleared by an arena reset: the table lives outside the payload zone until it is freed.
+   *
+   * @throws ResourceLimits.ArrowBufferLimitExceededException if limit would be exceeded
+   */
+  public void holdArrowBytes(long bytes) {
+    ResourceLimits.checkArrowBufferLimit(arrowBytesAllocated.get() + heldArrowBytes.get() + bytes);
+    heldArrowBytes.addAndGet(bytes);
+    totalArrowBytesTransferred.addAndGet(bytes);
+    touchActivity();
+  }
+
+  /** Give back what {@link #holdArrowBytes} counted. May be called from any thread. */
+  public void releaseHeldArrowBytes(long bytes) {
+    heldArrowBytes.addAndGet(-bytes);
+  }
+
+  /** Bytes of Arrow tables currently kept as objects. */
+  public long getHeldArrowBytes() {
+    return heldArrowBytes.get();
   }
 
   /** Get current Arrow bytes allocated. */

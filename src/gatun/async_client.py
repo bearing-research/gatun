@@ -19,7 +19,6 @@ Example using run_sync with existing sync client:
 """
 
 import asyncio
-import ctypes
 import inspect
 import mmap
 import os
@@ -46,10 +45,15 @@ from gatun.client import (
     PayloadTooLargeError,
     ProtocolDesyncError,
     SocketTimeoutError,
+    _arrow_ipc_stream,
     _close_shared_memory,
+    _finish_arrow_from_object,
+    _finish_arrow_to_object,
     _raise_java_exception_impl,
+    _read_arrow_stream,
     _unpack_value_impl,
     _ValueEncoder,
+    _write_arrow_stream,
 )
 from gatun.generated.org.gatun.protocol import Action as Act
 from gatun.generated.org.gatun.protocol import Command as Cmd
@@ -346,9 +350,21 @@ class AsyncGatunClient(_ValueEncoder):
             return False
 
     async def _send_raw(
-        self, data: bytes, wait_for_response: bool = True, expects_response: bool = True
+        self,
+        data: bytes,
+        wait_for_response: bool = True,
+        expects_response: bool = True,
+        prepare: Callable[[], None] | None = None,
+        finish: Callable[[Any], Any] | None = None,
     ):
-        """Write command to SHM and signal Java asynchronously."""
+        """Write command to SHM and signal Java asynchronously.
+
+        `prepare` runs before the command is written and `finish` is applied to
+        the response, both while this request holds the channel. A request that
+        carries data in the payload zone must touch the zone only from there:
+        another task's request can run before the lock is taken or after it is
+        released, and it uses the same zone.
+        """
         # Check for reentrancy - nested calls from callbacks would deadlock
         # Exception: CallbackResponse is sent during callback handling
         if self._in_callback and expects_response:
@@ -364,6 +380,8 @@ class AsyncGatunClient(_ValueEncoder):
             max_command_size = self.payload_offset
             if len(data) > max_command_size:
                 raise PayloadTooLargeError(len(data), max_command_size, "Command")
+            if prepare is not None:
+                prepare()
 
             # Write to shared memory (sync - mmap doesn't have async API)
             self.shm.seek(self.command_offset)
@@ -374,7 +392,8 @@ class AsyncGatunClient(_ValueEncoder):
             await self._writer.drain()
 
             if wait_for_response:
-                return await self._read_response()
+                response = await self._read_response()
+                return finish(response) if finish is not None else response
 
     async def _read_response(self):
         """Read and parse response from the server.
@@ -430,6 +449,11 @@ class AsyncGatunClient(_ValueEncoder):
                     else "java.lang.RuntimeException"
                 )
                 _raise_java_exception_impl(error_type, error_msg)
+
+            # Location of an Arrow IPC stream (arrow_from_java)
+            arrow_stream = resp.ArrowStream()
+            if arrow_stream is not None:
+                return arrow_stream.Offset(), arrow_stream.Length()
 
             # Unpack the return value
             return self._unpack_value(resp.ReturnValType(), resp.ReturnVal())
@@ -1043,8 +1067,6 @@ class AsyncGatunClient(_ValueEncoder):
         Note: Arrow IPC serialization still occurs (table → IPC format).
         For true zero-copy, use send_arrow_buffers() instead.
         """
-        max_payload_size = self.response_offset - self.payload_offset
-
         # Serialize to an in-memory buffer first
         # Arrow's IPC serialization is already optimized and this is fast
         sink = pa.BufferOutputStream()
@@ -1052,16 +1074,6 @@ class AsyncGatunClient(_ValueEncoder):
             writer.write_table(table)
 
         ipc_buffer = sink.getvalue()
-        bytes_written = ipc_buffer.size
-
-        if bytes_written > max_payload_size:
-            raise PayloadTooLargeError(bytes_written, max_payload_size, "Arrow batch")
-
-        # Copy IPC data to shared memory payload zone using single memmove
-        assert self.shm is not None, "Not connected"
-        payload_base = ctypes.addressof(ctypes.c_char.from_buffer(self.shm))
-        payload_addr = payload_base + self.payload_offset
-        ctypes.memmove(payload_addr, ipc_buffer.address, bytes_written)
 
         builder = flatbuffers.Builder(256)
         Cmd.CommandStart(builder)
@@ -1069,7 +1081,64 @@ class AsyncGatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        return await self._send_raw(builder.Output())
+        # Copied into the payload zone once this request holds the channel
+        return await self._send_raw(
+            builder.Output(),
+            prepare=lambda: _write_arrow_stream(self, ipc_buffer, 0, "Arrow batch"),
+        )
+
+    async def arrow_to_java(self, table: pa.Table | pa.RecordBatch) -> AsyncJavaObject:
+        """Copy an Arrow table into the JVM and return a handle to it.
+
+        The handle refers to an org.apache.arrow.vector.VectorSchemaRoot that owns
+        its memory. Pass it to any Java method that takes one, or get a table
+        back with arrow_from_java().
+
+        Async handles are not released by garbage collection. The table's memory
+        stays in use, and counts against max_arrow_bytes, until you free the
+        handle or the connection closes:
+
+            async with await client.arrow_to_java(table) as root:
+                ...
+            # or: await client.free_object(root.object_id)
+
+        Raises:
+            PayloadTooLargeError: If the table does not fit in shared memory.
+            UnsupportedArrowTypeError: If a column is dictionary-encoded.
+        """
+        stream = _arrow_ipc_stream(table)
+        command = _finish_arrow_to_object(flatbuffers.Builder(256), 0, stream.size)
+        return cast(
+            AsyncJavaObject,
+            await self._send_raw(
+                command, prepare=lambda: _write_arrow_stream(self, stream, 0)
+            ),
+        )
+
+    async def arrow_from_java(self, table: "AsyncJavaObject | int") -> pa.Table:
+        """Copy an Arrow table held by a Java object into Python.
+
+        Works for any org.apache.arrow.vector.VectorSchemaRoot the JVM holds. The
+        result is an ordinary pyarrow Table that owns its data; the Java table is
+        left as it is.
+
+        Raises:
+            PayloadTooLargeError: If the table does not fit in shared memory.
+            JavaIllegalArgumentException: If the object is not a VectorSchemaRoot.
+        """
+        if isinstance(table, (JavaObject, AsyncJavaObject)):
+            object_id = table.object_id
+        else:
+            object_id = table
+
+        command = _finish_arrow_from_object(flatbuffers.Builder(256), object_id)
+        # Copied out of the payload zone before another request can reuse it
+        return cast(
+            pa.Table,
+            await self._send_raw(
+                command, finish=lambda location: _read_arrow_stream(self, location)
+            ),
+        )
 
     def arrow_context(self) -> "AsyncScopedArenaContext":
         """Get an async context manager for scoped Arrow transfers.

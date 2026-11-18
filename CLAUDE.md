@@ -34,10 +34,10 @@ These sizes are hardcoded on both sides and must stay in sync: `PAYLOAD_OFFSET` 
 ### Where Changes Must Be Mirrored
 The protocol is implemented several times over, so a wire-level change usually touches all of these:
 - `schemas/commands.fbs` — add the `Action` / table / field
-- `GatunServer.handleClient` — top-level dispatch (an `if/else if` chain on `cmd.action()`)
+- `GatunServer.handleClient` — top-level dispatch (an `if/else if` chain on `cmd.action()`); new actions also need a name in `Metrics.getActionName`
 - `GatunServer.executeCommand` — a second, separate dispatch used only for sub-commands inside `Action.Batch`; an action missing here works standalone but fails in `client.batch()`
 - `src/gatun/client.py` — sync client, plus `BatchContext` if the action should be batchable
-- `src/gatun/async_client.py` — shares value encoding and decoding with the sync client (the `_ValueEncoder` mixin and `_unpack_value_impl` in `client.py`) but has its own `_read_response`, and implements only a subset of the sync API (no `batch`, `cancel`, `reflect`, static-field access, or `send_arrow_buffers` / `get_arrow_data`)
+- `src/gatun/async_client.py` — shares value encoding and decoding with the sync client (the `_ValueEncoder` mixin and `_unpack_value_impl` in `client.py`) but has its own `_read_response`, and implements only a subset of the sync API (no `batch`, `cancel`, `reflect`, static-field access, or `send_arrow_buffers` / `get_arrow_data`; it does have `arrow_to_java` / `arrow_from_java`)
 - `PROTOCOL_VERSION` in both `GatunServer.java` and `client.py` for breaking changes
 
 Java-side responsibilities are split: `GatunServer` (dispatch, object/callback registries, allowlist, value packing), `MethodResolver` (overload scoring, varargs), `ReflectionCache` (class/method/field/handle caches), `ArrowMemoryHandler` (Arrow IPC + buffer-descriptor transfer, epoch checks; one instance per session, since the loaded batch points into that session's shared memory), `ResourceLimits` + `SessionQuota` (per-session limits), `observability/` (logging, metrics, JFR).
@@ -420,6 +420,23 @@ client.create_objects([("class1", ()), ("class2", (arg,))])  # Multiple creation
 ### Arrow Data Transfer
 Multiple methods for transferring Arrow data:
 
+#### Tables as Java Objects
+The only path that lets Java code touch the data. `send_arrow_table` only counts rows, and `send_arrow_buffers` / `get_arrow_data` hold one batch private to `ArrowMemoryHandler` that can only be read back.
+```python
+root = client.arrow_to_java(table)       # JavaObject -> org.apache.arrow.vector.VectorSchemaRoot
+root.getRowCount()
+client.jvm.com.example.Stats.summarize(root)   # any Java method taking a VectorSchemaRoot
+
+produced = root.slice(1, 2)               # a table made on the Java side
+result = client.arrow_from_java(produced)  # pyarrow.Table that owns its data
+produced.close()                          # Java-made tables are the caller's to close
+```
+- Wire: `Action.ArrowToObject` / `ArrowFromObject`; the table travels as an Arrow IPC stream in the payload zone, located by `arrow_stream` (a `BufferDescriptor`) on `Command` / `Response`. Both clients implement them; they are not batchable.
+- A table made by `arrow_to_java` owns its memory (it does not point into shared memory). `GatunServer.ownedTables` counts the registry entries that refer to it and closes it with the last one, so freeing the handle releases the memory (async handles have no finalizer and must be freed explicitly). It is charged to `max_arrow_bytes` until then, separately from the arena's count, which `reset_payload_arena` clears.
+- The stream is written after any batch loaded in place by `send_arrow_buffers` (the client tracks its end in `_arrow_loaded_end`; the server refuses an overlapping stream). Any write that reaches the second half of the payload zone, where `ArrowTableView`s point, invalidates them (`GatunClient._note_payload_write`).
+- One transfer must fit in the payload zone; move larger tables in slices.
+- In the async client anything that touches the payload zone runs inside `_send_raw`'s lock (its `prepare` / `finish` hooks), since tasks share one zone.
+
 #### IPC Format (Simple)
 ```python
 import pyarrow as pa
@@ -767,7 +784,7 @@ bridge.is_instance_of(obj, "java.util.List")  # True
 ```
 
 ### PySpark Usage
-Nothing in this repo or in stock PySpark switches PySpark over to Gatun; there is no `PYSPARK_USE_GATUN` switch. Running PySpark on Gatun needs a PySpark build ported to the `BridgeAdapter` interface (`docs/bridge_adapter_spec.md`). What this repo tests is driving Spark's JVM classes directly via `connect(classpath=<spark jars>)` (`tests/test_spark_integration.py`), which needs a JDK Spark supports: it passes on 22 and fails on 27.
+Nothing in this repo or in stock PySpark switches PySpark over to Gatun; there is no `PYSPARK_USE_GATUN` switch. Running PySpark on Gatun needs a PySpark build ported to the `BridgeAdapter` interface (`docs/bridge_adapter_spec.md`). What this repo tests is driving Spark's JVM classes directly via `connect(classpath=<spark jars>)` (`tests/test_spark_integration.py`), which needs a JDK Spark supports: it passes on 22 and fails on 27. That file's `dataframe_from_arrow` / `arrow_from_dataframe` helpers show a pyarrow table becoming a Spark DataFrame and a query result coming back as Arrow, through `arrow_to_java` / `arrow_from_java` and Spark-internal converters (`ArrowConverters.toDataFrame`, `Dataset.toArrowBatchRdd`).
 
 ## Logging
 
