@@ -817,6 +817,35 @@ export GATUN_MEMORY=64MB
 export GATUN_SOCKET_PATH=/tmp/gatun.sock
 ```
 
+### Allowing Your Own Classes
+
+The server only lets a client create objects of, or call static members on, allowlisted classes. The built-in list covers common JDK collections, strings and boxed types, plus `org.apache.spark.`, `org.apache.log4j.` and `scala.`. Anything else raises `JavaSecurityException` until you allow it:
+
+```python
+from gatun import connect
+
+client = connect(
+    classpath=["/path/to/mylib.jar"],
+    allowed_classes=["java.util.concurrent.atomic.AtomicLong"],  # exact class names
+    allowed_prefixes=["com.example"],  # a package and all its subpackages
+)
+
+counter = client.jvm.java.util.concurrent.atomic.AtomicLong(41)
+counter.incrementAndGet()  # 42
+```
+
+The lists can also be set once per project or environment. Entries from all three places are combined and added to the built-in list:
+
+```toml
+[tool.gatun]
+allowed_classes = ["java.util.concurrent.atomic.AtomicLong"]
+allowed_prefixes = ["com.example"]
+```
+
+```bash
+export GATUN_ALLOWED_PREFIXES=com.example,org.acme
+```
+
 ## Supported Types
 
 | Python | Java |

@@ -363,6 +363,16 @@ def test_gatun_adapter_passes_classpath(monkeypatch):
 
     monkeypatch.setattr(adapters, "gatun_connect", fake_connect)
 
-    adapters.GatunAdapter(memory="32MB", classpath=["/a.jar", "/b.jar"])
+    adapters.GatunAdapter(
+        memory="32MB",
+        classpath=["/a.jar", "/b.jar"],
+        allowed_classes=["com.example.Thing"],
+        allowed_prefixes=["com.example.lib"],
+    )
 
-    assert seen == {"memory": "32MB", "classpath": ["/a.jar", "/b.jar"]}
+    assert seen == {
+        "memory": "32MB",
+        "classpath": ["/a.jar", "/b.jar"],
+        "allowed_classes": ["com.example.Thing"],
+        "allowed_prefixes": ["com.example.lib"],
+    }

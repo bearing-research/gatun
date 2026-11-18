@@ -2,7 +2,7 @@
 
 import pytest
 
-from gatun import JavaArray, aconnect, java_import
+from gatun import JavaArray, aconnect, connect, java_import
 
 
 class TestQuickStart:
@@ -393,3 +393,18 @@ class TestObservability:
             assert "=== Gatun Server Metrics ===" in metrics
         finally:
             await client.close()
+
+
+class TestAllowingYourOwnClasses:
+    """Test the 'Allowing Your Own Classes' example."""
+
+    def test_allowed_classes_and_prefixes(self):
+        client = connect(
+            allowed_classes=["java.util.concurrent.atomic.AtomicLong"],
+            allowed_prefixes=["com.example"],
+        )
+        try:
+            counter = client.jvm.java.util.concurrent.atomic.AtomicLong(41)
+            assert counter.incrementAndGet() == 42
+        finally:
+            client.close()

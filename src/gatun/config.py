@@ -7,12 +7,18 @@ Example pyproject.toml:
     memory = "64MB"
     socket_path = "/tmp/gatun.sock"
     jvm_flags = ["-Xmx512m"]
+    allowed_classes = ["java.util.concurrent.atomic.AtomicLong"]
+    allowed_prefixes = ["com.example"]
 
 Configuration precedence (highest to lowest):
     1. Function arguments (e.g., connect(memory="32MB"))
     2. Environment variables (e.g., GATUN_MEMORY=32MB)
     3. pyproject.toml [tool.gatun] section
     4. Built-in defaults
+
+The allow lists are the exception: allowed_classes and allowed_prefixes from every
+source (arguments, GATUN_ALLOWED_CLASSES / GATUN_ALLOWED_PREFIXES, pyproject.toml)
+are combined and added to the server's built-in list.
 """
 
 import os
@@ -31,6 +37,10 @@ class GatunConfig:
 
     # JVM settings
     jvm_flags: list[str] = field(default_factory=list)
+
+    # Classes and package prefixes allowed in addition to the server's built-in list
+    allowed_classes: list[str] = field(default_factory=list)
+    allowed_prefixes: list[str] = field(default_factory=list)
 
     # Timeouts
     connect_timeout: float = 5.0  # seconds
@@ -69,6 +79,11 @@ def find_pyproject_toml(start_path: Path | None = None) -> Path | None:
     return None
 
 
+def _split_names(value: str) -> list[str]:
+    """Split a comma-separated list of names, dropping blanks."""
+    return [name.strip() for name in value.split(",") if name.strip()]
+
+
 def load_config(pyproject_path: Path | None = None) -> GatunConfig:
     """Load configuration from pyproject.toml.
 
@@ -101,6 +116,16 @@ def load_config(pyproject_path: Path | None = None) -> GatunConfig:
             config.connect_timeout = gatun_config["connect_timeout"]
         if "startup_timeout" in gatun_config:
             config.startup_timeout = gatun_config["startup_timeout"]
+        for option in ("allowed_classes", "allowed_prefixes"):
+            if option in gatun_config:
+                value = gatun_config[option]
+                # A bare string would be read as a list of its characters
+                if not isinstance(value, list):
+                    raise TypeError(
+                        f"[tool.gatun] {option} in {pyproject_path} must be a list of "
+                        f"strings, got {type(value).__name__}: {value!r}"
+                    )
+                setattr(config, option, list(value))
 
     # 2. Override with environment variables
     if env_memory := os.environ.get("GATUN_MEMORY"):
@@ -111,6 +136,12 @@ def load_config(pyproject_path: Path | None = None) -> GatunConfig:
         config.connect_timeout = float(env_timeout)
     if env_startup := os.environ.get("GATUN_STARTUP_TIMEOUT"):
         config.startup_timeout = float(env_startup)
+    # Allow lists accumulate across sources instead of overriding: each source
+    # names libraries it needs, and none can take another's away.
+    if env_classes := os.environ.get("GATUN_ALLOWED_CLASSES"):
+        config.allowed_classes += _split_names(env_classes)
+    if env_prefixes := os.environ.get("GATUN_ALLOWED_PREFIXES"):
+        config.allowed_prefixes += _split_names(env_prefixes)
 
     # Reprocess paths after env override
     config.__post_init__()

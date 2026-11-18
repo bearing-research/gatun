@@ -595,7 +595,7 @@ Python-side exceptions:
 ## Security
 
 ### Class Allowlist
-Only these classes can be instantiated or used for static methods (hardcoded in GatunServer.java):
+Only allowlisted classes can be instantiated or used for static methods. The built-in list (`ClassAllowlist.java`):
 - Collections: `java.util.ArrayList`, `LinkedList`, `HashMap`, `LinkedHashMap`, `TreeMap`, `HashSet`, `LinkedHashSet`, `TreeSet`, `Collections`, `Arrays`
 - Strings: `java.lang.String`, `StringBuilder`, `StringBuffer`
 - Primitives: `java.lang.Integer`, `Long`, `Double`, `Float`, `Boolean`, `Byte`, `Short`, `Character`, `Math`
@@ -606,7 +606,17 @@ Only these classes can be instantiated or used for static methods (hardcoded in 
 
 Attempting to use non-allowlisted classes (e.g., `Runtime`, `ProcessBuilder`) raises `SecurityException`.
 
-To use a new class in a test or feature, add it to `ALLOWED_CLASSES` / `ALLOWED_PREFIXES` in `GatunServer.java` and rebuild. The allowlist gates object creation and static method/field access.
+Other libraries are added per server, without a rebuild:
+```python
+client = connect(
+    classpath=["/path/to/mylib.jar"],
+    allowed_classes=["java.util.concurrent.atomic.AtomicLong"],  # exact class names
+    allowed_prefixes=["com.example"],  # a package and its subpackages
+)
+```
+The same lists can come from `[tool.gatun] allowed_classes` / `allowed_prefixes` in `pyproject.toml` or from `GATUN_ALLOWED_CLASSES` / `GATUN_ALLOWED_PREFIXES` (comma-separated). All sources are combined and added to the built-in list; nothing removes a built-in entry. The launcher passes them to the server as the `gatun.allowlist.classes` / `gatun.allowlist.prefixes` system properties, read once at JVM start.
+
+In tests, pass `allowed_classes` to `connect()` rather than editing the built-in list. The allowlist gates object creation and static method/field access.
 
 ### Resource Limits
 Per-session limits (object count, string length, list entries, nesting depth, batch size, Arrow bytes, idle timeout) are defined in `ResourceLimits.java` as `gatun.limits.*` system properties read once at JVM start. Override them per server with `connect(extra_jvm_flags=["-Dgatun.limits.max_objects=5"])`; see `tests/test_resource_limits.py`.
@@ -708,6 +718,7 @@ socket_path = "/tmp/gatun.sock"  # Optional: fixed path instead of random
 jvm_flags = ["-Xmx512m"]         # Appended to the launcher's default flags
 connect_timeout = 5.0            # seconds
 startup_timeout = 5.0            # seconds to wait for the server socket
+allowed_prefixes = ["com.example"]  # added to the built-in class allowlist
 ```
 
 Or environment variables:
@@ -719,7 +730,7 @@ GATUN_STARTUP_TIMEOUT=5
 GATUN_DEBUG=true   # Stream Java server stdout/stderr instead of capturing it
 ```
 
-Precedence: function arguments > environment variables > `pyproject.toml` > defaults (memory defaults to `16MB`). The config is found by walking up from the current directory and is cached process-wide; call `reset_config()` in tests that change it.
+Precedence: function arguments > environment variables > `pyproject.toml` > defaults (memory defaults to `16MB`). The allow lists are the exception: every source is combined. The config is found by walking up from the current directory and is cached process-wide; call `reset_config()` in tests that change it.
 
 ## BridgeAdapter (PySpark Integration)
 
