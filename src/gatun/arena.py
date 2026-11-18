@@ -329,6 +329,24 @@ def _check_type_recursive(
             _check_type_recursive(field.type, unsupported, f"{path}.{field.name}")
 
 
+# Array.nbytes counts the bytes an array refers to, slice or not, but leaves out the
+# final entry of each offsets buffer. One 64-bit offset per buffer covers that.
+_OFFSET_SLACK = 8
+
+
+def _is_slice(array: pa.Array) -> bool:
+    """Whether the array's buffers hold rows that the array itself does not cover.
+
+    True for any slice of a larger array, including one that starts at row 0, such
+    as the first batch of ``table.to_batches()``.
+    """
+    if array.offset != 0:
+        return True
+    buffer_count = sum(buf is not None for buf in array.buffers())
+    unused = array.get_total_buffer_size() - array.nbytes
+    return bool(unused > _OFFSET_SLACK * buffer_count)
+
+
 def _get_own_buffers(array: pa.Array) -> list[pa.Buffer | None]:
     """Get only this array's own buffers (not children's buffers).
 
@@ -522,11 +540,11 @@ def copy_arrow_table_to_arena(
         # After combine_chunks(), each column has exactly one chunk
         chunk = column.chunks[0]
 
-        # Normalize sliced arrays to offset 0
-        # Sliced arrays have non-zero offsets, which means their buffers contain
-        # data before the slice that shouldn't be accessed. We use concat_arrays
-        # to create a new array with offset 0 and compacted buffers.
-        if chunk.offset != 0:
+        # Compact sliced arrays. A slice shares its parent's buffers, so they hold
+        # rows before the slice (which must not be read as its own) and after it
+        # (which would be copied for nothing). concat_arrays builds a new array
+        # with offset 0 and buffers that hold only its rows.
+        if _is_slice(chunk):
             chunk = pa.concat_arrays([chunk])
 
         # Extract field nodes AND buffers together in DFS order
@@ -577,26 +595,33 @@ def deserialize_schema(schema_bytes: bytes) -> pa.Schema:
     return pa.ipc.read_schema(pa.BufferReader(schema_bytes))
 
 
-def estimate_arrow_size(table: pa.Table) -> int:
+def estimate_arrow_size(table: pa.Table | pa.RecordBatch) -> int:
     """Estimate buffer size needed for an Arrow table (conservative estimate).
 
     This function estimates the total buffer size required to store a table
     in the payload arena, including alignment padding. The estimate is
     conservative (may overestimate) to ensure allocations don't fail.
 
+    A slice of a larger table, such as a batch from ``table.to_batches()``, is
+    sized by its own rows, because only those are copied.
+
     Args:
-        table: PyArrow Table to estimate size for
+        table: PyArrow Table or RecordBatch to estimate size for
 
     Returns:
         Estimated size in bytes including alignment padding
     """
     total = 0
     for column in table.columns:
-        for chunk in column.chunks:
-            for buf in chunk.buffers():
-                if buf is not None:
-                    # Add buffer size plus maximum alignment padding (64 bytes)
-                    total += buf.size + PayloadArena.ALIGNMENT
+        chunks = column.chunks if isinstance(column, pa.ChunkedArray) else [column]
+        for chunk in chunks:
+            buffer_sizes = [buf.size for buf in chunk.buffers() if buf is not None]
+            if _is_slice(chunk):
+                size = chunk.nbytes + _OFFSET_SLACK * len(buffer_sizes)
+            else:
+                size = sum(buffer_sizes)
+            # Add maximum alignment padding (64 bytes) per buffer
+            total += size + PayloadArena.ALIGNMENT * len(buffer_sizes)
     return total
 
 

@@ -46,9 +46,9 @@ from gatun.client import (
     PayloadTooLargeError,
     ProtocolDesyncError,
     SocketTimeoutError,
-    _encode_temporal,
     _raise_java_exception_impl,
     _unpack_value_impl,
+    _ValueEncoder,
 )
 from gatun.generated.org.gatun.protocol import Action as Act
 from gatun.generated.org.gatun.protocol import Command as Cmd
@@ -59,7 +59,6 @@ from gatun.generated.org.gatun.protocol import (
     MethodCall,
     ObjectSpec,
     Response,
-    Value,
 )
 
 # Default thread pool for run_sync
@@ -199,7 +198,7 @@ class AsyncJavaClass:
         return f"<AsyncJVM {self._path}>"
 
 
-class AsyncGatunClient:
+class AsyncGatunClient(_ValueEncoder):
     """Async client for communicating with the Gatun Java server.
 
     This client uses asyncio for non-blocking I/O operations. All Java
@@ -217,6 +216,8 @@ class AsyncGatunClient:
             Integer = client.jvm.java.lang.Integer
             result = await Integer.parseInt("42")
     """
+
+    _object_ref_types = (JavaObject, AsyncJavaObject)
 
     def __init__(
         self,
@@ -556,80 +557,6 @@ class AsyncGatunClient:
     def _unpack_value(self, val_type: int, val_table: Any) -> Any:
         """Unpack a FlatBuffer Value union to a Python object."""
         return _unpack_value_impl(val_type, val_table, self, AsyncJavaObject)
-
-    def _build_value(self, builder, value):
-        """Build a Value union and return (type, offset)."""
-        from gatun.generated.org.gatun.protocol import (
-            Argument,
-            BoolVal,
-            DoubleVal,
-            IntVal,
-            ListVal,
-            ObjectRef,
-            StringVal,
-        )
-
-        if isinstance(value, str):
-            str_off = builder.CreateString(value)
-            StringVal.Start(builder)
-            StringVal.AddV(builder, str_off)
-            return Value.Value.StringVal, StringVal.End(builder)
-        elif isinstance(value, bool):
-            BoolVal.Start(builder)
-            BoolVal.AddV(builder, value)
-            return Value.Value.BoolVal, BoolVal.End(builder)
-        elif isinstance(value, int):
-            IntVal.Start(builder)
-            IntVal.AddV(builder, value)
-            return Value.Value.IntVal, IntVal.End(builder)
-        elif isinstance(value, float):
-            DoubleVal.Start(builder)
-            DoubleVal.AddV(builder, value)
-            return Value.Value.DoubleVal, DoubleVal.End(builder)
-        elif isinstance(value, (JavaObject, AsyncJavaObject)):
-            ObjectRef.Start(builder)
-            ObjectRef.AddId(builder, value.object_id)
-            return Value.Value.ObjectRef, ObjectRef.End(builder)
-        elif isinstance(value, list):
-            item_offsets = []
-            for item in value:
-                item_type, item_off = self._build_value(builder, item)
-                Argument.Start(builder)
-                Argument.AddValType(builder, item_type)
-                Argument.AddVal(builder, item_off)
-                item_offsets.append(Argument.End(builder))
-
-            ListVal.StartItemsVector(builder, len(item_offsets))
-            for offset in reversed(item_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            items_vec = builder.EndVector()
-
-            ListVal.Start(builder)
-            ListVal.AddItems(builder, items_vec)
-            return Value.Value.ListVal, ListVal.End(builder)
-        elif value is None:
-            return Value.Value.NullVal, 0
-        else:
-            temporal = _encode_temporal(value)
-            if temporal is None:
-                raise TypeError(f"Unsupported type: {type(value)}")
-            from gatun.generated.org.gatun.protocol import TemporalVal
-
-            kind, temporal_value = temporal
-            TemporalVal.Start(builder)
-            TemporalVal.AddKind(builder, kind)
-            TemporalVal.AddV(builder, temporal_value)
-            return Value.Value.TemporalVal, TemporalVal.End(builder)
-
-    def _build_argument(self, builder, value):
-        """Convert a Python value to a FlatBuffer Argument."""
-        from gatun.generated.org.gatun.protocol import Argument
-
-        val_type, val_off = self._build_value(builder, value)
-        Argument.Start(builder)
-        Argument.AddValType(builder, val_type)
-        Argument.AddVal(builder, val_off)
-        return Argument.End(builder)
 
     async def create_object(self, class_name: str, *args) -> AsyncJavaObject:
         """Create a new Java object asynchronously."""
@@ -1184,7 +1111,8 @@ class AsyncGatunClient:
             # A server started for this client by aconnect() goes away with it
             session, self._server_session = self._server_session, None
             if session is not None:
-                session.stop()
+                # stop() waits for the JVM to exit; keep the event loop free meanwhile
+                await asyncio.to_thread(session.stop)
 
     async def __aenter__(self):
         # Only connect if not already connected

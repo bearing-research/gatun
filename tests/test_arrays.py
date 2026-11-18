@@ -5,6 +5,8 @@ import array
 import pyarrow as pa
 import pytest
 
+from gatun import JavaArray
+
 
 def test_array_fill(client):
     """Test Arrays.fill() modifies a Java array in place."""
@@ -206,9 +208,44 @@ class TestPyArrowArrayArguments:
         assert client.jvm.java.util.Arrays.toString(arr) == "[a, null, c]"
 
 
-def test_char_array_return(client):
-    """Regression: returning a char[] failed with ClassCastException."""
-    chars = client.jvm.java.lang.Character.toChars(0x1F600)  # a surrogate pair
+class TestCharArrays:
+    """char[] travels as its own array type, one-character strings in Python."""
 
-    assert [ord(c) for c in chars] == [0xD83D, 0xDE00]
-    assert list(client.jvm.java.lang.Character.toChars(65)) == ["A"]
+    def test_return(self, client):
+        """Regression: returning a char[] failed with ClassCastException."""
+        chars = client.jvm.java.lang.Character.toChars(0x1F600)  # a surrogate pair
+
+        assert isinstance(chars, JavaArray)
+        assert chars.element_type == "Char"
+        assert [ord(c) for c in chars] == [0xD83D, 0xDE00]
+        assert list(client.jvm.java.lang.Character.toChars(65)) == ["A"]
+
+    def test_round_trip(self, client):
+        """A returned char[] goes back to Java as a char[], not an Object[]."""
+        Arrays = client.jvm.java.util.Arrays
+        chars = Arrays.copyOf(JavaArray("hello", element_type="Char"), 5)
+
+        assert chars.element_type == "Char"
+        assert client.jvm.java.lang.String.valueOf(chars) == "hello"
+        assert client.jvm.java.util.Arrays.toString(chars) == "[h, e, l, l, o]"
+
+    def test_built_in_python(self, client):
+        chars = JavaArray("abc", element_type="Char")
+
+        assert client.jvm.java.lang.String.valueOf(chars) == "abc"
+
+    def test_long_array(self, client):
+        """Four bytes per char on the wire, so thousands fit in one response."""
+        text = "x" * 10_000
+        chars = client.jvm.java.util.Arrays.copyOf(
+            JavaArray(text, element_type="Char"), len(text)
+        )
+
+        assert "".join(chars) == text
+
+    def test_rejects_characters_outside_the_bmp(self, client):
+        chars = JavaArray(["\U0001f600"], element_type="Char")
+
+        with pytest.raises(ValueError, match="UTF-16 code units"):
+            client.jvm.java.lang.String.valueOf(chars)
+        assert client.ping() is True

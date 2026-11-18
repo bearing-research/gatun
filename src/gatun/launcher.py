@@ -1,4 +1,5 @@
 import atexit
+import glob
 import logging
 import os
 import secrets
@@ -125,16 +126,21 @@ class GatunSession:
                 self.process.kill()
             self.process = None
 
-        # Clean up socket and shared memory files
-        for path in [self.socket_path, f"{self.socket_path}.shm"]:
+        # Clean up the socket and the per-session shared memory files
+        # (<socket>.<session id>.shm). The server removes them itself on a clean
+        # shutdown; this covers a server that was killed.
+        shm_files = glob.glob(f"{glob.escape(self.socket_path)}.*.shm")
+        for path in [self.socket_path, *shm_files]:
             try:
-                if os.path.exists(path):
-                    os.unlink(path)
+                os.unlink(path)
             except OSError:
-                pass  # Ignore cleanup errors
+                pass  # Already gone, or not ours to remove
 
         # Remove from active sessions
         _active_sessions.discard(self)
+        # Stopped for good: drop the atexit entry so it does not keep this session
+        # (and its captured server output) alive until the interpreter exits
+        atexit.unregister(self.stop)
 
 
 def launch_gateway(

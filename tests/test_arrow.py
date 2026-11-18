@@ -8,6 +8,7 @@ from gatun import (
     UnsupportedArrowTypeError,
     estimate_arrow_size,
 )
+from gatun.arena import copy_arrow_table_to_arena
 
 
 def test_send_pyarrow_table(client):
@@ -889,6 +890,60 @@ def test_estimate_arrow_size():
         if buf is not None
     )
     assert estimated >= raw_size + num_buffers * 64
+
+
+def test_estimate_arrow_size_of_a_batch_from_a_large_table():
+    """Regression: a batch was sized by the whole table's buffers, so streaming
+    a table larger than the arena in batches failed on every batch."""
+    table = pa.table({"x": pa.array(range(200_000), type=pa.int64())})
+    batches = table.to_batches(max_chunksize=1000)
+
+    for batch in (batches[0], batches[7]):  # offset 0 and offset > 0
+        assert 8000 <= estimate_arrow_size(batch) < 9000
+    assert estimate_arrow_size(table) >= 1_600_000
+
+
+def test_copy_of_a_batch_copies_only_its_rows(tmp_path):
+    """The first batch of a table starts at offset 0 but shares the table's buffers."""
+    table = pa.table(
+        {
+            "x": pa.array(range(100_000), type=pa.int64()),
+            "s": pa.array([f"row{i}" for i in range(100_000)]),
+        }
+    )
+    with PayloadArena.create(tmp_path / "arena.shm", 4 * 1024 * 1024) as arena:
+        for batch in table.to_batches(max_chunksize=100)[:3]:
+            arena.reset()
+            estimated = estimate_arrow_size(batch)
+            copy_arrow_table_to_arena(pa.Table.from_batches([batch]), arena)
+
+            assert arena.bytes_used() <= estimated < 4000
+
+
+def test_streaming_a_table_larger_than_the_arena(client):
+    """The documented loop: one batch at a time through a reused arena."""
+    arena = client.get_payload_arena()
+    rows = arena.bytes_available() // 8 + 10_000  # int64 column that cannot fit whole
+    table = pa.table({"x": pa.array(range(rows), type=pa.int64())})
+    assert estimate_arrow_size(table) > arena.bytes_available()
+    batches = table.to_batches(max_chunksize=rows // 4)
+    try:
+        for batch in (batches[0], batches[-1]):
+            arena.reset()
+            client.send_arrow_buffers(batch, arena, {})
+            received = client.get_arrow_data()
+            first, last = (
+                received.column("x")[0].as_py(),
+                received.column("x")[-1].as_py(),
+            )
+            assert received.num_rows == batch.num_rows
+            assert (first, last) == (
+                batch.column("x")[0].as_py(),
+                batch.column("x")[-1].as_py(),
+            )
+            del received
+    finally:
+        arena.close()
 
 
 def test_estimate_arrow_size_empty_table():
