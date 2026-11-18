@@ -74,6 +74,11 @@ addopts = "--cov=gatun --cov-report=term-missing --cov-report=html"
 # aligned comments in the README examples.
 extend-exclude = ["*.md"]
 
+[tool.ruff.lint.isort]
+# src/gatun/generated is gitignored. Without this, a checkout that has not generated it yet
+# (the pre-commit CI job) sorts `gatun.generated` imports as third-party.
+known-first-party = ["gatun"]
+
 [tool.mypy]
 python_version = "3.13"
 warn_unused_configs = true
