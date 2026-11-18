@@ -194,7 +194,10 @@ public final class ReflectionCache {
     // Try to find the no-arg method and convert to MethodHandle
     try {
       java.lang.reflect.Method method = clazz.getMethod(methodName);
-      MethodHandle handle = METHOD_LOOKUP.unreflect(method);
+      if (java.lang.reflect.Modifier.isStatic(method.getModifiers())) {
+        return null; // called without a receiver; normal resolution handles it
+      }
+      MethodHandle handle = METHOD_LOOKUP.unreflect(accessibleEquivalent(method));
       // Cache it
       noArgMethodHandleCache
           .computeIfAbsent(clazz, k -> new ConcurrentHashMap<>())
@@ -290,6 +293,33 @@ public final class ReflectionCache {
     return classCache.computeIfAbsent(loader, k -> new ConcurrentHashMap<>());
   }
 
+  /**
+   * {@code Class.forName} as Python calls it. The real one initializes the class it finds, which
+   * would let a caller run the static initializer of any class on the classpath, allowed or not;
+   * these find the class and leave it uninitialized until something allowed uses it.
+   */
+  public static Class<?> classForName(String name) throws ClassNotFoundException {
+    return getClass(name);
+  }
+
+  /** The three-argument form; {@code initialize} is not honoured. */
+  public static Class<?> classForName(String name, boolean initialize, ClassLoader loader)
+      throws ClassNotFoundException {
+    return Class.forName(name, false, loader);
+  }
+
+  private static java.lang.reflect.Method withoutClassInitialization(
+      java.lang.reflect.Method method) {
+    if (method.getDeclaringClass() == Class.class && method.getName().equals("forName")) {
+      try {
+        return ReflectionCache.class.getMethod("classForName", method.getParameterTypes());
+      } catch (NoSuchMethodException e) {
+        // forName(Module, String) never initializes
+      }
+    }
+    return method;
+  }
+
   /** Get a class by name, using cache. Classloader-safe for Spark/dynamic loaders. */
   public static Class<?> getClass(String className) throws ClassNotFoundException {
     ClassLoader loader = getEffectiveClassLoader();
@@ -299,9 +329,60 @@ public final class ReflectionCache {
     if (clazz != null) {
       return clazz;
     }
-    clazz = Class.forName(className, true, loader);
+    clazz = loadClass(className, loader);
     loaderCache.put(className, clazz);
     return clazz;
+  }
+
+  /**
+   * Load a class without initializing it: naming a class must not run its static initializer, which
+   * happens anyway when the class is first used.
+   *
+   * <p>A nested class may be written the way Java source writes it, {@code
+   * java.util.AbstractMap.SimpleEntry}; the binary name the loader wants has a {@code $} there.
+   */
+  private static Class<?> loadClass(String className, ClassLoader loader)
+      throws ClassNotFoundException {
+    try {
+      return Class.forName(className, false, loader);
+    } catch (ClassNotFoundException notFound) {
+      Class<?> nested = loadNestedClass(className, loader);
+      if (nested == null) {
+        throw notFound;
+      }
+      return nested;
+    }
+  }
+
+  /**
+   * {@code a.b.Outer.Inner} as {@code a.b.Outer$Inner}, or null.
+   *
+   * <p>A failed load searches the whole classpath, and most names that are not classes are methods
+   * or fields being asked about ({@code java.lang.Integer.parseInt}), so this only tries names
+   * spelled like a class inside a class: both parts capitalized. A nested class named otherwise is
+   * still reachable by its binary name.
+   */
+  private static Class<?> loadNestedClass(String className, ClassLoader loader) {
+    int lastDot = className.lastIndexOf('.');
+    if (lastDot <= 0 || lastDot == className.length() - 1) {
+      return null;
+    }
+    String outerName = className.substring(0, lastDot);
+    char outerInitial = outerName.charAt(outerName.lastIndexOf('.') + 1);
+    char innerInitial = className.charAt(lastDot + 1);
+    if (!Character.isUpperCase(outerInitial) || !Character.isUpperCase(innerInitial)) {
+      return null;
+    }
+    // Cached when it is a class; itself looked up as a nested class when it is not
+    Class<?> outer = tryGetClass(outerName);
+    if (outer == null) {
+      return null;
+    }
+    try {
+      return Class.forName(outer.getName() + '$' + className.substring(lastDot + 1), false, loader);
+    } catch (ClassNotFoundException | LinkageError e) {
+      return null;
+    }
   }
 
   /**
@@ -317,10 +398,10 @@ public final class ReflectionCache {
       return clazz;
     }
     try {
-      clazz = Class.forName(className, true, loader);
+      clazz = loadClass(className, loader);
       loaderCache.put(className, clazz);
       return clazz;
-    } catch (ClassNotFoundException e) {
+    } catch (ClassNotFoundException | LinkageError e) {
       return null;
     }
   }
@@ -392,6 +473,8 @@ public final class ReflectionCache {
   /** Cached method resolution result with MethodHandle for fast invocation. */
   public static final class CachedMethod {
     public final java.lang.reflect.Method method;
+    private final java.lang.reflect.Method invocable;
+    private final Class<?>[] paramTypes;
     public final MethodHandle handle;
     public final boolean isVarArgs;
     public final int fixedArgCount;
@@ -409,58 +492,36 @@ public final class ReflectionCache {
         this.fixedArgCount = 0;
         this.varargComponentType = null;
       }
-      // Convert to MethodHandle for faster invocation
+      this.paramTypes = method.getParameterTypes();
+      // A public method of a non-public class (a stream, an iterator) is called through the
+      // public type that declares it; the class itself may be in a package nobody can open.
+      this.invocable = withoutClassInitialization(accessibleEquivalent(method));
       MethodHandle h = null;
       try {
-        h = METHOD_LOOKUP.unreflect(method);
+        h = METHOD_LOOKUP.unreflect(invocable);
       } catch (IllegalAccessException e) {
         // Try privateLookupIn for better access (JDK 9+)
         // This works for private inner classes (e.g. ArrayList$Itr) and unnamed modules
-        try {
-          method.setAccessible(true);
-          MethodHandles.Lookup privateLookup =
-              MethodHandles.privateLookupIn(method.getDeclaringClass(), MethodHandles.lookup());
-          h = privateLookup.unreflect(method);
-        } catch (IllegalAccessException | IllegalArgumentException ex) {
-          // Final fallback: use Method.invoke (slower but always works)
+        // A substituted method is never traded back for the one it replaces
+        if (invocable.getDeclaringClass() != ReflectionCache.class) {
+          try {
+            method.setAccessible(true);
+            MethodHandles.Lookup privateLookup =
+                MethodHandles.privateLookupIn(method.getDeclaringClass(), MethodHandles.lookup());
+            h = privateLookup.unreflect(method);
+          } catch (IllegalAccessException | RuntimeException ex) {
+            // Final fallback: use Method.invoke, which reports the access failure if there is one
+          }
         }
       }
-      // For varargs methods, convert to collector so invokeWithArguments works naturally
-      if (isVarArgs && h != null) {
-        Class<?>[] paramTypes = method.getParameterTypes();
-        h = h.asVarargsCollector(paramTypes[paramTypes.length - 1]);
-      }
-      this.handle = h;
+      // prepareArgs always builds the varargs array itself, so the handle takes it as is
+      this.handle = h == null ? null : h.asFixedArity();
       this.isStatic = java.lang.reflect.Modifier.isStatic(method.getModifiers());
     }
 
-    /**
-     * Prepare arguments for invocation.
-     *
-     * <p>For varargs methods with MethodHandle (using asVarargsCollector), we pass args as-is
-     * because the collector handles packing. For Method.invoke fallback, we need to repack.
-     */
+    /** The arguments as the method declares them: varargs collected, numbers converted. */
     public Object[] prepareArgs(Object[] args) {
-      if (!isVarArgs) {
-        return args;
-      }
-      // When using MethodHandle with asVarargsCollector, pass args as-is
-      // The collector will pack trailing args into the varargs array automatically
-      if (handle != null) {
-        return args;
-      }
-      // Fallback for Method.invoke: manually repack varargs
-      Object[] newArgs = new Object[fixedArgCount + 1];
-      for (int i = 0; i < fixedArgCount; i++) {
-        newArgs[i] = args[i];
-      }
-      int varargCount = args.length - fixedArgCount;
-      Object varargArray = java.lang.reflect.Array.newInstance(varargComponentType, varargCount);
-      for (int i = 0; i < varargCount; i++) {
-        java.lang.reflect.Array.set(varargArray, i, args[fixedArgCount + i]);
-      }
-      newArgs[fixedArgCount] = varargArray;
-      return newArgs;
+      return fixedArityArgs(paramTypes, isVarArgs, args);
     }
 
     /** Invoke the method using MethodHandle if available, otherwise fall back to reflection. */
@@ -477,7 +538,7 @@ public final class ReflectionCache {
           return handle.invokeWithArguments(fullArgs);
         }
       }
-      return method.invoke(target, args);
+      return invocable.invoke(target, args);
     }
   }
 
@@ -518,6 +579,7 @@ public final class ReflectionCache {
   /** Cached constructor resolution result with MethodHandle for fast invocation. */
   public static final class CachedConstructor {
     public final java.lang.reflect.Constructor<?> constructor;
+    private final Class<?>[] paramTypes;
     public final MethodHandle handle;
     public final boolean isVarArgs;
     public final int fixedArgCount;
@@ -546,39 +608,17 @@ public final class ReflectionCache {
               MethodHandles.privateLookupIn(
                   constructor.getDeclaringClass(), MethodHandles.lookup());
           h = privateLookup.unreflectConstructor(constructor);
-        } catch (IllegalAccessException | IllegalArgumentException ex) {
+        } catch (IllegalAccessException | RuntimeException ex) {
           // Final fallback: use Constructor.newInstance (slower but always works)
         }
       }
-      // For varargs constructors, convert to collector
-      if (isVarArgs && h != null) {
-        Class<?>[] paramTypes = constructor.getParameterTypes();
-        h = h.asVarargsCollector(paramTypes[paramTypes.length - 1]);
-      }
-      this.handle = h;
+      this.paramTypes = constructor.getParameterTypes();
+      this.handle = h == null ? null : h.asFixedArity();
     }
 
-    /** Prepare arguments for invocation, repacking varargs if needed. */
+    /** The arguments as the constructor declares them: varargs collected, numbers converted. */
     public Object[] prepareArgs(Object[] args) {
-      if (!isVarArgs) {
-        return args;
-      }
-      // When using MethodHandle with asVarargsCollector, pass args as-is
-      if (handle != null) {
-        return args;
-      }
-      // Fallback for Constructor.newInstance: manually repack varargs
-      Object[] newArgs = new Object[fixedArgCount + 1];
-      for (int i = 0; i < fixedArgCount; i++) {
-        newArgs[i] = args[i];
-      }
-      int varargCount = args.length - fixedArgCount;
-      Object varargArray = java.lang.reflect.Array.newInstance(varargComponentType, varargCount);
-      for (int i = 0; i < varargCount; i++) {
-        java.lang.reflect.Array.set(varargArray, i, args[fixedArgCount + i]);
-      }
-      newArgs[fixedArgCount] = varargArray;
-      return newArgs;
+      return fixedArityArgs(paramTypes, isVarArgs, args);
     }
 
     /** Invoke the constructor using MethodHandle if available. */
@@ -588,6 +628,95 @@ public final class ReflectionCache {
       }
       return constructor.newInstance(args);
     }
+  }
+
+  // ========== ARGUMENT PREPARATION ==========
+
+  /**
+   * Turn the arguments a caller passed into the ones a method or constructor declares.
+   *
+   * <p>Trailing arguments of a varargs call are collected into an array, unless the caller passed
+   * that array itself (as Java does for {@code String.format(fmt, objectArray)}). Numbers are
+   * converted to the declared parameter type where the resolver accepted a different one, such as
+   * an {@code Integer} for a {@code Long} parameter.
+   */
+  static Object[] fixedArityArgs(Class<?>[] paramTypes, boolean varArgs, Object[] args) {
+    if (!varArgs) {
+      Object[] result = args;
+      for (int i = 0; i < args.length && i < paramTypes.length; i++) {
+        Object converted = MethodResolver.coerce(args[i], paramTypes[i]);
+        if (converted != args[i]) {
+          if (result == args) {
+            result = args.clone();
+          }
+          result[i] = converted;
+        }
+      }
+      return result;
+    }
+
+    int fixedCount = paramTypes.length - 1;
+    Class<?> arrayType = paramTypes[fixedCount];
+    Object[] result = new Object[paramTypes.length];
+    for (int i = 0; i < fixedCount; i++) {
+      result[i] = MethodResolver.coerce(args[i], paramTypes[i]);
+    }
+    if (args.length == paramTypes.length && arrayType.isInstance(args[fixedCount])) {
+      result[fixedCount] = args[fixedCount]; // the caller passed the array itself
+      return result;
+    }
+    Class<?> componentType = arrayType.getComponentType();
+    int varargCount = args.length - fixedCount;
+    Object varargArray = java.lang.reflect.Array.newInstance(componentType, varargCount);
+    for (int i = 0; i < varargCount; i++) {
+      java.lang.reflect.Array.set(
+          varargArray, i, MethodResolver.coerce(args[fixedCount + i], componentType));
+    }
+    result[fixedCount] = varargArray;
+    return result;
+  }
+
+  /**
+   * The same method as declared by a public class or interface in an exported package, if there is
+   * one. {@code getMethods()} on a runtime class such as a stream reports methods declared by a
+   * package-private implementation class, which cannot be called reflectively; the interface's
+   * declaration can, and dispatches to the same code.
+   */
+  static java.lang.reflect.Method accessibleEquivalent(java.lang.reflect.Method method) {
+    Class<?> declaring = method.getDeclaringClass();
+    if (java.lang.reflect.Modifier.isStatic(method.getModifiers()) || isAccessibleType(declaring)) {
+      return method;
+    }
+    java.util.ArrayDeque<Class<?>> pending = new java.util.ArrayDeque<>();
+    java.util.Set<Class<?>> seen = new java.util.HashSet<>();
+    pending.add(declaring);
+    while (!pending.isEmpty()) {
+      Class<?> type = pending.poll();
+      if (!seen.add(type)) {
+        continue;
+      }
+      if (isAccessibleType(type)) {
+        try {
+          java.lang.reflect.Method candidate =
+              type.getDeclaredMethod(method.getName(), method.getParameterTypes());
+          if (java.lang.reflect.Modifier.isPublic(candidate.getModifiers())) {
+            return candidate;
+          }
+        } catch (NoSuchMethodException e) {
+          // not declared here; keep looking
+        }
+      }
+      if (type.getSuperclass() != null) {
+        pending.add(type.getSuperclass());
+      }
+      pending.addAll(java.util.List.of(type.getInterfaces()));
+    }
+    return method;
+  }
+
+  private static boolean isAccessibleType(Class<?> type) {
+    return java.lang.reflect.Modifier.isPublic(type.getModifiers())
+        && type.getModule().isExported(type.getPackageName());
   }
 
   // ========== VAR HANDLE SUPPORT ==========

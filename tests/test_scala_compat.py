@@ -14,7 +14,6 @@ The reflection support enables proper handling of:
 import pyarrow as pa
 
 from gatun import JavaArray
-from gatun.client import _reflect_cache
 
 
 class TestReflection:
@@ -46,17 +45,49 @@ class TestReflection:
         assert result == "none"
 
     def test_reflect_cache_used_by_jvm_node(self, client):
-        """Test that JVM navigation uses reflection cache."""
-        # Clear cache for this test
+        """JVM navigation remembers what the server said a path is."""
         test_path = "java.util.ArrayList"
-        _reflect_cache.pop(test_path, None)
+        assert test_path not in client._reflect_cache
 
-        # Access via JVM view triggers reflection and caches result
         _ = client.jvm.java.util.ArrayList()
 
-        # Cache should be populated by _JVMNode._get_type()
-        assert test_path in _reflect_cache
-        assert _reflect_cache[test_path] == "class"
+        assert client._reflect_cache[test_path] == "class"
+
+    def test_reflect_cache_belongs_to_the_client(self, client, make_client):
+        """What a name means depends on the server, so clients do not share answers."""
+        _ = client.jvm.java.util.ArrayList()
+        other = make_client()
+        assert "java.util.ArrayList" not in other._reflect_cache
+
+    def test_missing_member_of_a_known_class_is_remembered(self, client):
+        """A class's members are settled, so the server is asked about each once."""
+        assert client.jvm.java.lang.Integer.parseInt("7") == 7
+        asked = []
+        real = client.reflect
+
+        def counting(name):
+            asked.append(name)
+            return real(name)
+
+        client.reflect = counting
+        for _ in range(3):
+            assert client._reflect_cached("java.lang.Integer.noSuchMember") == "none"
+        assert asked == ["java.lang.Integer.noSuchMember"]
+
+    def test_underscore_names_are_not_sent_to_the_server(self, client):
+        """IPython asks every object for `_repr_html_` and a dozen like it."""
+        asked = []
+        client.reflect = lambda name: asked.append(name) or "none"
+
+        node = client.jvm.java.util.ArrayList
+        assert not hasattr(node, "_repr_html_")
+        assert not hasattr(node, "_ipython_display_")
+        assert asked == []
+
+    def test_unresolved_names_are_asked_again(self, client):
+        """A name that did not resolve may resolve later; "none" is not remembered."""
+        assert client._reflect_cached("java.util.NoSuchThing") == "none"
+        assert "java.util.NoSuchThing" not in client._reflect_cache
 
 
 class TestScalaObjectMethods:

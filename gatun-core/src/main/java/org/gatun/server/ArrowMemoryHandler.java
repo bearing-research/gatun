@@ -409,10 +409,16 @@ public class ArrowMemoryHandler implements AutoCloseable {
    * @return Rows in the stream, over all of its record batches, and the stream's size in bytes
    */
   public Received processArrowIpcBatch(MemorySegment payloadSlice) throws Exception {
-    ByteBuffer arrowBuf = payloadSlice.asByteBuffer();
 
+    // Read through a channel over the segment: a ByteBuffer cannot span a payload zone
+    // larger than 2GB
     try (ArrowStreamReader reader =
-        new ArrowStreamReader(new GatunServer.ByteBufferInputStream(arrowBuf), allocator)) {
+        new ArrowStreamReader(new SegmentReadChannel(payloadSlice), allocator)) {
+
+      // Reading the schema rejects a payload that is not an Arrow stream. A stream with a
+      // schema and no record batch is a table without rows, which is what pyarrow writes for
+      // one.
+      reader.getVectorSchemaRoot();
 
       // A table with several chunks arrives as one record batch per chunk
       long rows = 0;
@@ -421,11 +427,8 @@ public class ArrowMemoryHandler implements AutoCloseable {
         rows += reader.getVectorSchemaRoot().getRowCount();
         batches++;
       }
-      if (batches == 0) {
-        throw new RuntimeException("Arrow Stream Empty");
-      }
       LOG.fine("Arrow IPC stream received: " + rows + " rows in " + batches + " batches");
-      return new Received(rows, arrowBuf.position());
+      return new Received(rows, reader.bytesRead());
     }
   }
 

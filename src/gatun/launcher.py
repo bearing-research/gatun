@@ -6,12 +6,15 @@ import re
 import secrets
 import signal
 import socket
+import stat
 import subprocess
+import sys
 import threading
 import time
 import weakref
 from pathlib import Path
 
+from gatun.client import COMMAND_ZONE_SIZE, RESPONSE_ZONE_SIZE
 from gatun.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -19,6 +22,19 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 MODULE_DIR = Path(__file__).parent.resolve()
 JAR_PATH = MODULE_DIR / "jars" / "gatun-server-all.jar"
+
+# The shared memory holds the command zone, the payload zone and the response
+# zone. A size that leaves no payload zone makes the response zone overlap the
+# command zone, so require room for a small payload as well.
+MIN_PAYLOAD_SIZE = 65536
+MIN_MEMORY_BYTES = COMMAND_ZONE_SIZE + MIN_PAYLOAD_SIZE + RESPONSE_ZONE_SIZE
+
+# Lines of server output kept per stream. The tail is what a startup failure
+# reports; a server logging at FINE for days must not grow the client's memory.
+OUTPUT_TAIL_LINES = 1000
+
+# How long a server gets to exit after SIGTERM before it is killed
+STOP_GRACE_SECONDS = 2.0
 
 # Track all active sessions for cleanup on signals
 _active_sessions: weakref.WeakSet["GatunSession"] = weakref.WeakSet()
@@ -49,11 +65,13 @@ def _install_signal_handlers():
         return
     _signal_handlers_installed = True
 
-    # Only install handlers if we're not already handling these signals
+    # Only take over a signal that would otherwise kill the process without any
+    # cleanup. An ignored signal stays ignored: a process started with nohup, or
+    # as a background job of a non-interactive shell, must not start dying of
+    # it because it launched a server. Any other handler is the application's.
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            current = signal.getsignal(sig)
-            if current in (signal.SIG_DFL, signal.SIG_IGN, None):
+            if signal.getsignal(sig) is signal.SIG_DFL:
                 signal.signal(sig, _signal_handler)
         except (OSError, ValueError):
             pass  # Can't set signal handler (e.g., not main thread)
@@ -146,12 +164,96 @@ def _take_property(jvm_flags: list[str], name: str) -> list[str]:
     return names
 
 
-def _drain_pipe(pipe, storage: list):
-    """Drain a pipe to prevent buffer fill-up. Runs in background thread."""
+_MEMORY_UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3}
+_MEMORY_SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:([KMG])B?)?", re.IGNORECASE)
+
+
+def _parse_memory_size(memory: str | int) -> int:
+    """Convert a memory size such as "64MB" to a number of bytes.
+
+    Accepts a number followed by KB, MB or GB (or K, M, G; any case), a bare
+    number of bytes, or a positive int of bytes. Units are powers of 1024.
+
+    Raises:
+        ValueError: if the value is not a size, or is too small for a server
+            to run with.
+    """
+    mem_bytes: int | None = None
+    # bool is an int, but True is not a size
+    if isinstance(memory, int) and not isinstance(memory, bool):
+        mem_bytes = memory if memory > 0 else None
+    elif isinstance(memory, str):
+        match = _MEMORY_SIZE.fullmatch(memory.strip())
+        if match:
+            number, unit = match.groups()
+            if unit is not None:
+                mem_bytes = int(float(number) * _MEMORY_UNITS[unit.upper()])
+            elif number.isdigit():  # no such thing as half a byte
+                mem_bytes = int(number)
+
+    if mem_bytes is None:
+        raise ValueError(
+            f"Invalid memory size: {memory!r}. Expected a number with a unit, such "
+            "as '512KB', '64MB' or '1GB' (K, M and G also work, in any case), or a "
+            "positive whole number of bytes."
+        )
+    if mem_bytes < MIN_MEMORY_BYTES:
+        raise ValueError(
+            f"Memory size {memory!r} is too small: {mem_bytes:,} bytes, and the "
+            f"minimum is {MIN_MEMORY_BYTES:,} bytes ({MIN_MEMORY_BYTES // 1024}KB), "
+            "which holds the command zone, the response zone and a small payload "
+            "zone. Sizes are written like '512KB', '64MB' or '1GB'."
+        )
+    return mem_bytes
+
+
+def _accepts_connections(socket_path: str, timeout: float) -> bool:
+    """Whether something is listening on the Unix socket at socket_path."""
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
     try:
-        storage.extend(pipe)
+        probe.connect(socket_path)
+    except TimeoutError:
+        # Nobody refused the connection, so there is a listener whose accept
+        # queue is full
+        return True
+    except OSError:
+        # No file, a socket file nobody listens on, or not a socket at all
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def _drain_pipe(pipe, storage: list, limit: int = OUTPUT_TAIL_LINES):
+    """Read a pipe to its end, keeping the most recent lines in storage.
+
+    Runs in a background thread: a pipe nobody reads fills up and blocks the
+    server on its next line of output. storage holds between limit and
+    2 * limit lines once that many were read; trimming at twice the limit
+    avoids shifting the whole list for every line.
+    """
+    try:
+        for line in pipe:
+            storage.append(line)
+            if len(storage) >= 2 * limit:
+                del storage[:-limit]
     except (ValueError, OSError):
         pass  # Pipe closed
+
+
+def _terminate(process: subprocess.Popen) -> None:
+    """Stop a process and reap it: SIGTERM, then SIGKILL if that is not enough."""
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        # Without this the killed process stays a zombie until the interpreter
+        # exits, and returncode is never set
+        process.wait()
 
 
 class GatunSession:
@@ -162,55 +264,134 @@ class GatunSession:
         self._stdout_lines: list[str] = []
         self._stderr_lines: list[str] = []
         self._drain_threads: list[threading.Thread] = []
+        # A fork copies this object, the atexit entry and the signal handler
+        # into the child, where they would stop a server the child does not own
+        self._owner_pid = os.getpid()
+        self._stopped = False
 
     def _start_drain_threads(self):
         """Start background threads to drain stdout/stderr pipes."""
-        if self.process.stdout:
-            t = threading.Thread(
-                target=_drain_pipe,
-                args=(self.process.stdout, self._stdout_lines),
-                daemon=True,
-            )
-            t.start()
-            self._drain_threads.append(t)
-        if self.process.stderr:
-            t = threading.Thread(
-                target=_drain_pipe,
-                args=(self.process.stderr, self._stderr_lines),
-                daemon=True,
-            )
-            t.start()
-            self._drain_threads.append(t)
+        for pipe, storage in (
+            (self.process.stdout, self._stdout_lines),
+            (self.process.stderr, self._stderr_lines),
+        ):
+            if pipe:
+                t = threading.Thread(
+                    target=_drain_pipe, args=(pipe, storage), daemon=True
+                )
+                t.start()
+                self._drain_threads.append(t)
+
+    def _finish_draining(self, process) -> None:
+        """Collect the last output of a process that has exited, then close its pipes."""
+        for t in self._drain_threads:
+            # The pipes reach end-of-file when the process exits, unless a
+            # process it started still holds them open
+            t.join(timeout=1)
+        if any(t.is_alive() for t in self._drain_threads):
+            # Closing a pipe that a thread is blocked reading would block too
+            return
+        for pipe in (process.stdout, process.stderr):
+            if pipe:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+    def _captured_output(self) -> str:
+        """The tail of the server's output, for error messages."""
+        return (
+            f"stdout: {''.join(self._stdout_lines[-OUTPUT_TAIL_LINES:])}\n"
+            f"stderr: {''.join(self._stderr_lines[-OUTPUT_TAIL_LINES:])}"
+        )
 
     def stop(self):
-        if self.process:
-            logger.debug("Stopping Java server...")
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-            self.process = None
+        """Stop the server and remove its files. Safe to call more than once.
 
-        # Clean up the socket and the per-session shared memory files
-        # (<socket>.<session id>.shm). The server removes them itself on a clean
-        # shutdown; this covers a server that was killed.
-        shm_files = glob.glob(f"{glob.escape(self.socket_path)}.*.shm")
-        for path in [self.socket_path, *shm_files]:
+        Does nothing in a process other than the one that launched the server.
+        """
+        if os.getpid() != self._owner_pid or self._stopped:
+            return
+        # Set first: a signal handler may call stop() again while this call is
+        # waiting for the server to exit
+        self._stopped = True
+        process, self.process = self.process, None
+
+        try:
+            if process:
+                logger.debug("Stopping Java server...")
+                _terminate(process)
+                self._finish_draining(process)
+        finally:
+            # Clean up the socket and the per-session shared memory files
+            # (<socket>.<session id>.shm). The server removes them itself on a
+            # clean shutdown; this covers a server that was killed.
+            for path in glob.glob(f"{glob.escape(self.socket_path)}.*.shm"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass  # Already gone, or not ours to remove
             try:
-                os.unlink(path)
+                # Only if it is a socket. The path is the caller's choice, and a
+                # server that failed before binding it has left whatever was
+                # there in place.
+                if stat.S_ISSOCK(os.lstat(self.socket_path).st_mode):
+                    os.unlink(self.socket_path)
             except OSError:
-                pass  # Already gone, or not ours to remove
+                pass
 
-        # Remove from active sessions
-        _active_sessions.discard(self)
-        # Stopped for good: drop the atexit entry so it does not keep this session
-        # (and its captured server output) alive until the interpreter exits
-        atexit.unregister(self.stop)
+            # Remove from active sessions
+            _active_sessions.discard(self)
+            # Stopped for good: drop the atexit entry so it does not keep this
+            # session (and its captured server output) alive until the
+            # interpreter exits
+            atexit.unregister(self.stop)
+
+
+def _wait_until_ready(session: GatunSession, timeout: float, debug_mode: bool) -> None:
+    """Wait until the server accepts connections on its socket.
+
+    Raises RuntimeError if the server exits first or the timeout passes; on a
+    timeout the server has been stopped by the time this returns.
+    """
+    process = session.process
+    deadline = time.monotonic() + timeout
+    while True:
+        returncode = process.poll()
+        if returncode is not None:
+            if debug_mode:
+                # Output was already printed to stderr
+                raise RuntimeError(
+                    f"Java Server failed to start (exit code {returncode}, "
+                    "see output above)"
+                )
+            session._finish_draining(process)
+            raise RuntimeError(
+                f"Java Server failed to start (exit code {returncode}):\n"
+                f"{session._captured_output()}"
+            )
+
+        # The file existing is not enough: it may be left over from an earlier
+        # server, with this one yet to replace it
+        if _accepts_connections(session.socket_path, timeout=0.1):
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+
+    # Stop it before reporting, so the message has all of its output
+    session.stop()
+    message = (
+        f"Timed out after {timeout:g}s waiting for Java Server socket at "
+        f"{session.socket_path}."
+    )
+    if not debug_mode:
+        message += f" Server output:\n{session._captured_output()}"
+    raise RuntimeError(message)
 
 
 def launch_gateway(
-    memory: str | None = None,
+    memory: str | int | None = None,
     socket_path: str | None = None,
     classpath: list[str] | None = None,
     trace: bool = False,
@@ -224,9 +405,12 @@ def launch_gateway(
     Launches the embedded Java server.
 
     Args:
-        memory: Memory size (e.g., "512MB", "1GB"). Defaults to config value.
+        memory: Shared memory size per client: a number with a unit ("512KB",
+                "64MB", "1GB") or a number of bytes. Defaults to config value.
         socket_path: Path to the Unix socket. If not specified, generates a unique
                      path in the system temp directory to allow concurrent sessions.
+                     A fixed path can serve one server at a time: launching fails
+                     if another server is already listening on it.
         classpath: Additional JAR files or directories to add to the classpath.
                    This allows loading external classes (e.g., Spark JARs).
         trace: Enable trace mode for verbose method resolution logging.
@@ -266,13 +450,7 @@ def launch_gateway(
     if memory is None:
         memory = config.memory
 
-    size_str = memory.upper()
-    if size_str.endswith("GB"):
-        mem_bytes = int(float(size_str[:-2]) * 1024 * 1024 * 1024)
-    elif size_str.endswith("MB"):
-        mem_bytes = int(float(size_str[:-2]) * 1024 * 1024)
-    else:
-        mem_bytes = int(size_str)  # Assume bytes
+    mem_bytes = _parse_memory_size(memory)
 
     # 2. Setup Paths - use random temp file if not specified
     if socket_path is None:
@@ -321,6 +499,16 @@ def launch_gateway(
     if all_prefixes:
         jvm_flags.append(f"-Dgatun.allowlist.prefixes={','.join(all_prefixes)}")
 
+    # 3c. The process the server belongs to. The server runs in its own session
+    # (see Popen below), so nothing else ends it when this process is killed
+    # without running its cleanup; the server watches this pid and exits when
+    # it is gone. A value the caller set directly ties it to that process
+    # instead.
+    parent_pid = _take_property(jvm_flags, "gatun.parent.pid")
+    jvm_flags.append(
+        f"-Dgatun.parent.pid={parent_pid[-1] if parent_pid else os.getpid()}"
+    )
+
     # Find Java executable - prefer JAVA_HOME, fall back to PATH
     java_home = os.environ.get("JAVA_HOME")
     if java_home:
@@ -350,66 +538,59 @@ def launch_gateway(
     logger.info("Launching Java server: %s @ %s", memory, socket_path)
     logger.debug("JVM command: %s", " ".join(cmd))
 
-    # Check if debug mode is requested via env var or parameter
-    import sys
-
-    debug_mode = debug or os.environ.get("GATUN_DEBUG", "").lower() == "true"
-
-    if debug_mode:
-        # Pass through output for debugging - logs appear in real-time
-        process = subprocess.Popen(cmd, stdout=sys.stderr, stderr=sys.stderr, text=True)
-    else:
-        # Capture output (default) - quieter but startup errors are still reported
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    # A server already listening here would answer the readiness check below,
+    # so the caller would end up connected to it (with whatever classpath and
+    # memory size it was started with) while the new server deleted its socket
+    # file and truncated its shared memory files. A socket file left behind by
+    # a dead server refuses connections and is simply replaced.
+    if _accepts_connections(socket_path, timeout=1.0):
+        raise RuntimeError(
+            f"A server is already listening on {socket_path}; launching another "
+            "one on the same socket path would break it. Stop that server first, "
+            "pass a different socket_path, or leave socket_path unset (also in "
+            "[tool.gatun] and GATUN_SOCKET_PATH) to get a unique path for each "
+            "server. To use the server that is already running, connect to it "
+            "with GatunClient(socket_path) instead of launching."
         )
 
-    # 4. Wait for Socket to be ready (not just file existence, but connectable)
-    max_retries = int(config.startup_timeout / 0.1)
-    retries = max_retries
-    while retries > 0:
-        if process.poll() is not None:
-            # Process died
-            if debug_mode:
-                # Output was already printed to stderr
-                raise RuntimeError("Java Server failed to start (see output above)")
-            else:
-                stdout, stderr = process.communicate()
-                raise RuntimeError(
-                    f"Java Server failed to start:\nstdout: {stdout}\nstderr: {stderr}"
-                )
+    # Check if debug mode is requested via env var or parameter
+    debug_mode = debug or os.environ.get("GATUN_DEBUG", "").lower() == "true"
+    # Pass output through in debug mode, so logs appear in real time. Otherwise
+    # capture it: quieter, and a startup failure can still report it.
+    output = sys.stderr if debug_mode else subprocess.PIPE
 
-        # Check if socket file exists AND is connectable
-        if os.path.exists(socket_path):
-            try:
-                # Try to connect to verify server is ready
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(0.1)
-                sock.connect(socket_path)
-                sock.close()
-                break  # Server is ready
-            except (ConnectionRefusedError, OSError):
-                pass  # Socket exists but server not ready yet
+    session = GatunSession(None, socket_path, mem_bytes)
+    try:
+        session.process = subprocess.Popen(
+            cmd,
+            stdout=output,
+            stderr=output,
+            text=True,
+            # Undecodable output must not end the thread that drains the pipe
+            errors="replace",
+            # Its own session, and so its own process group: Ctrl-C in a
+            # terminal signals the whole foreground group, which would take the
+            # server down under a program that handles KeyboardInterrupt
+            start_new_session=True,
+        )
+        # 4. Drain the pipes from the start: a server that writes more than a
+        # pipe buffer (~64KB) while starting up would otherwise block before it
+        # ever listens.
+        if not debug_mode:
+            session._start_drain_threads()
 
-        time.sleep(0.1)
-        retries -= 1
+        # 5. Wait for the socket to be connectable, not just for the file
+        _wait_until_ready(session, config.startup_timeout, debug_mode)
 
-    if retries == 0:
-        process.terminate()
-        raise RuntimeError("Timed out waiting for Java Server socket.")
-
-    # 5. Register Cleanup
-    session = GatunSession(process, socket_path, mem_bytes)
-
-    # Start background threads to drain stdout/stderr pipes.
-    # This prevents the Java process from blocking when the pipe buffer fills up
-    # (default ~64KB on most systems). Without draining, the server hangs after
-    # producing enough log output.
-    if not debug_mode:
-        session._start_drain_threads()
-
-    _active_sessions.add(session)
-    atexit.register(session.stop)
-    _install_signal_handlers()
+        # 6. Register cleanup
+        _active_sessions.add(session)
+        atexit.register(session.stop)
+        _install_signal_handlers()
+    except BaseException:
+        # Nothing else refers to the server yet, so whatever interrupted the
+        # startup (KeyboardInterrupt included) would leave it running
+        if session.process is not None:
+            session.stop()
+        raise
 
     return session

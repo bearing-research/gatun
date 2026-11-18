@@ -410,6 +410,33 @@ class TestAllowingYourOwnClasses:
             client.close()
 
 
+class TestCancellingARequest:
+    """The 'Cancelling a Request' and 'Configuration' examples."""
+
+    def test_cancel_from_another_thread(self):
+        import threading
+
+        from gatun import CancelledException
+
+        client = connect(allowed_classes=["java.lang.Thread"])
+        try:
+            threading.Timer(0.5, client.cancel).start()
+            with pytest.raises(CancelledException):
+                client.jvm.java.lang.Thread.sleep(60_000)
+
+            assert client.ping() is True  # the client is still usable
+        finally:
+            client.close()
+
+    def test_timeouts(self):
+        client = connect(socket_timeout=120.0, callback_timeout=None)
+        try:
+            assert client.socket_timeout == 120.0
+            assert client.callback_timeout is None
+        finally:
+            client.close()
+
+
 class TestArrowTablesAsJavaObjects:
     """Test the 'Arrow Tables as Java Objects' example."""
 

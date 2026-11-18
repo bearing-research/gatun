@@ -2,7 +2,7 @@
 
 import pytest
 
-from gatun import JavaSecurityException, java_import
+from gatun import JavaObject, JavaSecurityException, connect, java_import
 
 
 def test_jvm_view_create_arraylist(client):
@@ -287,3 +287,43 @@ class TestPrimitiveWidening:
         """Test Math.floor with int argument."""
         result = client.jvm.java.lang.Math.floor(5)
         assert result == 5.0
+
+
+class TestMembersAreWhatTheServerSaysTheyAre:
+    """How a name is spelled does not say whether it is a field or a method."""
+
+    def test_lowercase_static_field(self, client):
+        out = client.jvm.java.lang.System.out
+        assert isinstance(out, JavaObject)
+        assert client.is_instance_of(out, "java.io.PrintStream")
+
+    def test_uppercase_static_method(self, compile_java):
+        """`Encoders.STRING()` in Spark is a method; it was read as a field."""
+        classes = compile_java(
+            "Caps",
+            "public class Caps {\n"
+            "  public static final int LIMIT = 3;\n"
+            "  public static int counter = 5;\n"
+            '  public static String NAME() { return "caps"; }\n'
+            "  public static int TWICE(int n) { return 2 * n; }\n"
+            "}\n",
+        )
+        client = connect(memory="16MB", classpath=[classes], allowed_classes=["Caps"])
+        try:
+            Caps = client.jvm.Caps
+            assert Caps.NAME() == "caps"
+            assert Caps.TWICE(4) == 8
+            assert Caps.LIMIT == 3
+            assert Caps.counter == 5
+        finally:
+            client.close()
+
+    def test_protocol_probes_are_not_java_names(self, client):
+        """`copy`, `pickle` and `inspect` look for dunder attributes."""
+        import copy
+
+        node = client.jvm.java.util.ArrayList
+        assert not hasattr(node, "__deepcopy__")
+        assert not hasattr(node, "__wrapped__")
+        with pytest.raises(TypeError):
+            copy.deepcopy(client.jvm.java.util)

@@ -1,4 +1,6 @@
 import logging
+import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -119,3 +121,25 @@ def make_client(java_gateway):
     # Cleanup the last client
     if current_client[0] is not None:
         current_client[0].close()
+
+
+@pytest.fixture
+def compile_java(tmp_path):
+    """Compile one Java class and return the directory to put on the classpath.
+
+    For behaviour no JDK class shows: a static initializer with a visible effect,
+    a static method spelled in capitals.
+    """
+
+    def _compile(class_name: str, source: str) -> str:
+        java_home = os.environ.get("JAVA_HOME")
+        javac = os.path.join(java_home, "bin", "javac") if java_home else "javac"
+        source_file = tmp_path / f"{class_name}.java"
+        source_file.write_text(source)
+        subprocess.run(
+            [javac, "--release", "22", "-d", str(tmp_path), str(source_file)],
+            check=True,
+        )
+        return str(tmp_path)
+
+    return _compile

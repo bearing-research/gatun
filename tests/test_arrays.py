@@ -249,3 +249,10 @@ class TestCharArrays:
         with pytest.raises(ValueError, match="UTF-16 code units"):
             client.jvm.java.lang.String.valueOf(chars)
         assert client.ping() is True
+
+
+def test_unknown_element_type_is_refused():
+    """`element_type="int"` used to be sent, without a word, as Object[]."""
+    with pytest.raises(ValueError, match="Unknown JavaArray element_type 'int'"):
+        JavaArray([1, 2], element_type="int")
+    assert JavaArray([1, 2], element_type="Int").element_type == "Int"

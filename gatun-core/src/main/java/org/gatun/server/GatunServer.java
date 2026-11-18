@@ -2,9 +2,9 @@ package org.gatun.server;
 
 import com.google.flatbuffers.FlatBufferBuilder;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
@@ -17,6 +17,10 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.nio.file.attribute.UserPrincipal;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -24,9 +28,12 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jdk.net.ExtendedSocketOptions;
+import jdk.net.UnixDomainPrincipal;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -45,7 +52,11 @@ public class GatunServer {
   // Version 2: Per-client shared memory (handshake includes SHM path)
   public static final int PROTOCOL_VERSION = 3;
 
+  private static final Set<PosixFilePermission> OWNER_ONLY =
+      PosixFilePermissions.fromString("rw-------");
+
   private final Path socketPath;
+  private volatile UserPrincipal serverUser; // owner of the socket file, set once it is bound
   private final long memorySize;
   private final long responseOffset;
   private final ExecutorService threadPool;
@@ -58,6 +69,12 @@ public class GatunServer {
 
   // --- SECURITY: classes that can be instantiated or used for static methods ---
   private final ClassAllowlist allowlist = ClassAllowlist.fromSystemProperties();
+
+  /** A static method or field: the class must be allowed and the member not refused. */
+  private void requireClassAllowed(String className, String member) {
+    requireClassAllowed(className);
+    allowlist.checkStaticMember(className, member);
+  }
 
   private void requireClassAllowed(String className) {
     if (!allowlist.isAllowed(className)) {
@@ -108,9 +125,9 @@ public class GatunServer {
   private static class SessionContext {
     final SocketChannel channel;
     final MemorySegment sharedMem;
-    final Object callbackLock; // Lock for serializing callback round-trips
     final Set<Long> sessionObjectIds; // Track object IDs for cleanup
     final SessionQuota quota;
+    final SessionControl control = new SessionControl();
 
     SessionContext(
         SocketChannel channel,
@@ -119,21 +136,87 @@ public class GatunServer {
         SessionQuota quota) {
       this.channel = channel;
       this.sharedMem = sharedMem;
-      this.callbackLock = new Object();
       this.sessionObjectIds = sessionObjectIds;
       this.quota = quota;
     }
   }
+
+  /**
+   * Lets another connection cancel the request a session is running.
+   *
+   * <p>A session's own channel is busy for as long as its request runs, so a cancel has to come in
+   * on a different connection, which names the session by its shared memory path. Cancelling
+   * interrupts the session's thread, but only while it is running the request's Java code:
+   * interrupting a thread that is reading or writing the session's socket would close the socket.
+   */
+  private static final class SessionControl {
+    private final Thread thread = Thread.currentThread();
+
+    private boolean requestActive;
+    private boolean interruptible;
+    private boolean cancelled;
+
+    synchronized void beginRequest() {
+      requestActive = true;
+      interruptible = true;
+      cancelled = false;
+    }
+
+    /** The request's Java code is done; from here on the thread uses the socket again. */
+    synchronized void endRequest() {
+      requestActive = false;
+      interruptible = false;
+      cancelled = false;
+      Thread.interrupted(); // drop an interrupt that arrived too late to matter
+    }
+
+    /** Called by another session's thread. False if there was no request to cancel. */
+    synchronized boolean cancel() {
+      if (!requestActive) {
+        return false;
+      }
+      cancelled = true;
+      if (interruptible) {
+        thread.interrupt();
+      }
+      return true;
+    }
+
+    /** Before a callback round trip, which uses the socket. */
+    synchronized void beginSocketUse() throws InterruptedException {
+      interruptible = false;
+      if (Thread.interrupted() || cancelled) {
+        throw new InterruptedException("Request was cancelled");
+      }
+    }
+
+    /** After a callback round trip; the caller checks for a cancel that arrived during it. */
+    synchronized void endSocketUse() {
+      interruptible = requestActive;
+    }
+
+    synchronized boolean isCancelled() {
+      return cancelled;
+    }
+
+    synchronized boolean isRequestActive() {
+      return requestActive;
+    }
+
+    boolean isSessionThread() {
+      return Thread.currentThread() == thread;
+    }
+  }
+
+  // Sessions by shared memory path, for Cancel and for reaping idle sessions
+  private final Map<String, SessionContext> sessions = new ConcurrentHashMap<>();
+  private final AtomicInteger sessionCount = new AtomicInteger();
 
   // Per-session context stored in ThreadLocal for the handleClient thread
   private static final ThreadLocal<SessionContext> sessionContext = new ThreadLocal<>();
 
   // Per-session: current request ID for cancellation support
   private static final ThreadLocal<Long> currentRequestId = new ThreadLocal<>();
-
-  // Per-session: cancelled request IDs
-  private static final ThreadLocal<Set<Long>> cancelledRequests =
-      ThreadLocal.withInitial(HashSet::new);
 
   // Per-request: nesting depth counter for convertArgument recursion
   private static final ThreadLocal<Integer> argumentNestingDepth = ThreadLocal.withInitial(() -> 0);
@@ -243,15 +326,171 @@ public class GatunServer {
     try (ServerSocketChannel serverChannel =
         ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
       serverChannel.bind(UnixDomainSocketAddress.of(socketPath));
+      // Whoever can connect can run code as this user, so only this user may
+      Files.setPosixFilePermissions(socketPath, OWNER_ONLY);
+      serverUser = Files.getOwner(socketPath);
       LOG.info("Server ready at: " + socketPath);
       if (allowlist.hasAdditions()) {
         LOG.info("Class allowlist additions: " + allowlist.describeAdditions());
       }
 
+      if (ResourceLimits.SESSION_IDLE_TIMEOUT_MS > 0) {
+        Thread.ofVirtual().name("gatun-idle-reaper").start(this::reapIdleSessions);
+      }
+
       while (true) {
-        SocketChannel client = serverChannel.accept();
+        SocketChannel client;
+        try {
+          client = serverChannel.accept();
+        } catch (java.nio.channels.ClosedChannelException e) {
+          throw e; // the server socket is gone; nothing more to accept
+        } catch (IOException e) {
+          // Typically out of file descriptors. That must not end the sessions already
+          // running; wait for some to close.
+          LOG.log(Level.WARNING, "Could not accept a connection", e);
+          try {
+            Thread.sleep(100);
+          } catch (InterruptedException interrupted) {
+            return;
+          }
+          continue;
+        }
+        if (!isSameUser(client)) {
+          LOG.warning("Refused a connection from another user");
+          client.close();
+          continue;
+        }
         long sessionId = sessionCounter.incrementAndGet();
-        threadPool.submit(() -> handleClient(client, sessionId));
+        threadPool.submit(() -> {
+          if (!takeSessionSlot()) {
+            LOG.warning(
+                "Refused a connection: "
+                    + ResourceLimits.MAX_SESSIONS
+                    + " sessions are open (max_sessions)");
+            try {
+              client.close();
+            } catch (IOException e) {
+              // already gone
+            }
+            return;
+          }
+          handleClient(client, sessionId);
+        });
+      }
+    }
+  }
+
+  /**
+   * Create a session's shared memory file: new, readable and writable by this user only, and {@code
+   * memorySize} long.
+   *
+   * <p>Everything a client sends and receives passes through this file, so nobody else may read it,
+   * and it must not be a file or link that someone else put at this predictable path. A stale file
+   * from an earlier server is removed first; if that or the exclusive create fails, the session is
+   * refused.
+   *
+   * <p>The file is extended by writing its last byte, which leaves the rest as a hole: pages read
+   * as zero and take up space only once touched. Writing zeros over the whole file made every
+   * connection pay for its full size.
+   */
+  private FileChannel createSharedMemoryFile(Path path) throws IOException {
+    // The file is sparse, so a full disk would not show until a page is first written, and
+    // then as a fault that takes the whole JVM down. Refuse the session instead.
+    long usable = Files.getFileStore(path.toAbsolutePath().getParent()).getUsableSpace();
+    if (usable < this.memorySize) {
+      throw new IOException(
+          "Not enough free space for the session's shared memory: "
+              + this.memorySize
+              + " bytes needed, "
+              + usable
+              + " available in "
+              + path.toAbsolutePath().getParent());
+    }
+    Files.deleteIfExists(path); // removes a link itself, never what it points at
+    FileChannel channel =
+        FileChannel.open(
+            path,
+            Set.of(
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE),
+            PosixFilePermissions.asFileAttribute(OWNER_ONLY));
+    try {
+      channel.write(ByteBuffer.allocate(1), this.memorySize - 1);
+    } catch (IOException | RuntimeException e) {
+      channel.close();
+      throw e;
+    }
+    return channel;
+  }
+
+  // How long a connection waits for a session slot before it is refused
+  private static final long SESSION_SLOT_WAIT_MS = 2_000;
+
+  /**
+   * Count one more session, if the limit allows. A slot is given back when the server notices its
+   * session's socket closing, a moment after the client closed it, so a connection that arrives
+   * just then (a client connecting right after the launcher's check that the server is up) waits
+   * briefly instead of being refused.
+   */
+  private boolean takeSessionSlot() {
+    int limit = ResourceLimits.MAX_SESSIONS;
+    long deadline = System.nanoTime() + SESSION_SLOT_WAIT_MS * 1_000_000;
+    while (true) {
+      int open = sessionCount.get();
+      if (limit <= 0 || open < limit) {
+        if (sessionCount.compareAndSet(open, open + 1)) {
+          return true;
+        }
+        continue;
+      }
+      if (System.nanoTime() >= deadline) {
+        return false;
+      }
+      try {
+        Thread.sleep(10);
+      } catch (InterruptedException e) {
+        return false;
+      }
+    }
+  }
+
+  /**
+   * Whether the process at the other end of a connection runs as the server's user. The socket
+   * file's permissions already keep other users out; this also covers the moment between creating
+   * the socket and restricting it, and a socket directory with looser rules.
+   */
+  private boolean isSameUser(SocketChannel client) {
+    if (serverUser == null) {
+      return true;
+    }
+    try {
+      UnixDomainPrincipal peer = client.getOption(ExtendedSocketOptions.SO_PEERCRED);
+      return serverUser.equals(peer.user());
+    } catch (UnsupportedOperationException | IOException e) {
+      return true; // the platform cannot tell us; the file permissions still apply
+    }
+  }
+
+  /**
+   * Close sessions that have been idle past the timeout. Their threads are blocked reading the
+   * socket, so without this an idle session would only be noticed when its next request came.
+   */
+  private void reapIdleSessions() {
+    long interval = Math.max(50, Math.min(ResourceLimits.SESSION_IDLE_TIMEOUT_MS / 2, 5_000));
+    while (true) {
+      try {
+        Thread.sleep(interval);
+      } catch (InterruptedException e) {
+        return;
+      }
+      for (SessionContext session : sessions.values()) {
+        if (session.quota.isTimedOut() && !session.control.isRequestActive()) {
+          LOG.warning("Closing idle session " + session.quota.getSessionId());
+          try {
+            session.channel.close();
+          } catch (IOException e) {
+            // already closing
+          }
+        }
       }
     }
   }
@@ -278,17 +517,10 @@ public class GatunServer {
     // The Arrow handler is declared last so that it is closed first: the batch it holds points
     // into the mapping that the arena unmaps.
     try (client;
-        RandomAccessFile raf = new RandomAccessFile(sessionShmPath.toFile(), "rw");
+        FileChannel channel = createSharedMemoryFile(sessionShmPath);
         Arena arena = Arena.ofConfined();
         ArrowMemoryHandler arrowHandler = new ArrowMemoryHandler(allocator)) {
 
-      // Create and map the session's shared memory. Extending an empty file yields pages that
-      // read as zero without writing them, so a session costs only the pages it touches;
-      // writing zeros over the whole mapping made every connection pay for its full size.
-      // Truncating first discards a stale file left by an earlier server on this socket path.
-      raf.setLength(0);
-      raf.setLength(this.memorySize);
-      FileChannel channel = raf.getChannel();
       MemorySegment sharedMem =
           channel.map(FileChannel.MapMode.READ_WRITE, 0, this.memorySize, arena);
 
@@ -297,6 +529,10 @@ public class GatunServer {
       // Set up session context for callbacks (captured by callback proxies)
       SessionContext ctx = new SessionContext(client, sharedMem, sessionObjectIds, quota);
       sessionContext.set(ctx);
+      SessionControl control = ctx.control;
+      sessions.put(sessionShmPath.toString(), ctx);
+      // Each command is copied here before it is read (see the request loop)
+      byte[] commandCopy = new byte[(int) PAYLOAD_OFFSET];
 
       // --- HANDSHAKE: Send Protocol Version, Memory Size, and SHM Path to Client ---
       // Format: [4 bytes: version] [4 bytes: arena_epoch] [8 bytes: memory size]
@@ -326,9 +562,17 @@ public class GatunServer {
       FlatBufferBuilder responseBuilder = new FlatBufferBuilder(1024);
 
       while (readFully(client, lengthBuf)) {
-        // Check idle timeout before processing request
+        // A request that arrives after the idle timeout is answered with the reason before the
+        // session closes; the reaper may not have got to this session yet
         if (quota.isTimedOut()) {
           LOG.warning("Session " + sessionId + " timed out due to inactivity");
+          writeErrorResponse(
+              client,
+              sharedMem,
+              "Session timed out after "
+                  + ResourceLimits.SESSION_IDLE_TIMEOUT_MS
+                  + " ms idle (gatun.limits.session_idle_timeout_ms). Reconnect to continue.",
+              ResourceLimits.SessionTimeoutException.class.getName());
           break;
         }
 
@@ -344,43 +588,49 @@ public class GatunServer {
         // Command zone is from COMMAND_OFFSET to PAYLOAD_OFFSET
         if (commandSize <= 0 || commandSize > PAYLOAD_OFFSET) {
           LOG.warning("Invalid command size: " + commandSize + " (max: " + PAYLOAD_OFFSET + ")");
-          // Send error response and continue
-          FlatBufferBuilder errBuilder = new FlatBufferBuilder(256);
-          int errOffset =
-              packError(
-                  errBuilder,
-                  "Invalid command size: " + commandSize + " bytes (max: " + PAYLOAD_OFFSET + ")",
-                  "java.lang.IllegalArgumentException");
-          errBuilder.finish(errOffset);
-          ByteBuffer errBuf = errBuilder.dataBuffer();
-          int errSize = errBuf.remaining();
-          MemorySegment errSlice = sharedMem.asSlice(this.responseOffset, errSize);
-          errSlice.copyFrom(MemorySegment.ofBuffer(errBuf));
-          lengthBuf.putInt(errSize);
-          lengthBuf.flip();
-          client.write(lengthBuf);
-          lengthBuf.clear();
+          writeErrorResponse(
+              client,
+              sharedMem,
+              "Invalid command size: " + commandSize + " bytes (max: " + PAYLOAD_OFFSET + ")",
+              "java.lang.IllegalArgumentException");
           continue;
         }
 
-        // --- Safe Buffer Slicing ---
-        // We create a ByteBuffer isolated to just the command data.
-        MemorySegment cmdSlice = sharedMem.asSlice(COMMAND_OFFSET, commandSize);
-        ByteBuffer cmdBuf = cmdSlice.asByteBuffer();
+        // The command is read from a private copy, not from shared memory. A callback
+        // made while it runs puts Python's answer in the command zone, and a command that
+        // is still being read then (the rest of a batch, the remaining calls of
+        // InvokeMethods) would be read out of that answer. A copy also cannot be changed
+        // by the client after it has been checked.
+        MemorySegment.copy(
+            sharedMem, ValueLayout.JAVA_BYTE, COMMAND_OFFSET, commandCopy, 0, commandSize);
+        ByteBuffer cmdBuf = ByteBuffer.wrap(commandCopy, 0, commandSize);
         cmdBuf.order(ByteOrder.LITTLE_ENDIAN); // Essential for FlatBuffers
 
-        // Define 'cmd' here so it is visible to the rest of the loop
-        Command cmd = Command.getRootAsCommand(cmdBuf);
+        // Define 'cmd' here so it is visible to the rest of the loop. Bytes that are not a
+        // command fail here, before the request proper; the client still gets an answer.
+        Command cmd;
+        long requestId;
+        try {
+          cmd = Command.getRootAsCommand(cmdBuf);
+          requestId = cmd.requestId();
+          observer.onRequestStart(requestId, cmd.action(), cmd.targetName());
+        } catch (RuntimeException e) {
+          LOG.log(Level.WARNING, "Session " + sessionId + " sent a malformed command", e);
+          writeErrorResponse(
+              client, sharedMem, "Malformed command: " + e, "java.lang.IllegalArgumentException");
+          continue;
+        }
 
-        // Handle Cancel action immediately (doesn't require response processing)
+        // Cancel names another session by its shared memory path and asks for its running
+        // request to be interrupted. It is answered at once: true if there was one.
         if (cmd.action() == Action.Cancel) {
-          long requestIdToCancel = cmd.requestId();
-          cancelledRequests.get().add(requestIdToCancel);
-          LOG.fine("Marked request " + requestIdToCancel + " for cancellation");
+          SessionContext target = sessions.get(String.valueOf(cmd.targetName()));
+          boolean delivered = target != null && target != ctx && target.control.cancel();
+          LOG.fine("Cancel for " + cmd.targetName() + (delivered ? " delivered" : " ignored"));
+          observer.onRequestEnd(true, null, null);
 
-          // Send acknowledgement
           FlatBufferBuilder cancelBuilder = new FlatBufferBuilder(256);
-          int cancelResponse = packSuccess(cancelBuilder, true);
+          int cancelResponse = packSuccess(cancelBuilder, delivered);
           cancelBuilder.finish(cancelResponse);
           ByteBuffer cancelBuf = cancelBuilder.dataBuffer();
           int cancelSize = cancelBuf.remaining();
@@ -395,12 +645,7 @@ public class GatunServer {
           continue;
         }
 
-        // Track current request ID for cancellation checks
-        long requestId = cmd.requestId();
         currentRequestId.set(requestId);
-
-        // Start observability tracking for this request
-        observer.onRequestStart(requestId, cmd.action(), cmd.targetName());
 
         // --- Standard Request/Response Logic ---
         // Reuse the response builder (clear resets position but keeps buffer)
@@ -421,11 +666,9 @@ public class GatunServer {
         // Set by the actions that build their own response instead of returning a result
         boolean responsePacked = false;
 
+        control.beginRequest();
         try {
-          // Check if this request was already cancelled
-          if (requestId != 0 && cancelledRequests.get().contains(requestId)) {
-            throw new InterruptedException("Request " + requestId + " was cancelled");
-          }
+          checkArgumentCount(cmd.argsLength());
 
           if (cmd.action() == Action.CreateObject) {
             String className = cmd.targetName();
@@ -471,10 +714,11 @@ public class GatunServer {
             result = null;
           } else if (cmd.action() == Action.InvokeMethod) {
             long targetId = cmd.targetId();
-            Object target = objectRegistry.get(targetId);
+            Object target = sessionObject(targetId);
             String methodName = cmd.targetName();
 
             if (target == null) throw new RuntimeException("Object " + targetId + " not found");
+            allowlist.checkInstanceMember(target, methodName);
 
             int argCount = cmd.argsLength();
 
@@ -531,7 +775,7 @@ public class GatunServer {
             String className = fullName.substring(0, lastDot);
             String methodName = fullName.substring(lastDot + 1);
 
-            requireClassAllowed(className);
+            requireClassAllowed(className, methodName);
 
             Class<?> clazz = getClass(className);
 
@@ -564,10 +808,11 @@ public class GatunServer {
             }
           } else if (cmd.action() == Action.GetField) {
             long targetId = cmd.targetId();
-            Object target = objectRegistry.get(targetId);
+            Object target = sessionObject(targetId);
             String fieldName = cmd.targetName();
 
             if (target == null) throw new RuntimeException("Object " + targetId + " not found");
+            allowlist.checkInstanceMember(target, fieldName);
 
             // Try VarHandle for faster access
             java.lang.invoke.VarHandle vh = getInstanceVarHandle(target.getClass(), fieldName);
@@ -590,10 +835,11 @@ public class GatunServer {
             }
           } else if (cmd.action() == Action.SetField) {
             long targetId = cmd.targetId();
-            Object target = objectRegistry.get(targetId);
+            Object target = sessionObject(targetId);
             String fieldName = cmd.targetName();
 
             if (target == null) throw new RuntimeException("Object " + targetId + " not found");
+            allowlist.checkInstanceMember(target, fieldName);
 
             if (cmd.argsLength() != 1)
               throw new IllegalArgumentException("SetField requires exactly one argument");
@@ -733,7 +979,7 @@ public class GatunServer {
           // --- ARROW TABLE HELD BY A JAVA OBJECT (Java -> Python) ---
           else if (cmd.action() == Action.ArrowFromObject) {
             long targetId = cmd.targetId();
-            Object target = objectRegistry.get(targetId);
+            Object target = sessionObject(targetId);
             if (target == null) throw new RuntimeException("Object " + targetId + " not found");
             if (!(target instanceof VectorSchemaRoot table)) {
               throw new IllegalArgumentException(
@@ -796,7 +1042,7 @@ public class GatunServer {
             long targetId = cmd.targetId();
             String className = cmd.targetName();
 
-            Object target = objectRegistry.get(targetId);
+            Object target = sessionObject(targetId);
             if (target == null) throw new RuntimeException("Object " + targetId + " not found");
 
             // Try to load the class (no allowlist check - this is read-only)
@@ -812,7 +1058,7 @@ public class GatunServer {
             String className = fullName.substring(0, lastDot);
             String fieldName = fullName.substring(lastDot + 1);
 
-            requireClassAllowed(className);
+            requireClassAllowed(className, fieldName);
 
             Class<?> clazz = getClass(className);
 
@@ -844,7 +1090,7 @@ public class GatunServer {
             String className = fullName.substring(0, lastDot);
             String fieldName = fullName.substring(lastDot + 1);
 
-            requireClassAllowed(className);
+            requireClassAllowed(className, fieldName);
 
             if (cmd.argsLength() != 1) {
               throw new IllegalArgumentException("SetStaticField requires exactly one argument");
@@ -933,7 +1179,7 @@ public class GatunServer {
           } else if (cmd.action() == Action.GetFields) {
             // Vectorized field reads: get multiple fields from one object
             long targetId = cmd.targetId();
-            Object target = objectRegistry.get(targetId);
+            Object target = sessionObject(targetId);
             if (target == null) {
               throw new RuntimeException("Object " + targetId + " not found");
             }
@@ -949,6 +1195,7 @@ public class GatunServer {
 
             for (int i = 0; i < fieldCount; i++) {
               String fieldName = req.fieldNames(i);
+              allowlist.checkInstanceMember(target, fieldName);
 
               // Try VarHandle for faster access
               java.lang.invoke.VarHandle vh = getInstanceVarHandle(target.getClass(), fieldName);
@@ -976,7 +1223,7 @@ public class GatunServer {
           } else if (cmd.action() == Action.InvokeMethods) {
             // Vectorized method calls: invoke multiple methods on same target
             long targetId = cmd.targetId();
-            Object target = objectRegistry.get(targetId);
+            Object target = sessionObject(targetId);
             if (target == null) {
               throw new RuntimeException("Object " + targetId + " not found");
             }
@@ -995,6 +1242,7 @@ public class GatunServer {
             for (int i = 0; i < callCount; i++) {
               MethodCall call = req.methodCalls(i);
               String methodName = call.methodName();
+              allowlist.checkInstanceMember(target, methodName);
               boolean returnObjectRef = call.returnObjectRef();
 
               // Convert arguments
@@ -1120,11 +1368,7 @@ public class GatunServer {
                 executedCount++;
               } catch (Throwable subT) {
                 // Pack error for this sub-command
-                Throwable subCause = subT;
-                if (subT instanceof java.lang.reflect.InvocationTargetException
-                    && subT.getCause() != null) {
-                  subCause = subT.getCause();
-                }
+                Throwable subCause = unwrap(subT);
                 String subMessage = formatException(subCause);
                 String subErrorType = subCause.getClass().getName();
                 subResponseOffsets[i] = packError(builder, subMessage, subErrorType);
@@ -1148,6 +1392,8 @@ public class GatunServer {
           } else if (cmd.action() == Action.Ping) {
             // Health check - just return true to confirm server is alive
             result = true;
+          } else {
+            throw new UnsupportedOperationException("Unknown action: " + cmd.action());
           }
 
           // 3. Pack Success, unless the action built its own response
@@ -1159,10 +1405,7 @@ public class GatunServer {
 
         } catch (Throwable t) {
           // Unwrap InvocationTargetException to get the real cause
-          Throwable cause = t;
-          if (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null) {
-            cause = t.getCause();
-          }
+          Throwable cause = unwrap(t);
 
           if (cause instanceof NoSuchMethodException
               || cause instanceof IllegalArgumentException
@@ -1179,6 +1422,11 @@ public class GatunServer {
           responseOffset = packError(builder, errorMessage, errorType);
           // The client gets the error, not the results gathered before it
           discardResultRefs(vectorResults, sessionObjectIds, quota);
+        } finally {
+          // Idle time runs from the end of a request, not its start: one that took longer
+          // than the timeout must not leave its session looking idle the moment it ends
+          quota.touchActivity();
+          control.endRequest();
         }
 
         // 4. Write Response to Zone C
@@ -1222,14 +1470,13 @@ public class GatunServer {
         client.write(lengthBuf);
         lengthBuf.clear();
 
-        // Clean up completed request from cancelled set
-        if (requestId != 0) {
-          cancelledRequests.get().remove(requestId);
-        }
         currentRequestId.remove();
       }
     } catch (IOException e) {
-      LOG.fine("Client session " + sessionId + " ended: " + e.getMessage());
+      // Losing the connection is how sessions normally end; failing to set one up is not
+      LOG.log(
+          sessions.containsKey(sessionShmPath.toString()) ? Level.FINE : Level.WARNING,
+          "Client session " + sessionId + " ended: " + e.getMessage());
     } catch (RuntimeException | Error e) {
       // Nothing waits on this task's result, so an unexpected failure (during session setup,
       // say) would otherwise close the connection without a trace
@@ -1244,8 +1491,9 @@ public class GatunServer {
       // Cleanup orphans: remove session objects and callbacks from global registries
       for (Long id : sessionObjectIds) removeObject(id);
       for (Long id : sessionCallbackIds) callbackRegistry.remove(id);
-      // Clear thread-locals
-      cancelledRequests.get().clear();
+      sessions.remove(sessionShmPath.toString());
+      sessionCount.decrementAndGet();
+      sessionContext.remove();
       currentRequestId.remove();
       argumentNestingDepth.remove();
       // Clean up session shared memory file
@@ -1266,9 +1514,8 @@ public class GatunServer {
    * @throws InterruptedException if the current request was cancelled
    */
   public static void checkCancelled() throws InterruptedException {
-    Long reqId = currentRequestId.get();
-    if (reqId != null && reqId != 0 && cancelledRequests.get().contains(reqId)) {
-      throw new InterruptedException("Request " + reqId + " was cancelled");
+    if (isCancelled()) {
+      throw new InterruptedException("Request was cancelled");
     }
   }
 
@@ -1278,8 +1525,52 @@ public class GatunServer {
    * @return true if the current request was cancelled
    */
   public static boolean isCancelled() {
-    Long reqId = currentRequestId.get();
-    return reqId != null && reqId != 0 && cancelledRequests.get().contains(reqId);
+    SessionContext ctx = sessionContext.get();
+    return Thread.currentThread().isInterrupted() || (ctx != null && ctx.control.isCancelled());
+  }
+
+  /**
+   * The exception the called code threw, without the wrappers reflection and proxies put around it:
+   * a checked exception thrown through a callback proxy arrives as an UndeclaredThrowableException.
+   */
+  private static Throwable unwrap(Throwable t) {
+    while ((t instanceof java.lang.reflect.InvocationTargetException
+            || t instanceof java.lang.reflect.UndeclaredThrowableException)
+        && t.getCause() != null) {
+      t = t.getCause();
+    }
+    return t;
+  }
+
+  /** Answer a request that could not be run with an error, in place of its result. */
+  private void writeErrorResponse(
+      SocketChannel client, MemorySegment sharedMem, String message, String errorType)
+      throws IOException {
+    FlatBufferBuilder builder = new FlatBufferBuilder(256);
+    builder.finish(packError(builder, message, errorType));
+    ByteBuffer response = builder.dataBuffer();
+    int size = response.remaining();
+    sharedMem.asSlice(this.responseOffset, size).copyFrom(MemorySegment.ofBuffer(response));
+    ByteBuffer length = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+    length.putInt(size).flip();
+    while (length.hasRemaining()) {
+      client.write(length);
+    }
+  }
+
+  // A command is at most 64KB, so no vector in it has more elements than that. The counts are
+  // read from the command itself, and a forged one would otherwise size an allocation.
+  private static void checkArgumentCount(int count) {
+    if (count < 0 || count > PAYLOAD_OFFSET) {
+      throw new IllegalArgumentException("Argument count " + count + " is not possible");
+    }
+  }
+
+  private static int arrayLength(int length) {
+    if (length < 0 || length > PAYLOAD_OFFSET) {
+      throw new IllegalArgumentException("Array length " + length + " is not possible");
+    }
+    return length;
   }
 
   /**
@@ -1308,6 +1599,32 @@ public class GatunServer {
       removeObject(objectId);
       quota.releaseObject();
     }
+  }
+
+  /**
+   * The object an ID from the client refers to, or null if the calling session has no such object.
+   * IDs come from one counter shared by all sessions and are easy to guess, so a lookup that
+   * skipped this check would let one session use another's objects.
+   */
+  private Object sessionObject(long objectId) {
+    SessionContext ctx = sessionContext.get();
+    if (ctx != null && !ctx.sessionObjectIds.contains(objectId)) {
+      return null;
+    }
+    return objectRegistry.get(objectId);
+  }
+
+  /**
+   * An object passed as an argument. A reference to a freed or unknown object is an error: Python
+   * sends None as a null value, never as an object reference.
+   */
+  private Object requireSessionObject(long objectId) {
+    Object obj = sessionObject(objectId);
+    if (obj == null) {
+      throw new IllegalArgumentException(
+          "Object " + objectId + " not found: it was freed or belongs to another session");
+    }
+    return obj;
   }
 
   /** Add an object to the registry. All registrations go through here so they are observed. */
@@ -1445,6 +1762,7 @@ public class GatunServer {
       throw new IllegalArgumentException("Cancel action cannot be used in batch");
     }
 
+    checkArgumentCount(cmd.argsLength());
     Object result = null;
 
     if (cmd.action() == Action.CreateObject) {
@@ -1488,10 +1806,11 @@ public class GatunServer {
 
     } else if (cmd.action() == Action.InvokeMethod) {
       long targetId = cmd.targetId();
-      Object target = objectRegistry.get(targetId);
+      Object target = sessionObject(targetId);
       String methodName = cmd.targetName();
 
       if (target == null) throw new RuntimeException("Object " + targetId + " not found");
+      allowlist.checkInstanceMember(target, methodName);
 
       int argCount = cmd.argsLength();
 
@@ -1542,7 +1861,7 @@ public class GatunServer {
       String className = fullName.substring(0, lastDot);
       String methodName = fullName.substring(lastDot + 1);
 
-      requireClassAllowed(className);
+      requireClassAllowed(className, methodName);
 
       Class<?> clazz = getClass(className);
 
@@ -1571,10 +1890,11 @@ public class GatunServer {
 
     } else if (cmd.action() == Action.GetField) {
       long targetId = cmd.targetId();
-      Object target = objectRegistry.get(targetId);
+      Object target = sessionObject(targetId);
       String fieldName = cmd.targetName();
 
       if (target == null) throw new RuntimeException("Object " + targetId + " not found");
+      allowlist.checkInstanceMember(target, fieldName);
 
       // Try VarHandle for faster access
       java.lang.invoke.VarHandle vh = getInstanceVarHandle(target.getClass(), fieldName);
@@ -1596,10 +1916,11 @@ public class GatunServer {
 
     } else if (cmd.action() == Action.SetField) {
       long targetId = cmd.targetId();
-      Object target = objectRegistry.get(targetId);
+      Object target = sessionObject(targetId);
       String fieldName = cmd.targetName();
 
       if (target == null) throw new RuntimeException("Object " + targetId + " not found");
+      allowlist.checkInstanceMember(target, fieldName);
 
       if (cmd.argsLength() != 1)
         throw new IllegalArgumentException("SetField requires exactly one argument");
@@ -1621,7 +1942,7 @@ public class GatunServer {
 
     } else if (cmd.action() == Action.IsInstanceOf) {
       long targetId = cmd.targetId();
-      Object target = objectRegistry.get(targetId);
+      Object target = sessionObject(targetId);
       String className = cmd.targetName();
 
       if (target == null) throw new RuntimeException("Object " + targetId + " not found");
@@ -1638,7 +1959,7 @@ public class GatunServer {
       String className = fullName.substring(0, lastDot);
       String fieldName = fullName.substring(lastDot + 1);
 
-      requireClassAllowed(className);
+      requireClassAllowed(className, fieldName);
 
       Class<?> clazz = getClass(className);
 
@@ -1668,7 +1989,7 @@ public class GatunServer {
       String className = fullName.substring(0, lastDot);
       String fieldName = fullName.substring(lastDot + 1);
 
-      requireClassAllowed(className);
+      requireClassAllowed(className, fieldName);
 
       if (cmd.argsLength() != 1) {
         throw new IllegalArgumentException("SetStaticField requires exactly one argument");
@@ -1753,9 +2074,9 @@ public class GatunServer {
       type = char.class;
     } else if (valType == Value.ObjectRef) {
       ObjectRef ref = (ObjectRef) arg.val(tempObjectRef.get());
-      value = objectRegistry.get(ref.id());
+      value = requireSessionObject(ref.id());
       // Use actual object type for better overload resolution
-      type = (value != null) ? value.getClass() : Object.class;
+      type = value.getClass();
     } else if (valType == Value.ListVal) {
       // Convert Python list to Java ArrayList
       // Use fast path for homogeneous lists (all elements same type)
@@ -1781,7 +2102,9 @@ public class GatunServer {
             StringVal sv = tempStringVal.get();
             for (int i = 0; i < len; i++) {
               lv.items(i).val(sv);
-              list.add(sv.v());
+              String element = sv.v();
+              ResourceLimits.checkStringLength(element);
+              list.add(element);
             }
           } else {
             // Fall back to per-element conversion
@@ -1797,14 +2120,21 @@ public class GatunServer {
             if (lv.items(i).valType() != Value.IntVal) allInts = false;
           }
           if (allInts) {
+            // One element type for the whole list: Integer if every value fits, otherwise
+            // Long. Choosing per element gave Java code a List that was neither.
             IntVal iv = tempIntVal.get();
-            for (int i = 0; i < len; i++) {
+            boolean fitsInt = true;
+            for (int i = 0; i < len && fitsInt; i++) {
               lv.items(i).val(iv);
               long longVal = iv.v();
-              if (longVal >= Integer.MIN_VALUE && longVal <= Integer.MAX_VALUE) {
-                list.add((int) longVal);
+              fitsInt = longVal >= Integer.MIN_VALUE && longVal <= Integer.MAX_VALUE;
+            }
+            for (int i = 0; i < len; i++) {
+              lv.items(i).val(iv);
+              if (fitsInt) {
+                list.add((int) iv.v());
               } else {
-                list.add(longVal);
+                list.add(iv.v());
               }
             }
           } else {
@@ -1841,7 +2171,7 @@ public class GatunServer {
             ObjectRef ref = tempObjectRef.get();
             for (int i = 0; i < len; i++) {
               lv.items(i).val(ref);
-              list.add(objectRegistry.get(ref.id()));
+              list.add(requireSessionObject(ref.id()));
             }
           } else {
             for (int i = 0; i < len; i++) {
@@ -1904,8 +2234,11 @@ public class GatunServer {
     }
 
     // If type hint is provided, use it for overload resolution instead of inferred type
+    // The value is converted too: a Python int hinted as "long" or "short" has to arrive as that
+    // type, or a method that takes Object or the boxed type gets an Integer.
     if (typeHint != null && !typeHint.isEmpty()) {
       type = resolveTypeHint(typeHint);
+      value = MethodResolver.coerce(value, type);
     }
 
     return new Object[] {value, type};
@@ -1946,11 +2279,11 @@ public class GatunServer {
       case "Iterable", "java.lang.Iterable" -> Iterable.class;
       default -> {
         // Try to load class by fully qualified name
+        // Through the cache, so classes added with connect(classpath=...) are found
         try {
-          yield Class.forName(typeHint);
+          yield getClass(typeHint);
         } catch (ClassNotFoundException e) {
-          LOG.warning("Type hint class not found: " + typeHint + ", using Object.class");
-          yield Object.class;
+          throw new IllegalArgumentException("Type hint names an unknown class: " + typeHint);
         }
       }
     };
@@ -1977,21 +2310,21 @@ public class GatunServer {
     byte elemType = av.elementType();
 
     if (elemType == ElementType.Int) {
-      int len = av.intValuesLength();
+      int len = arrayLength(av.intValuesLength());
       int[] arr = new int[len];
       for (int i = 0; i < len; i++) {
         arr[i] = av.intValues(i);
       }
       return arr;
     } else if (elemType == ElementType.Long) {
-      int len = av.longValuesLength();
+      int len = arrayLength(av.longValuesLength());
       long[] arr = new long[len];
       for (int i = 0; i < len; i++) {
         arr[i] = av.longValues(i);
       }
       return arr;
     } else if (elemType == ElementType.Double) {
-      int len = av.doubleValuesLength();
+      int len = arrayLength(av.doubleValuesLength());
       double[] arr = new double[len];
       for (int i = 0; i < len; i++) {
         arr[i] = av.doubleValues(i);
@@ -1999,21 +2332,21 @@ public class GatunServer {
       return arr;
     } else if (elemType == ElementType.Float) {
       // Float was widened to double, narrow back
-      int len = av.doubleValuesLength();
+      int len = arrayLength(av.doubleValuesLength());
       float[] arr = new float[len];
       for (int i = 0; i < len; i++) {
         arr[i] = (float) av.doubleValues(i);
       }
       return arr;
     } else if (elemType == ElementType.Bool) {
-      int len = av.boolValuesLength();
+      int len = arrayLength(av.boolValuesLength());
       boolean[] arr = new boolean[len];
       for (int i = 0; i < len; i++) {
         arr[i] = av.boolValues(i);
       }
       return arr;
     } else if (elemType == ElementType.Byte) {
-      int len = av.byteValuesLength();
+      int len = arrayLength(av.byteValuesLength());
       byte[] arr = new byte[len];
       for (int i = 0; i < len; i++) {
         arr[i] = (byte) av.byteValues(i);
@@ -2021,7 +2354,7 @@ public class GatunServer {
       return arr;
     } else if (elemType == ElementType.Short) {
       // Short was widened to int, narrow back
-      int len = av.intValuesLength();
+      int len = arrayLength(av.intValuesLength());
       short[] arr = new short[len];
       for (int i = 0; i < len; i++) {
         arr[i] = (short) av.intValues(i);
@@ -2029,7 +2362,7 @@ public class GatunServer {
       return arr;
     } else if (elemType == ElementType.Char) {
       // Char was widened to int, narrow back
-      int len = av.intValuesLength();
+      int len = arrayLength(av.intValuesLength());
       char[] arr = new char[len];
       for (int i = 0; i < len; i++) {
         arr[i] = (char) av.intValues(i);
@@ -2037,7 +2370,7 @@ public class GatunServer {
       return arr;
     } else if (elemType == ElementType.String) {
       // String array stored as object_values
-      int len = av.objectValuesLength();
+      int len = arrayLength(av.objectValuesLength());
       String[] arr = new String[len];
       for (int i = 0; i < len; i++) {
         Argument item = av.objectValues(i);
@@ -2047,7 +2380,7 @@ public class GatunServer {
       return arr;
     } else {
       // Object array
-      int len = av.objectValuesLength();
+      int len = arrayLength(av.objectValuesLength());
       Object[] arr = new Object[len];
       for (int i = 0; i < len; i++) {
         Argument item = av.objectValues(i);
@@ -2059,25 +2392,67 @@ public class GatunServer {
   }
 
   // --- HELPER: Format exception with full stack trace ---
+  // Longest error text sent to the client. A deep stack trace (Spark's run to hundreds of
+  // frames) must not push the response past the 64KB response zone: the client would then get
+  // a size error in place of the exception's type and message.
+  private static final int MAX_ERROR_TEXT = 12_000;
+
+  // Frames shown per exception in the chain when the whole trace does not fit
+  private static final int MAX_FRAMES_WHEN_CUT = 12;
+
   private static String formatException(Throwable t) {
-    StringBuilder sb = new StringBuilder();
-    sb.append(t.getClass().getName()).append(": ").append(t.getMessage());
-    for (StackTraceElement ste : t.getStackTrace()) {
-      sb.append("\n\tat ").append(ste.toString());
+    String full = stackTrace(t, Integer.MAX_VALUE);
+    if (full.length() <= MAX_ERROR_TEXT) {
+      return full;
     }
-    // Include cause chain
-    Throwable cause = t.getCause();
-    while (cause != null) {
-      sb.append("\nCaused by: ")
-          .append(cause.getClass().getName())
-          .append(": ")
-          .append(cause.getMessage());
-      for (StackTraceElement ste : cause.getStackTrace()) {
-        sb.append("\n\tat ").append(ste.toString());
+    // Too long: shorten each exception's frames rather than cutting the end off, because the
+    // end is where the root cause is ("Caused by: ..."), and that is the line that explains it
+    String cut = stackTrace(t, MAX_FRAMES_WHEN_CUT);
+    if (cut.length() > MAX_ERROR_TEXT) {
+      cut = cut.substring(0, MAX_ERROR_TEXT) + "\n\t...";
+    }
+    return cut + "\n(trace shortened; the server log has all of it)";
+  }
+
+  private static String stackTrace(Throwable t, int maxFrames) {
+    StringBuilder sb = new StringBuilder();
+    Set<Throwable> seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    for (Throwable current = t; current != null && seen.add(current); ) {
+      if (current != t) {
+        sb.append("\nCaused by: ");
       }
-      cause = cause.getCause();
+      sb.append(current.getClass().getName()).append(": ").append(current.getMessage());
+      StackTraceElement[] frames = current.getStackTrace();
+      int shown = Math.min(frames.length, maxFrames);
+      for (int i = 0; i < shown; i++) {
+        sb.append("\n\tat ").append(frames[i]);
+      }
+      if (shown < frames.length) {
+        sb.append("\n\t... ").append(frames.length - shown).append(" more");
+      }
+      current = current.getCause();
     }
     return sb.toString();
+  }
+
+  // Depth of the collection being packed. A list that contains itself would otherwise recurse
+  // until the stack overflows.
+  private static final ThreadLocal<int[]> packDepth = ThreadLocal.withInitial(() -> new int[1]);
+
+  private int[] packNested(FlatBufferBuilder builder, Object value, Set<Long> sessionObjectIds) {
+    int[] depth = packDepth.get();
+    if (depth[0] >= ResourceLimits.MAX_NESTING_DEPTH) {
+      throw new IllegalArgumentException(
+          "Result is nested more than "
+              + ResourceLimits.MAX_NESTING_DEPTH
+              + " levels deep (a collection that contains itself?)");
+    }
+    depth[0]++;
+    try {
+      return packValue(builder, value, sessionObjectIds);
+    } finally {
+      depth[0]--;
+    }
   }
 
   // --- HELPER: Pack a single value and return [type, offset] ---
@@ -2116,7 +2491,7 @@ public class GatunServer {
       type = Value.ListVal;
       int[] itemOffsets = new int[list.size()];
       for (int i = 0; i < list.size(); i++) {
-        int[] packed = packValue(builder, list.get(i), sessionObjectIds);
+        int[] packed = packNested(builder, list.get(i), sessionObjectIds);
         Argument.startArgument(builder);
         Argument.addValType(builder, (byte) packed[0]);
         Argument.addVal(builder, packed[1]);
@@ -2130,8 +2505,8 @@ public class GatunServer {
       int[] entryOffsets = new int[map.size()];
       int idx = 0;
       for (Map.Entry<?, ?> entry : map.entrySet()) {
-        int[] keyPacked = packValue(builder, entry.getKey(), sessionObjectIds);
-        int[] valPacked = packValue(builder, entry.getValue(), sessionObjectIds);
+        int[] keyPacked = packNested(builder, entry.getKey(), sessionObjectIds);
+        int[] valPacked = packNested(builder, entry.getValue(), sessionObjectIds);
 
         Argument.startArgument(builder);
         Argument.addValType(builder, (byte) keyPacked[0]);
@@ -2297,10 +2672,20 @@ public class GatunServer {
             }
           }
 
-          // Send callback request to Python and wait for response
-          // Use captured session context so this works from any thread
-          return invokeCallback(
-              callbackId, method.getName(), args == null ? new Object[0] : args, ctx);
+          // A default method runs as Java wrote it and reaches Python through the abstract
+          // method it calls: comparator.reversed() calls compare(), not Python's "reversed"
+          if (method.isDefault()) {
+            return InvocationHandler.invokeDefault(proxy, method, args);
+          }
+
+          Object result =
+              invokeCallback(
+                  callbackId, method.getName(), args == null ? new Object[0] : args, ctx);
+          // A cancel that arrived during the round trip, when it could not interrupt
+          if (ctx.control.isCancelled()) {
+            throw new InterruptedException("Request was cancelled");
+          }
+          return callbackResult(result, method);
         };
 
     return Proxy.newProxyInstance(
@@ -2311,14 +2696,25 @@ public class GatunServer {
    * Sends a callback invocation request to Python and blocks until Python responds. This is called
    * from the dynamic proxy when Java code invokes a method on the callback object.
    *
-   * <p>The SessionContext is passed explicitly (captured at proxy creation time) so this method can
-   * be called from any thread, not just the handleClient thread. A lock ensures thread-safe
-   * round-trip communication when multiple threads invoke callbacks concurrently.
+   * <p>This works only on the session's own thread, while it runs a request: that is the only time
+   * Python is listening, the channel carries one exchange at a time, and the session's shared
+   * memory is confined to that thread (any other thread touching it gets a WrongThreadException). A
+   * proxy called from any other thread (a parallel stream's worker, a Spark listener, an executor,
+   * a timer) is refused before anything is written.
    */
   private Object invokeCallback(
       long callbackId, String methodName, Object[] args, SessionContext ctx) throws Exception {
     if (ctx == null || ctx.channel == null || ctx.sharedMem == null) {
       throw new IllegalStateException("Callback invoked with invalid session context");
+    }
+    if (!ctx.control.isSessionThread()) {
+      throw new IllegalStateException(
+          "Python callback "
+              + methodName
+              + " was called from thread "
+              + Thread.currentThread().getName()
+              + ". Python can only be called back on the thread that is running its request,"
+              + " during that request.");
     }
 
     GatunEvents.CallbackEvent event =
@@ -2338,6 +2734,39 @@ public class GatunServer {
     }
   }
 
+  /**
+   * Check and convert what Python returned for a callback against the Java method's return type, so
+   * a mismatch is reported as one instead of surfacing as a ClassCastException or
+   * NullPointerException somewhere inside the caller.
+   */
+  private static Object callbackResult(Object result, java.lang.reflect.Method method) {
+    Class<?> returnType = method.getReturnType();
+    if (returnType == void.class) {
+      return null;
+    }
+    if (result == null) {
+      if (returnType.isPrimitive()) {
+        throw new IllegalStateException(
+            "Python callback returned None for "
+                + method.getName()
+                + ", which returns "
+                + returnType.getName());
+      }
+      return null;
+    }
+    Object converted = MethodResolver.coerce(result, returnType);
+    if (!MethodResolver.boxedType(returnType).isInstance(converted)) {
+      throw new IllegalStateException(
+          "Python callback returned a "
+              + result.getClass().getName()
+              + " for "
+              + method.getName()
+              + ", which returns "
+              + returnType.getName());
+    }
+    return converted;
+  }
+
   /** One callback round-trip: send the request to Python, wait for its CallbackResponse. */
   private Object exchangeCallback(
       long callbackId, String methodName, Object[] args, SessionContext ctx) throws Exception {
@@ -2345,9 +2774,9 @@ public class GatunServer {
     SocketChannel channel = ctx.channel;
     MemorySegment sharedMem = ctx.sharedMem;
 
-    // Lock to serialize callback round-trips from different threads
-    // This prevents interleaved writes/reads on the same socket/SHM
-    synchronized (ctx.callbackLock) {
+    // The round trip uses the socket, so a cancel must not interrupt it
+    ctx.control.beginSocketUse();
+    try {
       // Build the callback request response
       FlatBufferBuilder builder = new FlatBufferBuilder(1024);
 
@@ -2379,6 +2808,16 @@ public class GatunServer {
       builder.finish(responseOffset);
       ByteBuffer resBuf = builder.dataBuffer();
       int resSize = resBuf.remaining();
+      if (resSize > RESPONSE_ZONE_SIZE) {
+        throw new IllegalArgumentException(
+            "Arguments for callback "
+                + methodName
+                + " take "
+                + resSize
+                + " bytes, more than the "
+                + RESPONSE_ZONE_SIZE
+                + " a callback request can carry");
+      }
 
       // Write to response zone
       MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
@@ -2423,9 +2862,7 @@ public class GatunServer {
       String errorMsg = null;
 
       if (cmd.argsLength() > 0) {
-        Argument arg = cmd.args(0);
-        Object[] converted = convertArgument(arg);
-        returnValue = converted[0];
+        returnValue = convertArgument(cmd.args(0))[0];
       }
 
       // Check if there's an error flag (second arg if present)
@@ -2447,7 +2884,9 @@ public class GatunServer {
       }
 
       return returnValue;
-    } // end synchronized
+    } finally {
+      ctx.control.endSocketUse();
+    }
   }
 
   // --- HELPER: Pack Result into FlatBuffer ---
@@ -2589,28 +3028,6 @@ public class GatunServer {
     return true;
   }
 
-  public static class ByteBufferInputStream extends java.io.InputStream {
-    private final ByteBuffer buf;
-
-    public ByteBufferInputStream(ByteBuffer buf) {
-      this.buf = buf;
-    }
-
-    @Override
-    public int read() {
-      if (!buf.hasRemaining()) return -1;
-      return buf.get() & 0xFF;
-    }
-
-    @Override
-    public int read(byte[] bytes, int off, int len) {
-      if (!buf.hasRemaining()) return -1;
-      len = Math.min(len, buf.remaining());
-      buf.get(bytes, off, len);
-      return len;
-    }
-  }
-
   // ========== OBSERVABILITY API ==========
 
   /**
@@ -2653,6 +3070,8 @@ public class GatunServer {
       // Log resource limits at startup for debugging
       LOG.info(ResourceLimits.getSummary());
 
+      watchParent(Long.getLong("gatun.parent.pid", 0L));
+
       long size = 16 * 1024 * 1024;
       String path = System.getProperty("user.home") + "/gatun.sock";
       if (args.length > 0) size = Long.parseLong(args[0]);
@@ -2662,6 +3081,29 @@ public class GatunServer {
       LOG.log(Level.SEVERE, "Server failed to start", t);
       System.exit(1);
     }
+  }
+
+  /**
+   * Exit when the process that launched this server is gone. The launcher stops the server when
+   * Python exits normally; this covers a Python process that was killed or crashed, which would
+   * otherwise leave the server running for good.
+   */
+  private static void watchParent(long parentPid) {
+    if (parentPid <= 0) {
+      return;
+    }
+    java.util.Optional<ProcessHandle> parent = ProcessHandle.of(parentPid);
+    if (parent.isEmpty()) {
+      LOG.severe("Parent process " + parentPid + " is not running; exiting");
+      System.exit(1);
+    }
+    parent
+        .get()
+        .onExit()
+        .thenRun(() -> {
+          LOG.info("Parent process " + parentPid + " exited; shutting down");
+          System.exit(0);
+        });
   }
 
   /**

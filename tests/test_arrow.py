@@ -1460,3 +1460,92 @@ def test_send_arrow_table_counts_every_chunk(client):
     assert table.column("x").num_chunks == 2
 
     assert client.send_arrow_table(table) == "Received 5 rows"
+
+
+class TestReceivedTableLifetime:
+    """`view.table` is a plain pyarrow table whose buffers are the shared memory."""
+
+    def _received(self, client):
+        arena = client.get_payload_arena()
+        client.send_arrow_buffers(
+            pa.table({"name": ["", "bob", None], "n": [1, 2, 3]}), arena, {}
+        )
+        return client.get_arrow_data().table
+
+    def test_table_is_readable_after_the_client_closes(self, make_client):
+        """Its memory used to be unmapped by close(); reading it crashed Python."""
+        client = make_client()
+        table = self._received(client)
+        client.close()
+
+        assert table.to_pydict() == {"name": ["", "bob", None], "n": [1, 2, 3]}
+        assert table.column("n").to_pylist() == [1, 2, 3]
+
+    def test_table_keeps_the_mapping_only_while_it_lives(self, make_client):
+        import gc
+
+        client = make_client()
+        table = self._received(client)
+        mapping = client.shm
+        client.close()
+        assert not mapping.closed  # still backing the table
+
+        del table
+        gc.collect()
+        mapping.close()  # nothing holds it any more
+        assert mapping.closed
+
+    def test_empty_strings_come_back_as_strings(self, client):
+        """A column of empty strings has a data buffer of no bytes."""
+        arena = client.get_payload_arena()
+        table = pa.table(
+            {
+                "s": ["", "", ""],
+                "t": pa.array([None, None], pa.string()).take([0, 1, 0]),
+            }
+        )
+        client.send_arrow_buffers(table, arena, {})
+
+        assert client.get_arrow_data().to_pydict() == {
+            "s": ["", "", ""],
+            "t": [None, None, None],
+        }
+
+
+class TestArenaBelongsToTheClient:
+    def test_arena_of_another_mapping_is_refused(self, client, tmp_path):
+        """Java reads this client's shared memory, whatever arena the data is in."""
+        from gatun.arena import PayloadArena
+
+        foreign = PayloadArena.create(tmp_path / "foreign.shm", 1024 * 1024)
+        try:
+            with pytest.raises(ValueError, match="get_payload_arena"):
+                client.send_arrow_buffers(pa.table({"x": [1, 2, 3]}), foreign, {})
+        finally:
+            foreign.close()
+        assert client.ping() is True
+
+    def test_failed_reset_does_not_move_the_epoch(self, make_client, monkeypatch):
+        """The two sides count resets together; a reset that never ran is not one."""
+        client = make_client()
+        epoch = client._arena_epoch
+        arena = client.get_payload_arena()
+        client.send_arrow_buffers(pa.table({"x": [1, 2, 3]}), arena, {})
+        view = client.get_arrow_data()
+
+        def refused(data, *args, **kwargs):
+            raise PayloadTooLargeError(0, 0, "Command")
+
+        monkeypatch.setattr(client, "_send_raw", refused)
+        with pytest.raises(PayloadTooLargeError):
+            client.reset_payload_arena()
+        monkeypatch.undo()
+
+        assert client._arena_epoch == epoch
+        # The view is invalid all the same: a reset was asked for
+        with pytest.raises(StaleArenaError):
+            view.to_pydict()
+        # And the session still agrees with the server about the epoch
+        arena.reset()
+        client.send_arrow_buffers(pa.table({"x": [4]}), arena, {})
+        assert client.get_arrow_data().to_pydict() == {"x": [4]}

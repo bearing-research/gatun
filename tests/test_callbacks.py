@@ -473,3 +473,271 @@ class TestReentrancyDetection:
         assert not client._in_callback
         new_arr = client.create_object("java.util.ArrayList")
         assert new_arr.size() == 0
+
+
+class TestCallbackInterfaces:
+    def test_default_methods_run_as_java_wrote_them(self, client):
+        """`Comparator.reversed()` is Java code; only `compare` goes to Python."""
+        comparator = client.register_callback(
+            lambda a, b: a - b, "java.util.Comparator"
+        )
+        items = client.jvm.java.util.ArrayList()
+        for value in (3, 1, 2):
+            items.add(value)
+
+        client.jvm.java.util.Collections.sort(items, comparator.reversed())
+        assert list(items) == [3, 2, 1]
+
+    def test_chained_default_methods(self, client):
+        is_even = client.register_callback(
+            lambda value: value % 2 == 0, "java.util.function.Predicate"
+        )
+        items = client.jvm.java.util.ArrayList()
+        for value in range(6):
+            items.add(value)
+
+        items.removeIf(is_even.negate())
+        assert list(items) == [0, 2, 4]
+
+
+class TestCallbackResults:
+    """What Python returns has to be what the Java method declares."""
+
+    def _sort_with(self, client, callback):
+        items = client.jvm.java.util.ArrayList()
+        items.add(2)
+        items.add(1)
+        comparator = client.register_callback(callback, "java.util.Comparator")
+        client.jvm.java.util.Collections.sort(items, comparator)
+        return list(items)
+
+    def test_none_for_a_primitive_is_reported(self, client):
+        """It used to surface as a NullPointerException with no mention of why."""
+        with pytest.raises(JavaException, match="returned None for compare"):
+            self._sort_with(client, lambda a, b: None)
+        assert client.ping() is True
+
+    def test_wrong_type_is_reported(self, client):
+        with pytest.raises(
+            JavaException, match="String for compare, which returns int"
+        ):
+            self._sort_with(client, lambda a, b: "bigger")
+        assert client.ping() is True
+
+    def test_bool_is_not_an_int(self, client):
+        with pytest.raises(JavaException, match="for compare, which returns int"):
+            self._sort_with(client, lambda a, b: a > b)
+
+    def test_int_is_widened_for_a_long_or_double(self, client):
+        to_long = client.register_callback(
+            lambda value: 7, "java.util.function.ToLongFunction"
+        )
+        to_double = client.register_callback(
+            lambda value: 2, "java.util.function.ToDoubleFunction"
+        )
+        items = client.jvm.java.util.ArrayList()
+        items.add("a")
+        items.add("b")
+
+        assert items.stream().mapToLong(to_long).sum() == 14
+        assert items.stream().mapToDouble(to_double).sum() == 4.0
+
+    def test_result_too_large_for_the_channel(self, client):
+        grow = client.register_callback(
+            lambda value: "z" * 70_000, "java.util.function.Function"
+        )
+        items = client.jvm.java.util.ArrayList()
+        items.add("a")
+
+        with pytest.raises(JavaException, match="too large to return"):
+            items.stream().map(grow).toList()
+        assert client.ping() is True
+
+    def test_arguments_too_large_for_the_channel(self, client):
+        seen = []
+        consumer = client.register_callback(seen.append, "java.util.function.Consumer")
+        inner = client.jvm.java.util.ArrayList()
+        for _ in range(3):
+            inner.add("y" * 30_000)
+        outer = client.jvm.java.util.ArrayList()
+        outer.add(inner)
+
+        with pytest.raises(JavaException, match="more than the 65536"):
+            outer.forEach(consumer)
+        assert seen == []
+        assert client.ping() is True
+
+
+class TestCallbacksDuringMultiCommandRequests:
+    """The callback's answer travels in the zone the request itself arrived in."""
+
+    def test_callback_inside_a_batch(self, client):
+        comparator = client.register_callback(
+            lambda a, b: a - b, "java.util.Comparator"
+        )
+        items = client.jvm.java.util.ArrayList()
+        for value in (3, 1, 2):
+            items.add(value)
+
+        with client.batch() as b:
+            b.call_static("java.util.Collections", "sort", items, comparator)
+            size = b.call(items, "size")
+            first = b.call(items, "get", 0)
+            b.call(items, "add", 9)
+
+        assert size.get() == 3
+        assert first.get() == 1
+        assert list(items) == [1, 2, 3, 9]
+
+    def test_callback_inside_invoke_methods(self, client):
+        is_odd = client.register_callback(
+            lambda value: value % 2 == 1, "java.util.function.Predicate"
+        )
+        items = client.jvm.java.util.ArrayList()
+        for value in range(5):
+            items.add(value)
+
+        results = client.invoke_methods(
+            items, [("removeIf", (is_odd,)), ("size", ()), ("get", (1,))]
+        )
+        assert results == [True, 3, 2]
+
+
+OTHER_THREAD_JAVA = """
+import java.util.function.Supplier;
+
+public class OtherThread {
+  private static volatile String lastError;
+
+  /** Run the supplier on a new thread and wait for it. */
+  public static Object call(Supplier<Object> supplier) throws Exception {
+    Object[] out = new Object[1];
+    Throwable[] failure = new Throwable[1];
+    Thread thread = new Thread(() -> {
+      try {
+        out[0] = supplier.get();
+      } catch (Throwable t) {
+        failure[0] = t;
+      }
+    });
+    thread.start();
+    thread.join();
+    if (failure[0] != null) {
+      throw new RuntimeException(failure[0]);
+    }
+    return out[0];
+  }
+
+  /** Run the task on a new thread after a delay, without waiting for it. */
+  public static void later(Runnable task, long delayMs) {
+    lastError = null;
+    Thread thread = new Thread(() -> {
+      try {
+        Thread.sleep(delayMs);
+        task.run();
+        lastError = "";
+      } catch (Throwable t) {
+        lastError = String.valueOf(t.getMessage());
+      }
+    });
+    thread.setDaemon(true);
+    thread.start();
+  }
+
+  public static String lastError() {
+    return lastError;
+  }
+}
+"""
+
+
+class TestCallbacksFromOtherThreads:
+    """Only the thread running the request has the channel and its memory."""
+
+    @pytest.fixture
+    def other_thread(self, compile_java):
+        from gatun import connect
+
+        classes = compile_java("OtherThread", OTHER_THREAD_JAVA)
+        client = connect(
+            memory="16MB", classpath=[classes], allowed_classes=["OtherThread"]
+        )
+        yield client
+        client.close()
+
+    def test_callback_on_another_thread_is_refused(self, other_thread):
+        """Even during the request: the refusal names the thread and the rule."""
+        client = other_thread
+        calls = []
+        supplier = client.register_callback(
+            lambda: calls.append(1), "java.util.function.Supplier"
+        )
+
+        with pytest.raises(JavaException, match="called from thread") as exc_info:
+            client.jvm.OtherThread.call(supplier)
+
+        assert "thread that is running its request" in str(exc_info.value)
+        assert calls == []
+        assert client.jvm.java.lang.Math.max(1, 2) == 2
+
+    def test_callback_with_no_request_running_is_refused(self, other_thread):
+        """Nobody is reading the channel then; the call must not be written into
+        whatever request comes next."""
+        import time
+
+        client = other_thread
+        calls = []
+        task = client.register_callback(lambda: calls.append(1), "java.lang.Runnable")
+
+        client.jvm.OtherThread.later(task, 300)
+        time.sleep(1.0)  # the task fires while this client is idle
+
+        assert "called from thread" in client.jvm.OtherThread.lastError()
+        assert calls == []
+        assert client.jvm.java.lang.Math.max(1, 2) == 2
+
+    def test_callback_on_the_request_thread_still_works(self, other_thread):
+        client = other_thread
+        doubled = client.register_callback(
+            lambda value: value * 2, "java.util.function.Function"
+        )
+        items = client.jvm.java.util.ArrayList(list(range(50)))
+
+        assert items.stream().map(doubled).toList() == [2 * i for i in range(50)]
+
+
+class TestLongExceptionChains:
+    def test_root_cause_survives_a_long_trace(self, compile_java):
+        """The cause is at the end of the trace, which is what used to be cut."""
+        from gatun import connect
+
+        classes = compile_java(
+            "Deep",
+            "public class Deep {\n"
+            "  public static void fail(int depth) {\n"
+            "    if (depth > 0) { fail(depth - 1); return; }\n"
+            "    try { inner(400); } catch (RuntimeException e) {\n"
+            '      throw new IllegalStateException("wrapper", e);\n'
+            "    }\n"
+            "  }\n"
+            "  private static void inner(int depth) {\n"
+            "    if (depth > 0) { inner(depth - 1); return; }\n"
+            '    throw new UnsupportedOperationException("the root cause");\n'
+            "  }\n"
+            "}\n",
+        )
+        client = connect(memory="16MB", classpath=[classes], allowed_classes=["Deep"])
+        try:
+            with pytest.raises(JavaException) as exc_info:
+                client.jvm.Deep.fail(400)
+            text = str(exc_info.value)
+            assert "java.lang.IllegalStateException: wrapper" in text
+            assert (
+                "Caused by: java.lang.UnsupportedOperationException: the root cause"
+                in text
+            )
+            assert "Deep.inner" in text
+            assert len(text) < 16_000
+            assert client.ping() is True
+        finally:
+            client.close()

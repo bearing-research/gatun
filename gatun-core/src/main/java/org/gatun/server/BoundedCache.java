@@ -1,36 +1,34 @@
 package org.gatun.server;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
 
 /**
- * A thread-safe bounded cache with LRU eviction.
+ * A thread-safe bounded cache that evicts its oldest entries.
  *
- * <p>This cache evicts the least recently used entries when the size exceeds the maximum. Designed
- * for use in long-running processes like Spark drivers where unbounded caches can cause memory
- * issues with dynamically generated classes and methods.
+ * <p>Designed for use in long-running processes like Spark drivers where unbounded caches can cause
+ * memory issues with dynamically generated classes and methods.
  *
- * <p>Thread-safety is achieved with a read-write lock:
- *
- * <ul>
- *   <li>Reads (get) acquire read lock - allows concurrent reads
- *   <li>Writes (put, computeIfAbsent) acquire write lock - exclusive access
- * </ul>
+ * <p>Lookups take no lock: every method, constructor and field lookup of every session goes through
+ * one of these, so a lock here would serialize all sessions' calls. That is why eviction is by age
+ * (the order entries were added) rather than by last use, which would make every lookup a write. An
+ * entry that is evicted while still in use is simply computed again.
  *
  * @param <K> the key type
  * @param <V> the value type
  */
 public final class BoundedCache<K, V> {
   private final int maxSize;
-  private final LinkedHashMap<K, V> map;
-  private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+  private final ConcurrentHashMap<K, V> map = new ConcurrentHashMap<>();
+  // Keys in the order they were added; the head is the next to be evicted
+  private final ConcurrentLinkedQueue<K> order = new ConcurrentLinkedQueue<>();
 
   // Statistics for monitoring
-  private long hits = 0;
-  private long misses = 0;
-  private long evictions = 0;
+  private final LongAdder hits = new LongAdder();
+  private final LongAdder misses = new LongAdder();
+  private final LongAdder evictions = new LongAdder();
 
   /**
    * Create a bounded cache with the specified maximum size.
@@ -42,18 +40,6 @@ public final class BoundedCache<K, V> {
       throw new IllegalArgumentException("maxSize must be positive: " + maxSize);
     }
     this.maxSize = maxSize;
-    // accessOrder=true makes it LRU (access order rather than insertion order)
-    this.map =
-        new LinkedHashMap<>(16, 0.75f, true) {
-          @Override
-          protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
-            boolean shouldRemove = size() > BoundedCache.this.maxSize;
-            if (shouldRemove) {
-              evictions++;
-            }
-            return shouldRemove;
-          }
-        };
   }
 
   /**
@@ -63,18 +49,13 @@ public final class BoundedCache<K, V> {
    * @return the cached value, or null if not present
    */
   public V get(K key) {
-    lock.readLock().lock();
-    try {
-      V value = map.get(key);
-      if (value != null) {
-        hits++;
-      } else {
-        misses++;
-      }
-      return value;
-    } finally {
-      lock.readLock().unlock();
+    V value = map.get(key);
+    if (value != null) {
+      hits.increment();
+    } else {
+      misses.increment();
     }
+    return value;
   }
 
   /**
@@ -84,119 +65,88 @@ public final class BoundedCache<K, V> {
    * @param value the value
    */
   public void put(K key, V value) {
-    lock.writeLock().lock();
-    try {
-      map.put(key, value);
-    } finally {
-      lock.writeLock().unlock();
+    if (map.put(key, value) == null) {
+      added(key);
     }
   }
 
   /**
    * Get or compute a value if absent.
    *
-   * <p>Note: The mapping function is called while holding the write lock. Keep computation
-   * lightweight to avoid blocking other threads.
+   * <p>The mapping function runs without any lock held, so it may use this cache itself. Two
+   * threads that miss the same key at once may both compute it; one result is kept.
    *
    * @param key the key
    * @param mappingFunction function to compute the value if absent
    * @return the existing or computed value
    */
   public V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction) {
-    // First try read-only path
-    lock.readLock().lock();
-    try {
-      V value = map.get(key);
-      if (value != null) {
-        hits++;
-        return value;
-      }
-    } finally {
-      lock.readLock().unlock();
-    }
-
-    // Need to compute - acquire write lock
-    lock.writeLock().lock();
-    try {
-      // Double-check after acquiring write lock
-      V value = map.get(key);
-      if (value != null) {
-        hits++;
-        return value;
-      }
-      misses++;
-      value = mappingFunction.apply(key);
-      if (value != null) {
-        map.put(key, value);
-      }
+    V value = map.get(key);
+    if (value != null) {
+      hits.increment();
       return value;
-    } finally {
-      lock.writeLock().unlock();
+    }
+    misses.increment();
+    value = mappingFunction.apply(key);
+    if (value == null) {
+      return null;
+    }
+    V existing = map.putIfAbsent(key, value);
+    if (existing != null) {
+      return existing;
+    }
+    added(key);
+    return value;
+  }
+
+  /** Record a new key and evict the oldest entries until the cache is within its size. */
+  private void added(K key) {
+    order.add(key);
+    while (map.size() > maxSize) {
+      K oldest = order.poll();
+      if (oldest == null) {
+        break;
+      }
+      if (map.remove(oldest) != null) {
+        evictions.increment();
+      }
     }
   }
 
   /** Get the current size of the cache. */
   public int size() {
-    lock.readLock().lock();
-    try {
-      return map.size();
-    } finally {
-      lock.readLock().unlock();
-    }
+    return map.size();
   }
 
   /** Clear all entries from the cache. */
   public void clear() {
-    lock.writeLock().lock();
-    try {
-      map.clear();
-    } finally {
-      lock.writeLock().unlock();
-    }
+    map.clear();
+    order.clear();
   }
 
   /** Get cache statistics as a formatted string. */
   public String getStats() {
-    lock.readLock().lock();
-    try {
-      long total = hits + misses;
-      double hitRate = total > 0 ? (100.0 * hits / total) : 0.0;
-      return String.format(
-          "size=%d/%d hits=%d misses=%d evictions=%d hitRate=%.1f%%",
-          map.size(), maxSize, hits, misses, evictions, hitRate);
-    } finally {
-      lock.readLock().unlock();
-    }
+    long hitCount = hits.sum();
+    long total = hitCount + misses.sum();
+    double hitRate = total > 0 ? (100.0 * hitCount / total) : 0.0;
+    return String.format(
+        "size=%d/%d hits=%d misses=%d evictions=%d hitRate=%.1f%%",
+        map.size(), maxSize, hitCount, misses.sum(), evictions.sum(), hitRate);
   }
 
   /** Get the number of cache hits. */
   public long getHits() {
-    lock.readLock().lock();
-    try {
-      return hits;
-    } finally {
-      lock.readLock().unlock();
-    }
+    return hits.sum();
   }
 
   /** Get the number of cache misses. */
   public long getMisses() {
-    lock.readLock().lock();
-    try {
-      return misses;
-    } finally {
-      lock.readLock().unlock();
-    }
+    return misses.sum();
   }
 
   /** Get the number of evictions. */
   public long getEvictions() {
-    lock.readLock().lock();
-    try {
-      return evictions;
-    } finally {
-      lock.readLock().unlock();
-    }
+    return evictions.sum();
   }
 
   /** Get the maximum size of the cache. */

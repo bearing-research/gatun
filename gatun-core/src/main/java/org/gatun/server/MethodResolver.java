@@ -112,7 +112,7 @@ public final class MethodResolver {
         if (match) {
           // Score: base 1000 for non-varargs, plus specificity bonus
           int score = 1000 + specificity;
-          if (bestScore < score) {
+          if (isBetter(score, bestScore, paramTypes, bestMatch)) {
             bestMatch = m;
             bestScore = score;
           }
@@ -125,7 +125,7 @@ public final class MethodResolver {
           // Score varargs with specificity (but lower base than non-varargs)
           int fixedCount = paramTypes.length - 1;
           int score = getVarargsSpecificity(paramTypes, argTypes, fixedCount);
-          if (bestScore < score) {
+          if (isBetter(score, bestScore, paramTypes, bestMatch)) {
             bestMatch = m;
             bestScore = score;
           }
@@ -252,7 +252,7 @@ public final class MethodResolver {
         if (isVarargsCompatible(paramTypes, argTypes)) {
           int fixedCount = paramTypes.length - 1;
           int score = getVarargsSpecificity(paramTypes, argTypes, fixedCount);
-          if (bestScore < score) {
+          if (isBetter(score, bestScore, paramTypes, bestMatch)) {
             bestMatch = c;
             bestScore = score;
           }
@@ -276,7 +276,7 @@ public final class MethodResolver {
       }
       if (match) {
         int score = 1000 + specificity;
-        if (bestScore < score) {
+        if (isBetter(score, bestScore, paramTypes, bestMatch)) {
           bestMatch = c;
           bestScore = score;
         }
@@ -289,6 +289,98 @@ public final class MethodResolver {
 
     throw new NoSuchMethodException(
         "No matching constructor for " + clazz.getName() + " with " + argTypes.length + " args");
+  }
+
+  /**
+   * Whether a candidate beats the best one so far. On equal scores the one whose parameters are
+   * subtypes of the other's wins, as in Java: for a TreeSet argument, {@code TreeSet(SortedSet)}
+   * over {@code TreeSet(Collection)}. Without this the winner was whichever reflection listed
+   * first.
+   */
+  private static boolean isBetter(
+      int score, int bestScore, Class<?>[] paramTypes, java.lang.reflect.Executable best) {
+    if (score != bestScore || best == null) {
+      return score > bestScore;
+    }
+    Class<?>[] bestTypes = best.getParameterTypes();
+    if (bestTypes.length != paramTypes.length) {
+      return false;
+    }
+    boolean narrower = false;
+    for (int i = 0; i < paramTypes.length; i++) {
+      if (paramTypes[i] == bestTypes[i]) {
+        continue;
+      }
+      if (!bestTypes[i].isAssignableFrom(paramTypes[i])) {
+        return false;
+      }
+      narrower = true;
+    }
+    return narrower;
+  }
+
+  /**
+   * Convert a number to the type a parameter or type hint declares, where Java's own conversions
+   * would not: an {@code Integer} for a {@code Long}, {@code short} or {@code float} parameter, a
+   * {@code Double} for a {@code float}. Anything else is returned unchanged.
+   *
+   * @throws IllegalArgumentException if an integer does not fit the narrower type
+   */
+  public static Object coerce(Object value, Class<?> targetType) {
+    if (value == null || targetType == null) {
+      return value;
+    }
+    Class<?> boxed = targetType.isPrimitive() ? PRIMITIVE_TO_WRAPPER.get(targetType) : targetType;
+    if (boxed == null || boxed.isInstance(value)) {
+      return value;
+    }
+    if (value instanceof Character c) {
+      value = (int) c.charValue(); // char widens like a number
+    }
+    if (!(value instanceof Number number)) {
+      return value;
+    }
+    boolean integral =
+        value instanceof Integer
+            || value instanceof Long
+            || value instanceof Short
+            || value instanceof Byte;
+    if (boxed == Double.class) {
+      return number.doubleValue();
+    }
+    if (boxed == Float.class) {
+      return number.floatValue();
+    }
+    if (!integral) {
+      return value; // a fractional value is never silently truncated
+    }
+    long asLong = number.longValue();
+    if (boxed == Long.class) {
+      return asLong;
+    }
+    if (boxed == Integer.class) {
+      return (int) requireRange(asLong, Integer.MIN_VALUE, Integer.MAX_VALUE, "int");
+    }
+    if (boxed == Short.class) {
+      return (short) requireRange(asLong, Short.MIN_VALUE, Short.MAX_VALUE, "short");
+    }
+    if (boxed == Byte.class) {
+      return (byte) requireRange(asLong, Byte.MIN_VALUE, Byte.MAX_VALUE, "byte");
+    }
+    return value;
+  }
+
+  /** The wrapper class of a primitive type; any other type as it is. */
+  public static Class<?> boxedType(Class<?> type) {
+    Class<?> wrapper = type.isPrimitive() ? PRIMITIVE_TO_WRAPPER.get(type) : null;
+    return wrapper != null ? wrapper : type;
+  }
+
+  private static long requireRange(long value, long min, long max, String typeName) {
+    if (value < min || value > max) {
+      throw new IllegalArgumentException("Value " + value + " does not fit in a Java " + typeName);
+    }
+    return value;
   }
 
   // ========== VARARGS HELPERS ==========
@@ -519,10 +611,29 @@ public final class MethodResolver {
     // Object accepts anything (primitives auto-box at runtime)
     if (paramType == Object.class) return true;
 
+    if (isPythonNarrowing(paramType, argType)) return true;
+
     // argType=Object (from null or untyped) matches any reference type
     // Note: null to primitive is handled by caller (convertArgument)
     if (argType == Object.class && !paramType.isPrimitive()) return true;
 
+    return false;
+  }
+
+  /**
+   * Narrowing that Java would want a cast for, accepted because Python has one float type and one
+   * int type: a Python float for a {@code float} parameter, a Python int for {@code short} or
+   * {@code byte}. Without it {@code Float.valueOf(1.5)} matches nothing. The value is converted
+   * (and an int range-checked) by {@link #coerce} when the method is called.
+   */
+  private static boolean isPythonNarrowing(Class<?> paramType, Class<?> argType) {
+    Class<?> param = paramType.isPrimitive() ? paramType : WRAPPER_TO_PRIMITIVE.get(paramType);
+    if (param == float.class) {
+      return argType == double.class;
+    }
+    if (param == short.class || param == byte.class) {
+      return argType == int.class;
+    }
     return false;
   }
 
@@ -583,10 +694,12 @@ public final class MethodResolver {
     // Exact match - highest priority
     if (paramType == argType) return 100;
 
-    // Boxing/unboxing - second highest
+    // A boxed argument (an explicit java.lang.Integer hint, or a boxed object) prefers a
+    // reference parameter over unboxing, as Java does: list.remove(Integer) removes the element,
+    // not the index. Unboxing still matches when nothing else does.
     if (paramType.isPrimitive()) {
       Class<?> wrapper = PRIMITIVE_TO_WRAPPER.get(paramType);
-      if (wrapper == argType) return 90;
+      if (wrapper == argType) return 8;
     }
     if (!paramType.isPrimitive()) {
       Class<?> primitive = WRAPPER_TO_PRIMITIVE.get(paramType);
@@ -613,7 +726,7 @@ public final class MethodResolver {
     if (paramType.isPrimitive()
         && argPrimitive != null
         && isPrimitiveWidening(paramType, argPrimitive)) {
-      return 75 - getPrimitiveWideningDistance(paramType, argPrimitive);
+      return Math.max(1, 7 - getPrimitiveWideningDistance(paramType, argPrimitive));
     }
     if (paramPrimitive != null
         && argType.isPrimitive()
@@ -636,6 +749,11 @@ public final class MethodResolver {
     // Object.class arg (null or untyped) to reference type
     if (argType == Object.class && !paramType.isPrimitive()) {
       return paramType == Object.class ? 10 : 30;
+    }
+
+    // Last resort, below every other match
+    if (isPythonNarrowing(paramType, argType)) {
+      return 5;
     }
 
     return 0; // No match
