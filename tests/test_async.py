@@ -428,6 +428,37 @@ class TestAsyncDatetimeArguments:
         )
 
 
+class TestAsyncReturnValues:
+    """The async client decodes return values the same way the sync client does."""
+
+    async def test_map(self, async_client):
+        """Regression: any returned Map raised AttributeError."""
+        hm = await async_client.jvm.java.util.HashMap()
+        await hm.put("a", 1)
+        await hm.put("b", [1, 2])
+        copy = await async_client.jvm.java.util.Collections.unmodifiableMap(hm)
+
+        assert copy == {"a": 1, "b": [1, 2]}
+
+    async def test_primitive_array(self, async_client):
+        """Regression: decoding needed numpy, which is not a dependency."""
+        from gatun import JavaArray
+
+        jvm = async_client.jvm
+        int_array_class = await jvm.java.lang.Class.forName("[I")
+        int_class = await int_array_class.getComponentType()
+        ints = await jvm.java.lang.reflect.Array.newInstance(int_class, 3)
+
+        assert isinstance(ints, JavaArray)
+        assert ints.element_type == "Int"
+        assert list(ints) == [0, 0, 0]
+
+    async def test_char(self, async_client):
+        sb = await async_client.jvm.java.lang.StringBuilder("hi")
+
+        assert await sb.charAt(1) == "i"
+
+
 class TestAsyncObjectLifecycle:
     """Test async object lifecycle methods."""
 

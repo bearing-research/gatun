@@ -1201,3 +1201,21 @@ def test_arrow_manual_batch_processing_example(client):
 
     # Always close arena when done
     arena.close()
+
+
+def test_send_arrow_buffers_accepts_record_batch(client):
+    """Regression: a RecordBatch raised AttributeError ('columns' are Arrays)."""
+    table = pa.table({"x": [1, 2, 3, 4], "y": ["a", "b", "c", "d"]})
+    arena = client.get_payload_arena()
+    schema_cache: dict = {}
+    try:
+        for batch in table.to_batches(max_chunksize=2):
+            arena.reset()
+            client.send_arrow_buffers(batch, arena, schema_cache)
+            received = client.get_arrow_data()
+            assert received.num_rows == batch.num_rows
+            assert received.column("x").to_pylist() == batch.column("x").to_pylist()
+            assert received.column("y").to_pylist() == batch.column("y").to_pylist()
+            del received
+    finally:
+        arena.close()

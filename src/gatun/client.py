@@ -1175,13 +1175,157 @@ class _JVMNode:
         return f"<JVM {self._path}>"
 
 
+def _unpack_value_impl(
+    val_type: int, val_table: Any, client: Any, ref_class: Any
+) -> Any:
+    """Unpack a FlatBuffer Value union to a Python object.
+
+    Shared by the sync and async clients. Object references are wrapped as
+    ref_class(client, object_id).
+    """
+    if val_type == Value.Value.NullVal:
+        return None
+    elif val_type == Value.Value.StringVal:
+        str_obj = StringVal.StringVal()
+        str_obj.Init(val_table.Bytes, val_table.Pos)
+        return str_obj.V().decode("utf-8")
+    elif val_type == Value.Value.IntVal:
+        int_obj = IntVal.IntVal()
+        int_obj.Init(val_table.Bytes, val_table.Pos)
+        return int_obj.V()
+    elif val_type == Value.Value.DoubleVal:
+        double_obj = DoubleVal.DoubleVal()
+        double_obj.Init(val_table.Bytes, val_table.Pos)
+        return double_obj.V()
+    elif val_type == Value.Value.BoolVal:
+        bool_obj = BoolVal.BoolVal()
+        bool_obj.Init(val_table.Bytes, val_table.Pos)
+        return bool_obj.V()
+    elif val_type == Value.Value.CharVal:
+        char_obj = CharVal.CharVal()
+        char_obj.Init(val_table.Bytes, val_table.Pos)
+        return chr(char_obj.V())  # Convert to Python str (single char)
+    elif val_type == Value.Value.ObjectRef:
+        ref_obj = ObjectRef.ObjectRef()
+        ref_obj.Init(val_table.Bytes, val_table.Pos)
+        return ref_class(client, ref_obj.Id())
+    elif val_type == Value.Value.ListVal:
+        list_obj = ListVal.ListVal()
+        list_obj.Init(val_table.Bytes, val_table.Pos)
+        list_result = JavaList()
+        for i in range(list_obj.ItemsLength()):
+            item = list_obj.Items(i)
+            list_result.append(
+                _unpack_value_impl(item.ValType(), item.Val(), client, ref_class)
+            )
+        return list_result
+    elif val_type == Value.Value.MapVal:
+        map_obj = MapVal.MapVal()
+        map_obj.Init(val_table.Bytes, val_table.Pos)
+        map_result: dict[Any, Any] = {}
+        for i in range(map_obj.EntriesLength()):
+            entry = map_obj.Entries(i)
+            key_arg = entry.Key()
+            val_arg = entry.Value()
+            key = _unpack_value_impl(
+                key_arg.ValType(), key_arg.Val(), client, ref_class
+            )
+            val = _unpack_value_impl(
+                val_arg.ValType(), val_arg.Val(), client, ref_class
+            )
+            map_result[key] = val
+        return map_result
+    elif val_type == Value.Value.ArrayVal:
+        arr_obj = ArrayVal.ArrayVal()
+        arr_obj.Init(val_table.Bytes, val_table.Pos)
+        return _unpack_array_impl(arr_obj, client, ref_class)
+
+    return None
+
+
+def _unpack_array_impl(array_val, client: Any, ref_class: Any):
+    """Unpack an ArrayVal FlatBuffer to a JavaArray (preserves array semantics).
+
+    Uses direct buffer slicing with struct.unpack for primitive types,
+    which is much faster than element-by-element access.
+    """
+    elem_type = array_val.ElementType()
+    tab = array_val._tab
+
+    if elem_type == ElementType.ElementType.Int:
+        length = array_val.IntValuesLength()
+        values = _unpack_flatbuffer_vector(
+            tab, _ARRAYVAL_INT_VALUES_OFFSET, length, "i", 4
+        )
+        return JavaArray(values, element_type="Int")
+    elif elem_type == ElementType.ElementType.Long:
+        length = array_val.LongValuesLength()
+        values = _unpack_flatbuffer_vector(
+            tab, _ARRAYVAL_LONG_VALUES_OFFSET, length, "q", 8
+        )
+        return JavaArray(values, element_type="Long")
+    elif elem_type == ElementType.ElementType.Double:
+        length = array_val.DoubleValuesLength()
+        values = _unpack_flatbuffer_vector(
+            tab, _ARRAYVAL_DOUBLE_VALUES_OFFSET, length, "d", 8
+        )
+        return JavaArray(values, element_type="Double")
+    elif elem_type == ElementType.ElementType.Float:
+        # Float was widened to double
+        length = array_val.DoubleValuesLength()
+        values = _unpack_flatbuffer_vector(
+            tab, _ARRAYVAL_DOUBLE_VALUES_OFFSET, length, "d", 8
+        )
+        return JavaArray(values, element_type="Float")
+    elif elem_type == ElementType.ElementType.Bool:
+        length = array_val.BoolValuesLength()
+        values = _unpack_flatbuffer_vector(
+            tab, _ARRAYVAL_BOOL_VALUES_OFFSET, length, "?", 1
+        )
+        return JavaArray(values, element_type="Bool")
+    elif elem_type == ElementType.ElementType.Byte:
+        length = array_val.ByteValuesLength()
+        # Direct buffer slice for bytes
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(
+            tab.Offset(_ARRAYVAL_BYTE_VALUES_OFFSET)
+        )
+        if o == 0 or length == 0:
+            return b""
+        start = tab.Vector(o)
+        return bytes(tab.Bytes[start : start + length])
+    elif elem_type == ElementType.ElementType.Short:
+        # Short was widened to int
+        length = array_val.IntValuesLength()
+        values = _unpack_flatbuffer_vector(
+            tab, _ARRAYVAL_INT_VALUES_OFFSET, length, "i", 4
+        )
+        return JavaArray(values, element_type="Short")
+    elif elem_type == ElementType.ElementType.String:
+        result = JavaArray(element_type="String")
+        for i in range(array_val.ObjectValuesLength()):
+            item = array_val.ObjectValues(i)
+            result.append(
+                _unpack_value_impl(item.ValType(), item.Val(), client, ref_class)
+            )
+        return result
+    else:
+        # Object array
+        result = JavaArray(element_type="Object")
+        for i in range(array_val.ObjectValuesLength()):
+            item = array_val.ObjectValues(i)
+            result.append(
+                _unpack_value_impl(item.ValType(), item.Val(), client, ref_class)
+            )
+        return result
+
+
 class GatunClient:
     def __init__(
         self,
         socket_path=None,
-        callback_timeout: float | None = None,
-        socket_timeout: float | None = None,
-        handshake_timeout: float | None = None,
+        callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
+        socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
+        handshake_timeout: float | None = HANDSHAKE_TIMEOUT,
     ):
         """Initialize a Gatun client.
 
@@ -1208,17 +1352,12 @@ class GatunClient:
         self.memory_path: str | None = (
             None  # Set during connect() from server handshake
         )
-        self.callback_timeout = (
-            callback_timeout
-            if callback_timeout is not None
-            else DEFAULT_CALLBACK_TIMEOUT
-        )
-        self.socket_timeout = (
-            socket_timeout if socket_timeout is not None else DEFAULT_SOCKET_TIMEOUT
-        )
-        self.handshake_timeout = (
-            handshake_timeout if handshake_timeout is not None else HANDSHAKE_TIMEOUT
-        )
+        # None disables the corresponding timeout
+        self.callback_timeout = callback_timeout
+        self.socket_timeout = socket_timeout
+        self.handshake_timeout = handshake_timeout
+        # Server process launched for this client by connect(); stopped on close()
+        self._server_session: Any = None
 
         self.sock: socket.socket | None = socket.socket(
             socket.AF_UNIX, socket.SOCK_STREAM
@@ -1564,129 +1703,11 @@ class GatunClient:
 
     def _unpack_value(self, val_type: int, val_table: Any) -> Any:
         """Unpack a FlatBuffer Value union to a Python object."""
-        if val_type == Value.Value.NullVal:
-            return None
-        elif val_type == Value.Value.StringVal:
-            str_obj = StringVal.StringVal()
-            str_obj.Init(val_table.Bytes, val_table.Pos)
-            return str_obj.V().decode("utf-8")
-        elif val_type == Value.Value.IntVal:
-            int_obj = IntVal.IntVal()
-            int_obj.Init(val_table.Bytes, val_table.Pos)
-            return int_obj.V()
-        elif val_type == Value.Value.DoubleVal:
-            double_obj = DoubleVal.DoubleVal()
-            double_obj.Init(val_table.Bytes, val_table.Pos)
-            return double_obj.V()
-        elif val_type == Value.Value.BoolVal:
-            bool_obj = BoolVal.BoolVal()
-            bool_obj.Init(val_table.Bytes, val_table.Pos)
-            return bool_obj.V()
-        elif val_type == Value.Value.CharVal:
-            char_obj = CharVal.CharVal()
-            char_obj.Init(val_table.Bytes, val_table.Pos)
-            return chr(char_obj.V())  # Convert to Python str (single char)
-        elif val_type == Value.Value.ObjectRef:
-            ref_obj = ObjectRef.ObjectRef()
-            ref_obj.Init(val_table.Bytes, val_table.Pos)
-            return JavaObject(self, ref_obj.Id())
-        elif val_type == Value.Value.ListVal:
-            list_obj = ListVal.ListVal()
-            list_obj.Init(val_table.Bytes, val_table.Pos)
-            list_result = JavaList()
-            for i in range(list_obj.ItemsLength()):
-                item = list_obj.Items(i)
-                list_result.append(self._unpack_value(item.ValType(), item.Val()))
-            return list_result
-        elif val_type == Value.Value.MapVal:
-            map_obj = MapVal.MapVal()
-            map_obj.Init(val_table.Bytes, val_table.Pos)
-            map_result: dict[Any, Any] = {}
-            for i in range(map_obj.EntriesLength()):
-                entry = map_obj.Entries(i)
-                key_arg = entry.Key()
-                val_arg = entry.Value()
-                key = self._unpack_value(key_arg.ValType(), key_arg.Val())
-                val = self._unpack_value(val_arg.ValType(), val_arg.Val())
-                map_result[key] = val
-            return map_result
-        elif val_type == Value.Value.ArrayVal:
-            arr_obj = ArrayVal.ArrayVal()
-            arr_obj.Init(val_table.Bytes, val_table.Pos)
-            return self._unpack_array(arr_obj)
-
-        return None
+        return _unpack_value_impl(val_type, val_table, self, JavaObject)
 
     def _unpack_array(self, array_val):
-        """Unpack an ArrayVal FlatBuffer to a JavaArray (preserves array semantics).
-
-        Uses direct buffer slicing with struct.unpack for primitive types,
-        which is much faster than element-by-element access.
-        """
-        elem_type = array_val.ElementType()
-        tab = array_val._tab
-
-        if elem_type == ElementType.ElementType.Int:
-            length = array_val.IntValuesLength()
-            values = _unpack_flatbuffer_vector(
-                tab, _ARRAYVAL_INT_VALUES_OFFSET, length, "i", 4
-            )
-            return JavaArray(values, element_type="Int")
-        elif elem_type == ElementType.ElementType.Long:
-            length = array_val.LongValuesLength()
-            values = _unpack_flatbuffer_vector(
-                tab, _ARRAYVAL_LONG_VALUES_OFFSET, length, "q", 8
-            )
-            return JavaArray(values, element_type="Long")
-        elif elem_type == ElementType.ElementType.Double:
-            length = array_val.DoubleValuesLength()
-            values = _unpack_flatbuffer_vector(
-                tab, _ARRAYVAL_DOUBLE_VALUES_OFFSET, length, "d", 8
-            )
-            return JavaArray(values, element_type="Double")
-        elif elem_type == ElementType.ElementType.Float:
-            # Float was widened to double
-            length = array_val.DoubleValuesLength()
-            values = _unpack_flatbuffer_vector(
-                tab, _ARRAYVAL_DOUBLE_VALUES_OFFSET, length, "d", 8
-            )
-            return JavaArray(values, element_type="Float")
-        elif elem_type == ElementType.ElementType.Bool:
-            length = array_val.BoolValuesLength()
-            values = _unpack_flatbuffer_vector(
-                tab, _ARRAYVAL_BOOL_VALUES_OFFSET, length, "?", 1
-            )
-            return JavaArray(values, element_type="Bool")
-        elif elem_type == ElementType.ElementType.Byte:
-            length = array_val.ByteValuesLength()
-            # Direct buffer slice for bytes
-            o = flatbuffers.number_types.UOffsetTFlags.py_type(
-                tab.Offset(_ARRAYVAL_BYTE_VALUES_OFFSET)
-            )
-            if o == 0 or length == 0:
-                return b""
-            start = tab.Vector(o)
-            return bytes(tab.Bytes[start : start + length])
-        elif elem_type == ElementType.ElementType.Short:
-            # Short was widened to int
-            length = array_val.IntValuesLength()
-            values = _unpack_flatbuffer_vector(
-                tab, _ARRAYVAL_INT_VALUES_OFFSET, length, "i", 4
-            )
-            return JavaArray(values, element_type="Short")
-        elif elem_type == ElementType.ElementType.String:
-            result = JavaArray(element_type="String")
-            for i in range(array_val.ObjectValuesLength()):
-                item = array_val.ObjectValues(i)
-                result.append(self._unpack_value(item.ValType(), item.Val()))
-            return result
-        else:
-            # Object array
-            result = JavaArray(element_type="Object")
-            for i in range(array_val.ObjectValuesLength()):
-                item = array_val.ObjectValues(i)
-                result.append(self._unpack_value(item.ValType(), item.Val()))
-            return result
+        """Unpack an ArrayVal FlatBuffer to a JavaArray (preserves array semantics)."""
+        return _unpack_array_impl(array_val, self, JavaObject)
 
     def _read_response(self, timeout: float | None = None, _use_default: bool = True):
         """Read and parse a response from the server.
@@ -2788,6 +2809,17 @@ class GatunClient:
 
         arrow_type = arr.type
 
+        is_string = pa.types.is_string(arrow_type) or pa.types.is_large_string(
+            arrow_type
+        )
+        if arr.null_count and (
+            arrow_type == pa.bool_() or arrow_type in primitive_types
+        ):
+            raise ValueError(
+                f"Cannot convert a pyarrow {arrow_type} array containing nulls to a "
+                "Java primitive array. Fill or drop the nulls first."
+            )
+
         # Special handling for bool arrays - Arrow uses bit-packing, Java expects byte-per-bool
         if arrow_type == pa.bool_():
             # Convert to byte array (1 byte per boolean)
@@ -2802,9 +2834,10 @@ class GatunClient:
             elem_type, add_values_fn, itemsize, cast_type = primitive_types[arrow_type]
             if cast_type is not None:
                 arr = arr.cast(cast_type)
-            # Get the data buffer (index 1, index 0 is validity bitmap)
-            # For primitive arrays without nulls, we can use the buffer directly
-            buf = arr.buffers()[1].to_pybytes()
+            # Data buffer (index 1; index 0 is the validity bitmap). A sliced array
+            # shares its parent's buffer, so take only this array's window.
+            start = arr.offset * itemsize
+            buf = arr.buffers()[1][start : start + len(arr) * itemsize].to_pybytes()
             vec_off = _create_typed_vector(builder, buf, itemsize, len(arr))
             ArrayVal.Start(builder)
             ArrayVal.AddElementType(builder, elem_type)
@@ -2812,7 +2845,7 @@ class GatunClient:
             return Value.Value.ArrayVal, ArrayVal.End(builder)
 
         # String array - serialize each element
-        if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+        if is_string:
             item_offsets = [
                 self._build_argument(builder, arr[i].as_py()) for i in range(len(arr))
             ]
@@ -3099,11 +3132,11 @@ class GatunClient:
 
     def send_arrow_buffers(
         self,
-        table: pa.Table,
+        table: pa.Table | pa.RecordBatch,
         arena: PayloadArena,
         schema_cache: dict[int, bool] | None = None,
     ):
-        """Send an Arrow table via true zero-copy buffer transfer.
+        """Send an Arrow table or record batch via true zero-copy buffer transfer.
 
         This method copies Arrow buffers directly into the payload shared memory
         arena and sends buffer descriptors to Java, enabling Java to read the
@@ -3150,6 +3183,10 @@ class GatunClient:
             estimate_arrow_size,
             serialize_schema,
         )
+
+        if isinstance(table, pa.RecordBatch):
+            # Wrapping a batch in a Table shares its buffers; nothing is copied
+            table = pa.Table.from_batches([table])
 
         # 0. Pre-check available space to provide informative error
         estimated = estimate_arrow_size(table)
@@ -3392,6 +3429,11 @@ class GatunClient:
             # Best-effort teardown; mmap.close() raises BufferError while Arrow
             # buffers exported from the mapping are still alive.
             pass
+        finally:
+            # A server started for this client by connect() goes away with it
+            session, self._server_session = self._server_session, None
+            if session is not None:
+                session.stop()
 
     def __enter__(self):
         # Only connect if not already connected

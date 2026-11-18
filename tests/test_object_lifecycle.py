@@ -114,6 +114,22 @@ class TestWrapperRelease:
 
         assert size.get() == 0
 
+    def test_objects_nested_in_a_returned_list_are_freed(self, client):
+        """Regression: objects inside a returned collection were registered
+        outside the session, so nothing could ever free them."""
+        sb = client.create_object("java.lang.StringBuilder", "x")
+        nested = client.jvm.java.util.Arrays.asList(sb, sb)
+        nested_ids = [obj.object_id for obj in nested]
+        assert client.invoke_method(nested_ids[0], "toString") == "x"
+
+        del nested
+        gc.collect()
+
+        for object_id in nested_ids:
+            with pytest.raises(JavaException, match="not found"):
+                client.invoke_method(object_id, "toString")
+        assert sb.toString() == "x"
+
     def test_wrappers_dropped_on_another_thread(self, client):
         """Wrappers released by another thread do not corrupt requests in flight."""
         arr = client.create_object("java.util.ArrayList")

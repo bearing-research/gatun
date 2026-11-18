@@ -1103,8 +1103,11 @@ public class GatunServer {
             result = true;
           }
 
-          // 3. Pack Success
-          responseOffset = packSuccess(builder, result);
+          // 3. Pack Success. Objects nested in the result (elements of a returned list, say)
+          // are registered while packing; tie them to this session so they can be freed.
+          int registeredBefore = sessionObjectIds.size();
+          responseOffset = packSuccessWithSession(builder, result, sessionObjectIds);
+          quota.countRegisteredObjects(sessionObjectIds.size() - registeredBefore);
 
         } catch (Throwable t) {
           // Unwrap InvocationTargetException to get the real cause
@@ -2061,7 +2064,17 @@ public class GatunServer {
       return ArrayVal.endArrayVal(builder);
     } else {
       // Object array (String[], Object[], etc.)
-      Object[] arr = (Object[]) array;
+      Object[] arr;
+      if (componentType == char.class) {
+        // char[] has no primitive encoding on the wire; send it as an array of chars
+        char[] chars = (char[]) array;
+        arr = new Object[chars.length];
+        for (int i = 0; i < chars.length; i++) {
+          arr[i] = chars[i];
+        }
+      } else {
+        arr = (Object[]) array;
+      }
       int[] argOffsets = new int[arr.length];
       for (int i = 0; i < arr.length; i++) {
         int[] packed = packValue(builder, arr[i], sessionObjectIds);

@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `datetime`, `date` and `time` arguments no longer kill the connection, and can be returned from callbacks
 - A batch no longer loses a target object whose last reference is dropped before the batch runs
 - Objects passed to callbacks are counted against `max_objects`, so freeing them no longer lowers the session's object count below the real one
+- Objects nested in a returned collection (for example the elements of `Arrays.asList(obj, obj)`) are now released when their wrappers are dropped; they used to stay on the server for the life of the JVM
+- `client.close()` stops the server that `connect()` / `aconnect()` launched for it instead of leaving the JVM running until interpreter exit
+- `socket_timeout=None`, `callback_timeout=None` and `handshake_timeout=None` disable the timeout, as documented; they were silently replaced by the defaults
+- Sliced pyarrow arrays passed as arguments send their own values rather than the parent buffer from element 0, and primitive pyarrow arrays containing nulls raise `ValueError` instead of sending garbage
+- `send_arrow_buffers()` accepts a `RecordBatch`
+- The async client can decode returned maps and primitive arrays (it now shares the sync client's decoder)
+- Methods returning `char[]` no longer fail with `ClassCastException`
+- `GatunAdapter(classpath=...)` passes the classpath on
 
 ## [0.2.1] - 2026-01-17
 

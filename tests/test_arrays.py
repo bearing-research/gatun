@@ -150,3 +150,65 @@ def test_array_sizes(client, size):
     else:
         assert result.startswith("[0, 1, 2,")
         assert result.endswith("97, 98, 99]")
+
+
+class TestPyArrowArrayArguments:
+    """pyarrow arrays passed as arguments must send exactly their own values."""
+
+    def test_sliced_primitive_array(self, client):
+        """Regression: a slice sent its parent's whole buffer from element 0."""
+        full = pa.array([10, 20, 30, 40, 50], type=pa.int32())
+        Arrays = client.jvm.java.util.Arrays
+
+        assert Arrays.toString(full.slice(2, 2)) == "[30, 40]"
+        assert Arrays.toString(full.slice(1)) == "[20, 30, 40, 50]"
+        assert Arrays.toString(full) == "[10, 20, 30, 40, 50]"
+
+    def test_sliced_arrays_of_other_widths(self, client):
+        Arrays = client.jvm.java.util.Arrays
+        longs = pa.array([1, 2, 3, 4], type=pa.int64()).slice(1, 2)
+        doubles = pa.array([1.5, 2.5, 3.5], type=pa.float64()).slice(2)
+        shorts = pa.array([7, 8, 9], type=pa.int16()).slice(1)
+        bools = pa.array([True, False, True]).slice(1)
+
+        assert Arrays.toString(longs) == "[2, 3]"
+        assert Arrays.toString(doubles) == "[3.5]"
+        assert Arrays.toString(shorts) == "[8, 9]"
+        assert Arrays.toString(bools) == "[false, true]"
+
+    def test_chunked_array(self, client):
+        chunked = pa.chunked_array(
+            [pa.array([1, 2], type=pa.int32()), pa.array([3], type=pa.int32())]
+        )
+
+        assert client.jvm.java.util.Arrays.toString(chunked) == "[1, 2, 3]"
+
+    @pytest.mark.parametrize(
+        "values, arrow_type",
+        [
+            ([1, None, 3], pa.int32()),
+            ([1.0, None], pa.float64()),
+            ([True, None], pa.bool_()),
+        ],
+        ids=["int32", "float64", "bool"],
+    )
+    def test_nulls_in_primitive_array_are_rejected(self, client, values, arrow_type):
+        """Regression: nulls were sent as whatever sat in the data buffer."""
+        arr = pa.array(values, type=arrow_type)
+
+        with pytest.raises(ValueError, match="nulls"):
+            client.jvm.java.util.Arrays.toString(arr)
+        assert client.ping() is True
+
+    def test_nulls_in_string_array_become_null(self, client):
+        arr = pa.array(["a", None, "c"])
+
+        assert client.jvm.java.util.Arrays.toString(arr) == "[a, null, c]"
+
+
+def test_char_array_return(client):
+    """Regression: returning a char[] failed with ClassCastException."""
+    chars = client.jvm.java.lang.Character.toChars(0x1F600)  # a surrogate pair
+
+    assert [ord(c) for c in chars] == [0xD83D, 0xDE00]
+    assert list(client.jvm.java.lang.Character.toChars(65)) == ["A"]

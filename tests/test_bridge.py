@@ -349,3 +349,20 @@ class TestGatunAdapterClose:
         adapter = GatunAdapter(memory="16MB")
         adapter.close()
         adapter.close()  # Should not raise
+
+
+def test_gatun_adapter_passes_classpath(monkeypatch):
+    """Regression: the classpath argument was accepted and then dropped."""
+    import gatun.bridge_adapters as adapters
+
+    seen = {}
+
+    def fake_connect(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(adapters, "gatun_connect", fake_connect)
+
+    adapters.GatunAdapter(memory="32MB", classpath=["/a.jar", "/b.jar"])
+
+    assert seen == {"memory": "32MB", "classpath": ["/a.jar", "/b.jar"]}
