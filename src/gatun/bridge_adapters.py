@@ -41,16 +41,23 @@ class GatunAdapter(BridgeAdapter):
         self,
         memory: str = "64MB",
         classpath: list[str] | None = None,
+        allowed_classes: list[str] | None = None,
+        allowed_prefixes: list[str] | None = None,
     ):
         """Create a new GatunAdapter.
 
         Args:
             memory: Shared memory size (e.g., "64MB", "256MB")
             classpath: Additional JAR files for the classpath
+            allowed_classes: Class names allowed beyond the server's built-in list
+            allowed_prefixes: Package prefixes allowed beyond the built-in list
         """
         # connect() launches the server and returns a connected client
         self._client: GatunClient | None = gatun_connect(
-            memory=memory, classpath=classpath
+            memory=memory,
+            classpath=classpath,
+            allowed_classes=allowed_classes,
+            allowed_prefixes=allowed_prefixes,
         )
 
     # === Object Lifecycle ===

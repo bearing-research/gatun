@@ -56,56 +56,17 @@ public class GatunServer {
       65536; // 64KB - increased to handle large pickled functions
   private static final int RESPONSE_ZONE_SIZE = 65536; // 64KB - increased to handle large responses
 
-  // --- SECURITY: Allowlist of classes that can be instantiated or used for static methods ---
-  private static final Set<String> ALLOWED_CLASSES =
-      Set.of(
-          "java.util.ArrayList",
-          "java.util.LinkedList",
-          "java.util.HashMap",
-          "java.util.LinkedHashMap",
-          "java.util.HashSet",
-          "java.util.LinkedHashSet",
-          "java.util.TreeMap",
-          "java.util.TreeSet",
-          "java.util.Collections",
-          "java.util.Arrays",
-          "java.lang.String",
-          "java.lang.Integer",
-          "java.lang.Long",
-          "java.lang.Double",
-          "java.lang.Float",
-          "java.lang.Boolean",
-          "java.lang.Byte",
-          "java.lang.Short",
-          "java.lang.Character",
-          "java.lang.Math",
-          "java.lang.StringBuilder",
-          "java.lang.StringBuffer",
-          "java.lang.System", // For setting system properties (e.g., spark.master)
-          "java.lang.Class", // For reflection-based array creation
-          "java.lang.reflect.Array", // For array operations
-          "java.sql.Timestamp", // For datetime conversion
-          "java.sql.Date", // For date conversion
-          "java.sql.Time"); // For time conversion
+  // --- SECURITY: classes that can be instantiated or used for static methods ---
+  private final ClassAllowlist allowlist = ClassAllowlist.fromSystemProperties();
 
-  // --- SECURITY: Prefixes for allowed class packages (e.g., for Spark integration) ---
-  private static final Set<String> ALLOWED_PREFIXES =
-      Set.of(
-          "org.apache.spark.", // Apache Spark
-          "org.apache.log4j.", // Log4J (used by Spark)
-          "scala." // Scala standard library
-          );
-
-  private static boolean isClassAllowed(String className) {
-    if (ALLOWED_CLASSES.contains(className)) {
-      return true;
+  private void requireClassAllowed(String className) {
+    if (!allowlist.isAllowed(className)) {
+      throw new SecurityException(
+          "Class not allowed: "
+              + className
+              + ". To allow it, pass allowed_classes or allowed_prefixes to connect(), or set"
+              + " the gatun.allowlist.classes / gatun.allowlist.prefixes system properties.");
     }
-    for (String prefix : ALLOWED_PREFIXES) {
-      if (className.startsWith(prefix)) {
-        return true;
-      }
-    }
-    return false;
   }
 
   // --- THE OBJECT REGISTRY ---
@@ -266,6 +227,9 @@ public class GatunServer {
         ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
       serverChannel.bind(UnixDomainSocketAddress.of(socketPath));
       LOG.info("Server ready at: " + socketPath);
+      if (allowlist.hasAdditions()) {
+        LOG.info("Class allowlist additions: " + allowlist.describeAdditions());
+      }
 
       while (true) {
         SocketChannel client = serverChannel.accept();
@@ -448,9 +412,7 @@ public class GatunServer {
 
           if (cmd.action() == Action.CreateObject) {
             String className = cmd.targetName();
-            if (!isClassAllowed(className)) {
-              throw new SecurityException("Class not allowed: " + className);
-            }
+            requireClassAllowed(className);
 
             // Refuse before running the constructor; the slot is taken once it succeeds
             quota.checkObjectLimit();
@@ -552,9 +514,7 @@ public class GatunServer {
             String className = fullName.substring(0, lastDot);
             String methodName = fullName.substring(lastDot + 1);
 
-            if (!isClassAllowed(className)) {
-              throw new SecurityException("Class not allowed: " + className);
-            }
+            requireClassAllowed(className);
 
             Class<?> clazz = getClass(className);
 
@@ -757,9 +717,7 @@ public class GatunServer {
             String className = fullName.substring(0, lastDot);
             String fieldName = fullName.substring(lastDot + 1);
 
-            if (!isClassAllowed(className)) {
-              throw new SecurityException("Class not allowed: " + className);
-            }
+            requireClassAllowed(className);
 
             Class<?> clazz = getClass(className);
 
@@ -791,9 +749,7 @@ public class GatunServer {
             String className = fullName.substring(0, lastDot);
             String fieldName = fullName.substring(lastDot + 1);
 
-            if (!isClassAllowed(className)) {
-              throw new SecurityException("Class not allowed: " + className);
-            }
+            requireClassAllowed(className);
 
             if (cmd.argsLength() != 1) {
               throw new IllegalArgumentException("SetStaticField requires exactly one argument");
@@ -1006,9 +962,7 @@ public class GatunServer {
               ObjectSpec spec = req.objects(i);
               String className = spec.className();
 
-              if (!isClassAllowed(className)) {
-                throw new SecurityException("Class not allowed: " + className);
-              }
+              requireClassAllowed(className);
 
               // Refuse before running the constructor; the slot is taken once it succeeds
               quota.checkObjectLimit();
@@ -1371,9 +1325,7 @@ public class GatunServer {
 
     if (cmd.action() == Action.CreateObject) {
       String className = cmd.targetName();
-      if (!isClassAllowed(className)) {
-        throw new SecurityException("Class not allowed: " + className);
-      }
+      requireClassAllowed(className);
 
       // Refuse before running the constructor; the slot is taken once it succeeds
       quota.checkObjectLimit();
@@ -1466,9 +1418,7 @@ public class GatunServer {
       String className = fullName.substring(0, lastDot);
       String methodName = fullName.substring(lastDot + 1);
 
-      if (!isClassAllowed(className)) {
-        throw new SecurityException("Class not allowed: " + className);
-      }
+      requireClassAllowed(className);
 
       Class<?> clazz = getClass(className);
 
@@ -1564,9 +1514,7 @@ public class GatunServer {
       String className = fullName.substring(0, lastDot);
       String fieldName = fullName.substring(lastDot + 1);
 
-      if (!isClassAllowed(className)) {
-        throw new SecurityException("Class not allowed: " + className);
-      }
+      requireClassAllowed(className);
 
       Class<?> clazz = getClass(className);
 
@@ -1596,9 +1544,7 @@ public class GatunServer {
       String className = fullName.substring(0, lastDot);
       String fieldName = fullName.substring(lastDot + 1);
 
-      if (!isClassAllowed(className)) {
-        throw new SecurityException("Class not allowed: " + className);
-      }
+      requireClassAllowed(className);
 
       if (cmd.argsLength() != 1) {
         throw new IllegalArgumentException("SetStaticField requires exactly one argument");

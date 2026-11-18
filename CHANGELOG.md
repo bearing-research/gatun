@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `estimate_arrow_size()` and up-front size validation raising `PayloadTooLargeError`
 - Direction field on Arrow batch descriptors
 - Arrow memory architecture documentation
+- `allowed_classes` and `allowed_prefixes` arguments to `connect()`, `aconnect()`, `launch_gateway()` and `GatunAdapter`, also settable in `pyproject.toml` and through `GATUN_ALLOWED_CLASSES` / `GATUN_ALLOWED_PREFIXES`. Using a library outside the built-in allowlist no longer needs a source edit and a rebuild
 
 ### Changed
 - Protocol version is now 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together

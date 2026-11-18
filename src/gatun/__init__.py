@@ -105,6 +105,8 @@ def connect(
     log_level: str | None = None,
     debug: bool = False,
     extra_jvm_flags: list[str] | None = None,
+    allowed_classes: list[str] | None = None,
+    allowed_prefixes: list[str] | None = None,
 ):
     """Convenience: Launches server and returns connected client.
 
@@ -118,15 +120,21 @@ def connect(
         log_level: Java logging level ("FINE", "FINER", "INFO", etc.).
         debug: If True, Java server logs are printed to stderr in real-time.
         extra_jvm_flags: Additional JVM flags to pass to the server (e.g., for resource limits).
+        allowed_classes: Fully qualified class names the client may instantiate or call
+                         static members on, in addition to the built-in list.
+        allowed_prefixes: Package prefixes (e.g. "com.example") whose classes, and those of
+                          their subpackages, are allowed likewise.
 
     Configuration can be set in pyproject.toml:
         [tool.gatun]
         memory = "64MB"
         socket_path = "/tmp/gatun.sock"
+        allowed_prefixes = ["com.example"]
 
     Or via environment variables:
         GATUN_MEMORY=64MB
         GATUN_SOCKET_PATH=/tmp/gatun.sock
+        GATUN_ALLOWED_PREFIXES=com.example,org.acme
         GATUN_TRACE=true
         GATUN_LOG_LEVEL=FINE
         GATUN_DEBUG=true
@@ -146,6 +154,8 @@ def connect(
         log_level=log_level,
         debug=debug,
         extra_jvm_flags=extra_jvm_flags,
+        allowed_classes=allowed_classes,
+        allowed_prefixes=allowed_prefixes,
     )
 
     client = GatunClient(session.socket_path)
@@ -166,6 +176,8 @@ async def aconnect(
     log_level: str | None = None,
     debug: bool = False,
     extra_jvm_flags: list[str] | None = None,
+    allowed_classes: list[str] | None = None,
+    allowed_prefixes: list[str] | None = None,
 ) -> AsyncGatunClient:
     """Async convenience: Launches server and returns connected async client.
 
@@ -179,6 +191,10 @@ async def aconnect(
         log_level: Java logging level ("FINE", "FINER", "INFO", etc.).
         debug: If True, Java server logs are printed to stderr in real-time.
         extra_jvm_flags: Additional JVM flags to pass to the server.
+        allowed_classes: Fully qualified class names the client may instantiate or call
+                         static members on, in addition to the built-in list.
+        allowed_prefixes: Package prefixes (e.g. "com.example") whose classes, and those of
+                          their subpackages, are allowed likewise.
 
     Example:
         async with await aconnect() as client:
@@ -193,6 +209,7 @@ async def aconnect(
     Or via environment variables:
         GATUN_MEMORY=64MB
         GATUN_SOCKET_PATH=/tmp/gatun.sock
+        GATUN_ALLOWED_PREFIXES=com.example,org.acme
         GATUN_TRACE=true
         GATUN_LOG_LEVEL=FINE
         GATUN_DEBUG=true
@@ -205,6 +222,8 @@ async def aconnect(
         log_level=log_level,
         debug=debug,
         extra_jvm_flags=extra_jvm_flags,
+        allowed_classes=allowed_classes,
+        allowed_prefixes=allowed_prefixes,
     )
 
     client = AsyncGatunClient(session.socket_path)

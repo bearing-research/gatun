@@ -2,6 +2,7 @@ import atexit
 import glob
 import logging
 import os
+import re
 import secrets
 import signal
 import socket
@@ -80,6 +81,71 @@ DEFAULT_JVM_FLAGS = [
 ]
 
 
+# A dotted Java name: identifiers separated by single dots ('$' for nested classes)
+_JAVA_NAME = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*(\.[A-Za-z_$][A-Za-z0-9_$]*)*")
+
+
+def _checked_names(names: list[str], option: str) -> list[str]:
+    """Validate allow-list entries and drop duplicates, keeping their order.
+
+    A prefix may be written "com.example", "com.example." or "com.example.*". The
+    server validates again; checking here reports a mistake as a ValueError at
+    the call site instead of as a server that failed to start.
+    """
+    checked: list[str] = []
+    for name in names:
+        if not isinstance(name, str):
+            raise TypeError(
+                f"{option} entries must be strings, got {type(name).__name__}"
+            )
+        bare = name
+        if option == "allowed_prefixes":
+            # One suffix only, as ClassAllowlist.normalizePrefix does
+            if bare.endswith(".*"):
+                bare = bare[:-2]
+            elif bare.endswith("."):
+                bare = bare[:-1]
+        if not _JAVA_NAME.fullmatch(bare):
+            raise ValueError(
+                f"Invalid entry in {option}: {name!r}. Expected a dotted Java name "
+                "such as 'com.example.Thing' (a class) or 'com.example' (a package prefix)."
+            )
+        if name not in checked:
+            checked.append(name)
+    return checked
+
+
+def _name_list(value: object, option: str) -> list[str]:
+    """Check that an allow-list option is a list, not a bare string.
+
+    A string is iterable, so without this "com.example" would be taken as the
+    eleven one-letter names it is made of.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise TypeError(
+            f"{option} must be a list of strings, got {type(value).__name__}: {value!r}"
+        )
+    return list(value)
+
+
+def _take_property(jvm_flags: list[str], name: str) -> list[str]:
+    """Remove every -D<name>=... flag from jvm_flags and return the names in them.
+
+    The JVM keeps only the last of several -D flags for one property, so a list
+    the caller set directly has to be merged into the launcher's own flag.
+    """
+    prefix = f"-D{name}="
+    names: list[str] = []
+    for flag in [flag for flag in jvm_flags if flag.startswith(prefix)]:
+        jvm_flags.remove(flag)
+        names += [
+            item.strip() for item in flag[len(prefix) :].split(",") if item.strip()
+        ]
+    return names
+
+
 def _drain_pipe(pipe, storage: list):
     """Drain a pipe to prevent buffer fill-up. Runs in background thread."""
     try:
@@ -151,6 +217,8 @@ def launch_gateway(
     log_level: str | None = None,
     debug: bool = False,
     extra_jvm_flags: list[str] | None = None,
+    allowed_classes: list[str] | None = None,
+    allowed_prefixes: list[str] | None = None,
 ):
     """
     Launches the embedded Java server.
@@ -168,12 +236,21 @@ def launch_gateway(
                    logging, "FINER" for object registry changes.
         debug: If True, Java server output is printed to stderr instead of captured.
                Useful for seeing logs in real-time during development.
+        allowed_classes: Fully qualified class names the client may instantiate or
+                         call static members on, in addition to the built-in list.
+        allowed_prefixes: Package prefixes (e.g. "com.example") whose classes, and
+                          those of their subpackages, are allowed likewise.
+
+    The allow lists from the arguments, the environment and pyproject.toml are
+    combined; everything else follows arguments > environment > pyproject.toml.
 
     Configuration can be set in pyproject.toml:
         [tool.gatun]
         memory = "64MB"
         socket_path = "/tmp/gatun.sock"  # Optional: fixed path for single session
         jvm_flags = ["-Xmx512m"]
+        allowed_classes = ["java.util.concurrent.atomic.AtomicLong"]
+        allowed_prefixes = ["com.example"]
 
     Environment variables for observability:
         GATUN_TRACE=true     - Enable trace mode
@@ -221,6 +298,28 @@ def launch_gateway(
     if effective_log_level:
         # Pass the log level to Java - it will configure logging programmatically
         jvm_flags.append(f"-Dgatun.log.level={effective_log_level}")
+
+    # 3b. Classes allowed beyond the server's built-in list
+    all_classes = _checked_names(
+        [
+            *config.allowed_classes,
+            *_take_property(jvm_flags, "gatun.allowlist.classes"),
+            *_name_list(allowed_classes, "allowed_classes"),
+        ],
+        "allowed_classes",
+    )
+    all_prefixes = _checked_names(
+        [
+            *config.allowed_prefixes,
+            *_take_property(jvm_flags, "gatun.allowlist.prefixes"),
+            *_name_list(allowed_prefixes, "allowed_prefixes"),
+        ],
+        "allowed_prefixes",
+    )
+    if all_classes:
+        jvm_flags.append(f"-Dgatun.allowlist.classes={','.join(all_classes)}")
+    if all_prefixes:
+        jvm_flags.append(f"-Dgatun.allowlist.prefixes={','.join(all_prefixes)}")
 
     # Find Java executable - prefer JAVA_HOME, fall back to PATH
     java_home = os.environ.get("JAVA_HOME")
