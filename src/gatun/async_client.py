@@ -48,6 +48,7 @@ from gatun.client import (
     SocketTimeoutError,
     _encode_temporal,
     _raise_java_exception_impl,
+    _unpack_value_impl,
 )
 from gatun.generated.org.gatun.protocol import Action as Act
 from gatun.generated.org.gatun.protocol import Command as Cmd
@@ -220,9 +221,9 @@ class AsyncGatunClient:
     def __init__(
         self,
         socket_path: str | None = None,
-        callback_timeout: float | None = None,
-        socket_timeout: float | None = None,
-        handshake_timeout: float | None = None,
+        callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
+        socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
+        handshake_timeout: float | None = HANDSHAKE_TIMEOUT,
     ):
         """Initialize an async Gatun client.
 
@@ -249,17 +250,12 @@ class AsyncGatunClient:
         self.memory_path: str | None = (
             None  # Set during connect() from server handshake
         )
-        self.callback_timeout: float | None = (
-            callback_timeout
-            if callback_timeout is not None
-            else DEFAULT_CALLBACK_TIMEOUT
-        )
-        self.socket_timeout = (
-            socket_timeout if socket_timeout is not None else DEFAULT_SOCKET_TIMEOUT
-        )
-        self.handshake_timeout = (
-            handshake_timeout if handshake_timeout is not None else HANDSHAKE_TIMEOUT
-        )
+        # None disables the corresponding timeout
+        self.callback_timeout = callback_timeout
+        self.socket_timeout = socket_timeout
+        self.handshake_timeout = handshake_timeout
+        # Server process launched for this client by aconnect(); stopped on close()
+        self._server_session: Any = None
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -559,83 +555,7 @@ class AsyncGatunClient:
 
     def _unpack_value(self, val_type: int, val_table: Any) -> Any:
         """Unpack a FlatBuffer Value union to a Python object."""
-        from gatun.generated.org.gatun.protocol import (
-            ArrayVal,
-            BoolVal,
-            DoubleVal,
-            ElementType,
-            IntVal,
-            ListVal,
-            MapVal,
-            ObjectRef,
-            StringVal,
-        )
-
-        if val_type == Value.Value.NullVal:
-            return None
-        elif val_type == Value.Value.StringVal:
-            str_obj = StringVal.StringVal()
-            str_obj.Init(val_table.Bytes, val_table.Pos)
-            return str_obj.V().decode("utf-8")
-        elif val_type == Value.Value.IntVal:
-            int_obj = IntVal.IntVal()
-            int_obj.Init(val_table.Bytes, val_table.Pos)
-            return int_obj.V()
-        elif val_type == Value.Value.DoubleVal:
-            double_obj = DoubleVal.DoubleVal()
-            double_obj.Init(val_table.Bytes, val_table.Pos)
-            return double_obj.V()
-        elif val_type == Value.Value.BoolVal:
-            bool_obj = BoolVal.BoolVal()
-            bool_obj.Init(val_table.Bytes, val_table.Pos)
-            return bool_obj.V()
-        elif val_type == Value.Value.ObjectRef:
-            ref_obj = ObjectRef.ObjectRef()
-            ref_obj.Init(val_table.Bytes, val_table.Pos)
-            return AsyncJavaObject(self, ref_obj.Id())
-        elif val_type == Value.Value.ListVal:
-            list_obj = ListVal.ListVal()
-            list_obj.Init(val_table.Bytes, val_table.Pos)
-            list_result: list[Any] = []
-            for i in range(list_obj.ItemsLength()):
-                item = list_obj.Items(i)
-                list_result.append(self._unpack_value(item.ValType(), item.Val()))
-            return list_result
-        elif val_type == Value.Value.MapVal:
-            map_obj = MapVal.MapVal()
-            map_obj.Init(val_table.Bytes, val_table.Pos)
-            map_result: dict[Any, Any] = {}
-            for i in range(map_obj.EntriesLength()):
-                entry = map_obj.Entries(i)
-                key = self._unpack_value(entry.KeyType(), entry.Key())
-                value = self._unpack_value(entry.ValueType(), entry.Value())
-                map_result[key] = value
-            return map_result
-        elif val_type == Value.Value.ArrayVal:
-            arr_obj = ArrayVal.ArrayVal()
-            arr_obj.Init(val_table.Bytes, val_table.Pos)
-            elem_type = arr_obj.ElementType()
-
-            if elem_type == ElementType.ElementType.Int:
-                return list(arr_obj.IntValuesAsNumpy())
-            elif elem_type == ElementType.ElementType.Long:
-                return list(arr_obj.LongValuesAsNumpy())
-            elif (
-                elem_type == ElementType.ElementType.Double
-                or elem_type == ElementType.ElementType.Float
-            ):
-                return list(arr_obj.DoubleValuesAsNumpy())
-            elif elem_type == ElementType.ElementType.Byte:
-                return bytes(arr_obj.ByteValuesAsNumpy())
-            elif elem_type == ElementType.ElementType.String:
-                return [
-                    arr_obj.StringValues(i).decode("utf-8")
-                    for i in range(arr_obj.StringValuesLength())
-                ]
-            else:
-                return []
-        else:
-            return None
+        return _unpack_value_impl(val_type, val_table, self, AsyncJavaObject)
 
     def _build_value(self, builder, value):
         """Build a Value union and return (type, offset)."""
@@ -1260,6 +1180,11 @@ class AsyncGatunClient:
             # Best-effort teardown; mmap.close() raises BufferError while Arrow
             # buffers exported from the mapping are still alive.
             pass
+        finally:
+            # A server started for this client by aconnect() goes away with it
+            session, self._server_session = self._server_session, None
+            if session is not None:
+                session.stop()
 
     async def __aenter__(self):
         # Only connect if not already connected

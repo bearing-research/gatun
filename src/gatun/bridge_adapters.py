@@ -49,7 +49,9 @@ class GatunAdapter(BridgeAdapter):
             classpath: Additional JAR files for the classpath
         """
         # connect() launches the server and returns a connected client
-        self._client: GatunClient | None = gatun_connect(memory=memory)
+        self._client: GatunClient | None = gatun_connect(
+            memory=memory, classpath=classpath
+        )
 
     # === Object Lifecycle ===
 
