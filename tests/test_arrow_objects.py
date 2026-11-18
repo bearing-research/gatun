@@ -4,6 +4,7 @@ A table Python sends becomes a VectorSchemaRoot that Java methods can receive,
 and any VectorSchemaRoot the JVM holds can be fetched as a pyarrow Table.
 """
 
+import ctypes
 import datetime
 import decimal
 import gc
@@ -12,6 +13,7 @@ import pyarrow as pa
 import pytest
 
 from gatun import (
+    ArrowTableView,
     JavaException,
     JavaIllegalArgumentException,
     JavaObject,
@@ -152,6 +154,57 @@ class TestSendingToJava:
             client.arrow_to_java({"x": [1, 2, 3]})
 
 
+class TestWritingIntoSharedMemory:
+    """The stream is written straight into the mapping, through objects that
+    hold it open while they live. None of them may outlive the call."""
+
+    def test_send_leaves_the_mapping_free_to_close(self, make_client):
+        client = make_client()
+        shm = client.shm
+        client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
+
+        client.close()
+
+        assert shm.closed
+
+    def test_refused_send_writes_nothing_and_holds_nothing(self):
+        client = connect(memory="2MB")
+        shm = client.shm
+        start = client.payload_offset
+        try:
+            client.arrow_to_java(pa.table({"x": [7] * 1000}))
+            before = bytes(shm[start : start + 16_384])
+            too_big = pa.table({"x": pa.array(range(400_000), type=pa.int64())})
+
+            with pytest.raises(PayloadTooLargeError) as exc_info:
+                client.arrow_to_java(too_big)
+
+            # The size reported is the stream's, to the byte
+            sink = pa.BufferOutputStream()
+            with pa.ipc.new_stream(sink, too_big.schema) as writer:
+                writer.write_table(too_big)
+            assert exc_info.value.payload_size == sink.getvalue().size
+            assert bytes(shm[start : start + 16_384]) == before
+        finally:
+            client.close()
+        assert shm.closed
+
+    def test_stream_is_placed_after_a_loaded_batch(self, client):
+        """Written in place, it must still start where the loaded batch ends."""
+        arena = client.get_payload_arena()
+        loaded = pa.table({"x": list(range(1000))})
+        client.send_arrow_buffers(loaded, arena, {})
+        try:
+            sent = pa.table({"y": ["a", "b", "c"]})
+
+            root = client.arrow_to_java(sent)
+
+            assert client.arrow_from_java(root).equals(sent)
+            assert client.get_arrow_data().table.equals(loaded)
+        finally:
+            arena.close()
+
+
 class TestFetchingFromJava:
     def test_table_produced_by_java(self, client):
         """slice() makes a new table on the Java side; Python never sent it."""
@@ -202,6 +255,159 @@ class TestFetchingFromJava:
     def test_unknown_object(self, client):
         with pytest.raises(JavaException, match="not found"):
             client.arrow_from_java(2**40)
+
+
+class TestReadingInPlace:
+    """arrow_from_java(copy=False): the table is the bytes Java wrote into the
+    payload zone, good until something else is written there."""
+
+    TABLE = pa.table({"x": list(range(1000)), "s": [str(i) for i in range(1000)]})
+
+    @pytest.fixture
+    def root(self, client):
+        return client.arrow_to_java(self.TABLE)
+
+    def test_table_is_not_copied(self, client, root):
+        view = client.arrow_from_java(root, copy=False)
+
+        assert isinstance(view, ArrowTableView)
+        assert view.table.equals(self.TABLE)
+        base = ctypes.addressof(ctypes.c_char.from_buffer(client.shm))
+        zone = range(base + client.payload_offset, base + client.response_offset)
+        for column in view.table.columns:
+            for buffer in column.chunk(0).buffers():
+                if buffer is not None and buffer.size:
+                    assert buffer.address in zone
+
+    def test_copy_is_the_default(self, client, root):
+        table = client.arrow_from_java(root)
+
+        assert isinstance(table, pa.Table)
+        client.arrow_to_java(pa.table({"y": [0] * 5000}))
+        assert table.equals(self.TABLE)
+
+    def test_ordinary_calls_leave_the_view_valid(self, client, root):
+        view = client.arrow_from_java(root, copy=False)
+
+        items = client.create_object("java.util.ArrayList")
+        items.add("x" * 10_000)
+        assert root.getRowCount() == 1000
+
+        assert view.table.equals(self.TABLE)
+        assert "valid" in repr(view)
+
+    @pytest.mark.parametrize(
+        "transfer",
+        [
+            lambda client, root, arena: client.arrow_to_java(pa.table({"y": [1]})),
+            lambda client, root, arena: client.arrow_from_java(root),
+            lambda client, root, arena: client.arrow_from_java(root, copy=False),
+            lambda client, root, arena: client.send_arrow_table(pa.table({"y": [1]})),
+            lambda client, root, arena: client.send_arrow_buffers(
+                pa.table({"y": [1]}), arena, {}
+            ),
+            lambda client, root, arena: arena.allocate(8),
+        ],
+        ids=[
+            "arrow_to_java",
+            "arrow_from_java",
+            "arrow_from_java in place",
+            "send_arrow_table",
+            "send_arrow_buffers",
+            "arena allocation",
+        ],
+    )
+    def test_any_later_write_ends_the_view(self, client, root, transfer):
+        """Even a small one: the table starts at the front of the zone."""
+        arena = client.get_payload_arena()
+        try:
+            view = client.arrow_from_java(root, copy=False)
+
+            transfer(client, root, arena)
+
+            with pytest.raises(StaleArenaError, match="reused the shared memory"):
+                view.to_pydict()
+            with pytest.raises(StaleArenaError):
+                view.column("x")
+            assert "STALE" in repr(view)
+        finally:
+            arena.close()
+
+    def test_arena_reset_ends_the_view(self, client, root):
+        view = client.arrow_from_java(root, copy=False)
+
+        client.reset_payload_arena()
+
+        with pytest.raises(StaleArenaError):
+            _ = view.table
+
+    def test_get_arrow_data_ends_the_view(self, client, root):
+        arena = client.get_payload_arena()
+        try:
+            client.send_arrow_buffers(pa.table({"y": [1]}), arena, {})
+            view = client.arrow_from_java(root, copy=False)
+
+            client.get_arrow_data()
+
+            with pytest.raises(StaleArenaError, match="reused the shared memory"):
+                view.to_pydict()
+        finally:
+            arena.close()
+
+    def test_fetch_that_does_not_fit_ends_the_view(self):
+        """Java fills what room there is before finding it is not enough."""
+        client = connect(memory="2MB", allowed_classes=[APPENDER])
+        try:
+            half = pa.table({"x": pa.array(range(150_000), type=pa.int64())})
+            grown = client.arrow_to_java(half)
+            client.jvm.org.apache.arrow.vector.util.VectorSchemaRootAppender.append(
+                grown, client.arrow_to_java(half)
+            )
+            small = client.arrow_to_java(pa.table({"y": [1, 2, 3]}))
+            view = client.arrow_from_java(small, copy=False)
+
+            with pytest.raises(PayloadTooLargeError):
+                client.arrow_from_java(grown, copy=False)
+
+            with pytest.raises(StaleArenaError):
+                view.to_pydict()
+        finally:
+            client.close()
+
+    def test_view_of_a_loaded_batch_survives_but_not_the_borrowed_table(self, client):
+        """The two kinds of view end on different writes: one from
+        get_arrow_data() outlives a small transfer, one read in place does not."""
+        arena = client.get_payload_arena()
+        try:
+            client.send_arrow_buffers(pa.table({"x": [1, 2, 3]}), arena, {})
+            root = client.arrow_to_java(self.TABLE)
+            loaded = client.get_arrow_data()
+            borrowed = client.arrow_from_java(root, copy=False)
+
+            client.arrow_to_java(pa.table({"y": [1]}))
+
+            assert loaded.to_pydict() == {"x": [1, 2, 3]}
+            with pytest.raises(StaleArenaError):
+                borrowed.to_pydict()
+        finally:
+            arena.close()
+
+    def test_close_ends_the_view_and_the_table_keeps_the_mapping(self, make_client):
+        client = make_client()
+        shm = client.shm
+        view = client.arrow_from_java(client.arrow_to_java(self.TABLE), copy=False)
+        table = view.table
+
+        client.close()
+
+        with pytest.raises(StaleArenaError):
+            _ = view.table
+        # The memory stays mapped for as long as the table can reach it
+        assert not shm.closed
+        assert table.equals(self.TABLE)
+        del table, view
+        gc.collect()
+        shm.close()
 
 
 class TestTableLifetime:
@@ -478,6 +684,22 @@ class TestMalformedRequests:
 
 
 class TestAsyncClient:
+    async def test_table_too_large_to_send(self):
+        client = await aconnect(memory="2MB")
+        try:
+            too_big = pa.table({"x": pa.array(range(400_000), type=pa.int64())})
+
+            with pytest.raises(PayloadTooLargeError) as exc_info:
+                await client.arrow_to_java(too_big)
+
+            assert exc_info.value.payload_size > exc_info.value.max_size > 0
+            root = await client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
+            assert (await client.arrow_from_java(root)).to_pydict() == {"x": [1, 2, 3]}
+        finally:
+            shm = client.shm
+            await client.close()
+        assert shm.closed
+
     async def test_concurrent_transfers_do_not_mix(self):
         """Regression: the payload zone was written before the request had the
         channel, so tasks sharing a client overwrote each other's tables."""

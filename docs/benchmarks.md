@@ -41,6 +41,13 @@ JAVA_HOME=/opt/homebrew/opt/openjdk uv run python benchmarks/benchmark_vectorize
 
 # Python callback benchmarks
 JAVA_HOME=/opt/homebrew/opt/openjdk uv run python benchmarks/benchmark_callbacks.py
+
+# Arrow transfer through shared memory against a Unix socket and a file.
+# Needs its Java helper compiled first (JDK 22+)
+javac -cp src/gatun/jars/gatun-server-all.jar -d benchmarks/java/out \
+    benchmarks/java/bench/TransportBench.java
+JAVA_HOME=/opt/homebrew/opt/openjdk uv run python benchmarks/benchmark_transport.py \
+    --classes benchmarks/java/out
 ```
 
 ## Results Summary
@@ -207,6 +214,7 @@ The pre-binding pattern matches how real applications (like PySpark) cache metho
 | `benchmark_arrow.py` | Arrow data transfer methods |
 | `benchmark_vectorized.py` | Vectorized API performance |
 | `benchmark_callbacks.py` | Python callback overhead |
+| `benchmark_transport.py` | Arrow tables through shared memory, a Unix socket and a file, both directions (Java half in `benchmarks/java/`) |
 | `profile_hotspots.py` | CPU profiling for optimization |
 
 ## Reproducing Results

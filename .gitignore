@@ -58,3 +58,6 @@ src/gatun/generated/
 # Spark distribution (for testing)
 spark-*/
 spark-*.tgz
+
+# Compiled benchmark helper
+benchmarks/java/out/

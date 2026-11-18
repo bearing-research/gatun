@@ -33,7 +33,7 @@ from __future__ import annotations
 import ctypes
 import io
 import mmap
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Self
 
@@ -72,6 +72,10 @@ class PayloadArena:
     _file: io.BufferedRandom | None
     _mmap: mmap.mmap | None
     _base_offset: int
+
+    # Called on each allocation. The client sets it on the arena it hands
+    # out, to learn that its payload zone is being written to
+    _on_allocate: Callable[[], None] | None = None
 
     def __init__(self, path: Path | str, size: int):
         """Initialize the payload arena from an existing file.
@@ -170,6 +174,9 @@ class PayloadArena:
                 f"Payload arena full: need {aligned_offset + size} bytes, "
                 f"have {self.size} bytes (current offset: {self.offset})"
             )
+
+        if self._on_allocate is not None:
+            self._on_allocate()
 
         # Create an Arrow buffer backed by the shared memory region
         # foreign_buffer creates a zero-copy view into existing memory

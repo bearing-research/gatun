@@ -17,7 +17,7 @@ import time
 import weakref
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Literal, Self, cast, overload
 
 import flatbuffers
 import pyarrow as pa
@@ -576,13 +576,26 @@ class ArrowTableView:
 
     For most use cases, immediately copy the data you need from the table
     or call table.to_pandas() / table.to_pydict() before resetting the arena.
+
+    A view from arrow_from_java(copy=False) can lie anywhere in the payload
+    zone, so it ends with the next Arrow transfer of any kind (any_write).
+    One from get_arrow_data() lies in the second half of the zone and outlives
+    transfers that stay in the first.
     """
 
-    def __init__(self, table: pa.Table, epoch: int, client: GatunClient):
+    def __init__(
+        self,
+        table: pa.Table,
+        epoch: int,
+        client: GatunClient,
+        *,
+        any_write: bool = False,
+    ):
         self._table = table
         self._epoch = epoch
         self._client = client
-        self._payload_generation = client._payload_generation
+        self._counter = "_payload_writes" if any_write else "_payload_generation"
+        self._payload_generation = getattr(client, self._counter)
 
     def _check_epoch(self):
         """Raise StaleArenaError if epoch changed or client closed."""
@@ -595,7 +608,7 @@ class ArrowTableView:
         current = self._client._arena_epoch
         if self._epoch != current:
             raise StaleArenaError(self._epoch, current)
-        if self._payload_generation != self._client._payload_generation:
+        if self._payload_generation != getattr(self._client, self._counter):
             raise StaleArenaError(
                 self._epoch,
                 current,
@@ -650,7 +663,11 @@ class ArrowTableView:
         return self._table.column(name)
 
     def __repr__(self):
-        epoch_status = "valid" if self._epoch == self._client._arena_epoch else "STALE"
+        try:
+            self._check_epoch()
+            epoch_status = "valid"
+        except StaleArenaError:
+            epoch_status = "STALE"
         return f"<ArrowTableView rows={self.num_rows} cols={self.num_columns} epoch={self._epoch} ({epoch_status})>"
 
 
@@ -1460,8 +1477,8 @@ def _unpack_array_impl(array_val, client: Any, ref_class: Any):
         return result
 
 
-def _arrow_ipc_stream(table: pa.Table | pa.RecordBatch) -> pa.Buffer:
-    """Serialize a table as an Arrow IPC stream for arrow_to_java()."""
+def _arrow_table_to_send(table: pa.Table | pa.RecordBatch) -> pa.Table:
+    """Check a table for arrow_to_java() and return it in the form it is sent in."""
     from gatun.arena import UnsupportedArrowTypeError, _check_type_recursive
 
     if isinstance(table, pa.RecordBatch):
@@ -1482,10 +1499,51 @@ def _arrow_ipc_stream(table: pa.Table | pa.RecordBatch) -> pa.Buffer:
 
     # One chunk per column, so the table arrives as a single record batch and
     # Java can keep its buffers as they are instead of stitching batches together.
-    sink = pa.BufferOutputStream()
+    return table.combine_chunks()
+
+
+def _arrow_stream_size(table: pa.Table) -> int:
+    """The length of the table's Arrow IPC stream, without writing its data."""
+    sink = pa.MockOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table.combine_chunks())
-    return sink.getvalue()
+        writer.write_table(table)
+    return cast(int, sink.size())
+
+
+def _write_arrow_table(client: Any, table: pa.Table, offset: int, size: int) -> None:
+    """Write a table as an Arrow IPC stream into the payload zone at the given offset.
+
+    The stream is written where Java reads it. Building it in a buffer of its
+    own and copying that across would pass over the data twice. `size` is the
+    stream's length, from _arrow_stream_size().
+
+    Raises PayloadTooLargeError when it does not fit between the offset and the
+    response zone; nothing is written then.
+    """
+    assert client.shm is not None, "Not connected"
+    available = client.response_offset - client.payload_offset - offset
+    if size > available:
+        raise PayloadTooLargeError(size, max(available, 0), "Arrow table")
+
+    start = client.payload_offset + offset
+    buffer = pa.py_buffer(memoryview(client.shm)[start : start + size])
+    if not buffer.is_mutable:
+        # The writer would abort the process on this, rather than raise
+        raise RuntimeError("The shared memory is mapped read-only")
+    sink = pa.FixedSizeBufferWriter(buffer)
+    writer = None
+    try:
+        with pa.ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table)
+        written = sink.tell()
+    finally:
+        # Each of these holds the mapping open, and so would a traceback that
+        # kept them: close() could not unmap the shared memory
+        del writer, sink, buffer
+    if written != size:
+        raise RuntimeError(
+            f"Arrow stream took {written:,} bytes where {size:,} were expected"
+        )
 
 
 def _write_arrow_stream(
@@ -1529,11 +1587,16 @@ def _finish_arrow_from_object(builder: Any, object_id: int) -> Any:
     return builder.Output()
 
 
-def _read_arrow_stream(client: Any, location: tuple[int, int]) -> pa.Table:
+def _read_arrow_stream(
+    client: Any, location: tuple[int, int], *, in_place: bool = False
+) -> pa.Table:
     """Read the IPC stream the server wrote into the payload zone.
 
-    The bytes are copied out of shared memory first, so the table owns its data
-    and stays valid whatever happens to the zone or the connection afterwards.
+    By default the bytes are copied out of shared memory first, so the table
+    owns its data and stays valid whatever happens to the zone or the connection
+    afterwards. Read in place, the table's columns are the bytes in the zone:
+    nothing is copied, and the next write there changes the table. It holds the
+    mapping open, so it never reads unmapped memory.
     """
     offset, length = location
     assert client.shm is not None, "Not connected"
@@ -1543,7 +1606,10 @@ def _read_arrow_stream(client: Any, location: tuple[int, int]) -> pa.Table:
             f"Arrow stream at offset {offset} with length {length} is outside "
             "the payload zone"
         )
-    data = client.shm[start : start + length]
+    if in_place:
+        data = pa.py_buffer(memoryview(client.shm)[start : start + length])
+    else:
+        data = client.shm[start : start + length]
     return pa.ipc.open_stream(data).read_all()
 
 
@@ -2110,8 +2176,13 @@ class GatunClient(_ValueEncoder):
         self._arrow_loaded_end: int = 0
 
         # Bumped whenever something is written into the part of the payload
-        # zone that ArrowTableViews point at; see _note_payload_write
+        # zone that get_arrow_data()'s ArrowTableViews point at; see
+        # _note_payload_write
         self._payload_generation: int = 0
+
+        # Bumped whenever anything is written into the payload zone at all. A
+        # table read in place by arrow_from_java(copy=False) can lie anywhere in it
+        self._payload_writes: int = 0
 
         # FlatBuffers builder pool - reuse builders to reduce allocation overhead.
         # One pool per thread: a command is built before the channel is taken,
@@ -2284,7 +2355,10 @@ class GatunClient(_ValueEncoder):
         # Payload zone: from payload_offset to response_offset
         payload_size = self.response_offset - self.payload_offset
         assert self.shm is not None, "Not connected"
-        return PayloadArena.from_mmap(self.shm, self.payload_offset, payload_size)
+        arena = PayloadArena.from_mmap(self.shm, self.payload_offset, payload_size)
+        # What is put in the arena lands on whatever was read in place there
+        arena._on_allocate = self._end_borrowed_tables
+        return arena
 
     def arrow_context(self) -> ScopedArenaContext:
         """Get a context manager for scoped Arrow transfers.
@@ -3713,6 +3787,7 @@ class GatunClient(_ValueEncoder):
         """
         # Outstanding ArrowTableViews are invalid from here on, whatever happens
         self._payload_generation += 1
+        self._payload_writes += 1
 
         builder = self._get_builder()
 
@@ -3735,9 +3810,15 @@ class GatunClient(_ValueEncoder):
         Tables from get_arrow_data() point into the second half of the zone. A
         write that reaches it invalidates them, so that they raise
         StaleArenaError instead of returning whatever was written over them.
+        Tables read in place by arrow_from_java(copy=False) end with any write.
         """
+        self._payload_writes += 1
         if end > (self.response_offset - self.payload_offset) // 2:
             self._payload_generation += 1
+
+    def _end_borrowed_tables(self) -> None:
+        """Invalidate the tables arrow_from_java(copy=False) read in place."""
+        self._payload_writes += 1
 
     @_holding_channel
     def get_arrow_data(self) -> ArrowTableView:
@@ -3787,6 +3868,7 @@ class GatunClient(_ValueEncoder):
         view = cast(ArrowTableView, self._send_raw(builder.Output()))
         # Java wrote over the region earlier views point at; only this one is current
         self._payload_generation += 1
+        self._payload_writes += 1
         view._payload_generation = self._payload_generation
         return view
 
@@ -3801,7 +3883,8 @@ class GatunClient(_ValueEncoder):
         so Java code that needs the data for longer must copy it.
 
         The table is sent in one piece and must fit in the payload zone; connect
-        with more memory, or send it in slices, if it does not.
+        with more memory, or send it in slices, if it does not. It is written
+        into shared memory as it is serialized, and Java copies it out from there.
 
         Args:
             table: A pyarrow Table or RecordBatch.
@@ -3818,18 +3901,36 @@ class GatunClient(_ValueEncoder):
             root.getRowCount()                      # 3
             client.jvm.com.example.Stats.sum(root)  # your own Java code
         """
-        stream = _arrow_ipc_stream(table)
+        table = _arrow_table_to_send(table)
+        size = _arrow_stream_size(table)
         # Stay clear of a batch Java is still reading in place
         offset = (self._arrow_loaded_end + 63) & ~63
-        _write_arrow_stream(self, stream, offset)
-        self._note_payload_write(offset + stream.size)
+        _write_arrow_table(self, table, offset, size)
+        self._note_payload_write(offset + size)
 
-        command = _finish_arrow_to_object(self._get_builder(), offset, stream.size)
+        command = _finish_arrow_to_object(self._get_builder(), offset, size)
         return cast(JavaObject, self._send_raw(command))
 
+    @overload
+    def arrow_from_java(
+        self, table: JavaObject | int, *, copy: Literal[True] = True
+    ) -> pa.Table: ...
+
+    @overload
+    def arrow_from_java(
+        self, table: JavaObject | int, *, copy: Literal[False]
+    ) -> ArrowTableView: ...
+
+    @overload
+    def arrow_from_java(
+        self, table: JavaObject | int, *, copy: bool
+    ) -> pa.Table | ArrowTableView: ...
+
     @_holding_channel
-    def arrow_from_java(self, table: JavaObject | int) -> pa.Table:
-        """Copy an Arrow table held by a Java object into Python.
+    def arrow_from_java(
+        self, table: JavaObject | int, *, copy: bool = True
+    ) -> pa.Table | ArrowTableView:
+        """Fetch an Arrow table held by a Java object.
 
         Works for any org.apache.arrow.vector.VectorSchemaRoot the JVM holds:
         one made by arrow_to_java(), or one that Java code produced. The result
@@ -3838,8 +3939,22 @@ class GatunClient(_ValueEncoder):
         The Java table is left as it is. One that Java code created is that
         code's to release; call close() on the handle when you are done with it.
 
+        With copy=False the table is not copied out of shared memory: you get
+        an ArrowTableView whose table reads the bytes where Java wrote them.
+        That saves a pass over the data, and the view is good only until this
+        client's next Arrow transfer of any kind (or its close()); after that
+        it raises StaleArenaError. Use it to read a result
+        once, for example to aggregate it or to convert it with to_pandas(),
+        and keep copy=True for a table you hold on to. A pyarrow Table taken
+        from the view (view.table) is not checked: reading it after the next
+        transfer returns whatever was written over it.
+
         Args:
             table: JavaObject (or object ID) of a VectorSchemaRoot.
+            copy: False to read the table in place rather than copy it.
+
+        Returns:
+            A pyarrow Table, or an ArrowTableView with copy=False.
 
         Raises:
             PayloadTooLargeError: If the table does not fit in shared memory.
@@ -3851,6 +3966,9 @@ class GatunClient(_ValueEncoder):
             result = client.jvm.com.example.Reports.build()  # a VectorSchemaRoot
             table = client.arrow_from_java(result)
             result.close()
+
+            # Read once, in place
+            total = pc.sum(client.arrow_from_java(result, copy=False).column("x"))
         """
         object_id = table.object_id if isinstance(table, JavaObject) else table
         command = _finish_arrow_from_object(self._get_builder(), object_id)
@@ -3859,9 +3977,13 @@ class GatunClient(_ValueEncoder):
         except PayloadTooLargeError:
             # Java filled what room there was before finding it was not enough
             self._payload_generation += 1
+            self._payload_writes += 1
             raise
         self._note_payload_write(offset + length)
-        return _read_arrow_stream(self, (offset, length))
+        if copy:
+            return _read_arrow_stream(self, (offset, length))
+        borrowed = _read_arrow_stream(self, (offset, length), in_place=True)
+        return ArrowTableView(borrowed, self._arena_epoch, self, any_write=True)
 
     def cancel(self) -> bool:
         """Interrupt the request this client is running. Call it from another thread.

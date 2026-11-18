@@ -452,4 +452,7 @@ class TestArrowTablesAsJavaObjects:
         produced = root.slice(1, 2)
         result = client.arrow_from_java(produced)
         assert result.to_pydict() == {"x": [2, 3], "name": ["b", "c"]}
+
+        view = client.arrow_from_java(produced, copy=False)
+        assert view.to_pydict() == {"x": [2, 3], "name": ["b", "c"]}
         produced.close()

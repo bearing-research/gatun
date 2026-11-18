@@ -52,7 +52,8 @@ from gatun.client import (
     ProtocolDesyncError,
     ReentrancyError,
     SocketTimeoutError,
-    _arrow_ipc_stream,
+    _arrow_stream_size,
+    _arrow_table_to_send,
     _build_free_command,
     _close_shared_memory,
     _enter_callback,
@@ -69,6 +70,7 @@ from gatun.client import (
     _usable_timeout,
     _ValueEncoder,
     _write_arrow_stream,
+    _write_arrow_table,
 )
 from gatun.generated.org.gatun.protocol import Action as Act
 from gatun.generated.org.gatun.protocol import Command as Cmd
@@ -1247,12 +1249,14 @@ class AsyncGatunClient(_ValueEncoder):
             PayloadTooLargeError: If the table does not fit in shared memory.
             UnsupportedArrowTypeError: If a column is dictionary-encoded.
         """
-        stream = _arrow_ipc_stream(table)
-        command = _finish_arrow_to_object(flatbuffers.Builder(256), 0, stream.size)
+        table = _arrow_table_to_send(table)
+        size = _arrow_stream_size(table)
+        command = _finish_arrow_to_object(flatbuffers.Builder(256), 0, size)
+        # Written into the payload zone once this request holds the channel
         return cast(
             AsyncJavaObject,
             await self._send_raw(
-                command, prepare=lambda: _write_arrow_stream(self, stream, 0)
+                command, prepare=lambda: _write_arrow_table(self, table, 0, size)
             ),
         )
 
