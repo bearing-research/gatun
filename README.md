@@ -476,7 +476,7 @@ This distinction exists because Object arrays are kept as references on the Java
 
 ### Arrow Data Transfer
 
-Gatun supports multiple methods for transferring Arrow data between Python and Java:
+Gatun supports multiple methods for transferring Arrow data between Python and Java. To exchange tables with your own Java code, see [Arrow Tables as Java Objects](#arrow-tables-as-java-objects) below.
 
 ```python
 from gatun import connect
@@ -509,6 +509,38 @@ print(result_view.to_pydict())  # {'name': ['Alice', 'Bob'], 'age': [25, 30]}
 
 arena.close()
 ```
+
+#### Arrow Tables as Java Objects
+
+To hand a table to Java code, or to get one that Java code produced, use `arrow_to_java()` and `arrow_from_java()`. A sent table becomes an `org.apache.arrow.vector.VectorSchemaRoot` in the JVM, and you get an ordinary object handle to it:
+
+```python
+import pyarrow as pa
+
+table = pa.table({"x": [1, 2, 3], "name": ["a", "b", "c"]})
+
+# Python -> Java: the handle is a VectorSchemaRoot
+root = client.arrow_to_java(table)
+root.getRowCount()                 # 3
+root.getVector("x").get(2)         # 3
+
+# Pass it to any Java method that takes a VectorSchemaRoot
+# client.jvm.com.example.Stats.summarize(root)
+
+# Java -> Python: works for any VectorSchemaRoot the JVM holds,
+# including ones Java code created
+produced = root.slice(1, 2)        # a new table, made on the Java side
+result = client.arrow_from_java(produced)
+result.to_pydict()                 # {'x': [2, 3], 'name': ['b', 'c']}
+produced.close()                   # Java-made tables are yours to close
+```
+
+- A table made by `arrow_to_java()` owns its memory in the JVM and is released when its handle is garbage collected or the connection closes. Java code that keeps it for longer must copy it. Handles from the async client are not garbage collected: free them with `async with await client.arrow_to_java(table) as root:` or `await client.free_object(root.object_id)`.
+- `arrow_from_java()` returns a `pyarrow.Table` that owns its data, so it stays valid after later transfers and after `close()`.
+- Each transfer must fit in the shared memory payload zone (`PayloadTooLargeError` otherwise). Connect with more memory, or move a large table in pieces with `table.slice()` / `root.slice(start, length)`.
+- Dictionary-encoded columns are not supported; decode them first.
+
+The other methods on this page do not give Java code access to the data: `send_arrow_table()` reads and counts a table, and `send_arrow_buffers()` / `get_arrow_data()` hold one batch that can only be read back.
 
 #### Size Validation
 

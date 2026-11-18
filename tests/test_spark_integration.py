@@ -22,6 +22,98 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Arrow and JDK classes the Arrow tests construct or call statically to move
+# record batches between an Arrow table and the serialized form Spark exchanges
+ARROW_PLUMBING_CLASSES = [
+    "java.io.ByteArrayInputStream",
+    "java.io.ByteArrayOutputStream",
+    "java.nio.channels.Channels",
+    "org.apache.arrow.vector.VectorLoader",
+    "org.apache.arrow.vector.VectorSchemaRoot",
+    "org.apache.arrow.vector.VectorUnloader",
+    "org.apache.arrow.vector.ipc.ReadChannel",
+    "org.apache.arrow.vector.ipc.WriteChannel",
+    "org.apache.arrow.vector.ipc.message.MessageSerializer",
+]
+
+
+def _object_ref(client, obj, method, *args):
+    """Call a method and keep the result in the JVM instead of converting it.
+
+    Serialized Arrow batches are byte arrays, which would otherwise be copied to
+    Python through the 64KB response zone.
+    """
+    return client.invoke_methods(obj, [(method, args)], return_object_refs=[True])[0]
+
+
+def dataframe_from_arrow(client, spark, table):
+    """Make a Spark DataFrame out of a pyarrow table.
+
+    The table goes to the JVM as an Arrow table (arrow_to_java) and is handed to
+    Spark the way Spark takes Arrow data: as serialized record batches.
+    """
+    jvm = client.jvm
+    root = client.arrow_to_java(table)
+
+    record_batch = jvm.org.apache.arrow.vector.VectorUnloader(root).getRecordBatch()
+    serialized = jvm.java.io.ByteArrayOutputStream()
+    channel = jvm.org.apache.arrow.vector.ipc.WriteChannel(
+        jvm.java.nio.channels.Channels.newChannel(serialized)
+    )
+    jvm.org.apache.arrow.vector.ipc.message.MessageSerializer.serialize(
+        channel, record_batch
+    )
+    record_batch.close()
+
+    batches = jvm.java.util.ArrayList()
+    batches.add(_object_ref(client, serialized, "toByteArray"))
+    schema = jvm.org.apache.spark.sql.util.ArrowUtils.fromArrowSchema(root.getSchema())
+    return jvm.org.apache.spark.sql.execution.arrow.ArrowConverters.toDataFrame(
+        jvm.scala.jdk.javaapi.CollectionConverters.asScala(batches.iterator()),
+        schema.json(),
+        spark,
+    )
+
+
+def arrow_from_dataframe(client, df):
+    """Collect a Spark DataFrame as a pyarrow table.
+
+    Spark converts the result to Arrow record batches itself (the conversion
+    behind toPandas); each one is loaded into an Arrow table in the JVM and
+    fetched with arrow_from_java.
+    """
+    import pyarrow as pa
+
+    jvm = client.jvm
+    arrow_utils = jvm.org.apache.spark.sql.util.ArrowUtils
+    arrow_schema = arrow_utils.toArrowSchema(df.schema(), "UTC", True, False)
+    allocator = arrow_utils.rootAllocator()
+    root = jvm.org.apache.arrow.vector.VectorSchemaRoot.create(arrow_schema, allocator)
+    loader = jvm.org.apache.arrow.vector.VectorLoader(root)
+
+    serialized = _object_ref(client, df.toArrowBatchRdd().toJavaRDD(), "collect")
+    tables = []
+    try:
+        for i in range(serialized.size()):
+            source = jvm.java.io.ByteArrayInputStream(
+                _object_ref(client, serialized, "get", i)
+            )
+            channel = jvm.org.apache.arrow.vector.ipc.ReadChannel(
+                jvm.java.nio.channels.Channels.newChannel(source)
+            )
+            record_batch = jvm.org.apache.arrow.vector.ipc.message.MessageSerializer.deserializeRecordBatch(
+                channel, allocator
+            )
+            loader.load(record_batch)
+            record_batch.close()
+            tables.append(client.arrow_from_java(root))
+        if not tables:
+            tables.append(client.arrow_from_java(root))
+    finally:
+        root.close()
+    return pa.concat_tables(tables)
+
+
 def get_spark_jars() -> list[str]:
     """Get all JAR files from Spark's jars directory."""
     jars_dir = SPARK_HOME / "jars"
@@ -32,7 +124,9 @@ def get_spark_jars() -> list[str]:
 def spark_client():
     """Create a Gatun client with Spark JARs on classpath."""
     spark_jars = get_spark_jars()
-    client = connect(memory="512MB", classpath=spark_jars)
+    client = connect(
+        memory="512MB", classpath=spark_jars, allowed_classes=ARROW_PLUMBING_CLASSES
+    )
     yield client
     client.close()
 
@@ -688,20 +782,38 @@ class TestLargeDataFrameArrowTransfer:
         assert result_table.column("category")[0].as_py() == 0
         assert result_table.column("count")[0].as_py() == 500
 
-    def test_arrow_roundtrip_with_spark_processing(self, spark_session, spark_client):
-        """Test Arrow data round-trip with Spark-like processing.
-
-        This test demonstrates:
-        1. Creating Arrow data in Python
-        2. Sending to Java via zero-copy transfer
-        3. Getting it back as Arrow via get_arrow_data()
-        4. Verifying data integrity
-        """
+    def test_spark_reads_a_table_sent_from_python(self, spark_session, spark_client):
+        """Spark's own Arrow column reader reads the vectors of a sent table."""
         import pyarrow as pa
 
-        # 1. Create source data in Python
+        jvm = spark_client.jvm
+        size = 1000
+        table = pa.table(
+            {
+                "id": pa.array(range(size), type=pa.int64()),
+                "name": [f"name-{i}" for i in range(size)],
+                "value": pa.array(
+                    [None if i % 10 == 0 else i * 1.5 for i in range(size)]
+                ),
+            }
+        )
+
+        root = spark_client.arrow_to_java(table)
+        ArrowColumnVector = jvm.org.apache.spark.sql.vectorized.ArrowColumnVector
+        ids, names, values = (ArrowColumnVector(root.getVector(i)) for i in range(3))
+
+        assert ids.getLong(size - 1) == size - 1
+        assert names.getUTF8String(5).toString() == "name-5"
+        assert values.getDouble(3) == 4.5
+        assert values.isNullAt(10) is True
+        assert values.numNulls() == size // 10
+
+    def test_python_table_becomes_a_spark_dataframe(self, spark_session, spark_client):
+        """A pyarrow table is queried by Spark SQL."""
+        import pyarrow as pa
+
         size = 10_000
-        source_table = pa.table(
+        table = pa.table(
             {
                 "id": pa.array(range(size), type=pa.int64()),
                 "category": pa.array([i % 20 for i in range(size)], type=pa.int64()),
@@ -711,36 +823,84 @@ class TestLargeDataFrameArrowTransfer:
             }
         )
 
-        # 2. Send to Java via zero-copy
-        arena = spark_client.get_payload_arena()
-        schema_cache = {}
+        df = dataframe_from_arrow(spark_client, spark_session, table)
 
-        response = spark_client.send_arrow_buffers(source_table, arena, schema_cache)
-        assert f"Received {size} rows" in str(response)
+        assert df.count() == size
+        assert (
+            df.schema().simpleString()
+            == "struct<id:bigint,category:bigint,value:double>"
+        )
+        df.createOrReplaceTempView("arrow_from_python")
+        row = spark_session.sql(
+            "SELECT count(DISTINCT category) AS categories, max(id) AS top, sum(value) AS total "
+            "FROM arrow_from_python"
+        ).first()
+        assert row.getLong(0) == 20
+        assert row.getLong(1) == size - 1
+        assert row.getDouble(2) == sum(float(i) * 1.5 for i in range(size))
 
-        # 3. Get data back from Java
-        result_view = spark_client.get_arrow_data()
+    def test_spark_query_result_comes_back_as_arrow(self, spark_session, spark_client):
+        """A table Spark produced, which Python never sent, arrives as pyarrow."""
+        df = spark_session.range(0, 5000).selectExpr(
+            "id",
+            "id * 2 AS doubled",
+            "concat('row-', cast(id AS string)) AS label",
+            "CASE WHEN id % 7 = 0 THEN NULL ELSE id / 4.0 END AS quarter",
+        )
 
-        # 4. Verify the returned data
-        assert result_view.num_rows == size
-        assert result_view.num_columns == 3
+        result = arrow_from_dataframe(spark_client, df).sort_by("id")
 
-        # Convert to Python dict for verification
-        result_dict = result_view.to_pydict()
+        assert result.num_rows == 5000
+        assert result.column_names == ["id", "doubled", "label", "quarter"]
+        assert result.column("doubled").to_pylist() == [i * 2 for i in range(5000)]
+        assert result.column("label")[4999].as_py() == "row-4999"
+        assert result.column("quarter").null_count == len(range(0, 5000, 7))
+        assert result.column("quarter")[6].as_py() == 1.5
 
-        # Verify columns exist
-        assert "id" in result_dict
-        assert "category" in result_dict
-        assert "value" in result_dict
+    def test_arrow_roundtrip_with_spark_processing(self, spark_session, spark_client):
+        """Python table -> Spark DataFrame -> Spark SQL -> Python table.
 
-        # Verify data values
-        assert result_dict["id"][0] == 0
-        assert result_dict["id"][size - 1] == size - 1
-        assert result_dict["category"][0] == 0
-        assert result_dict["category"][20] == 0  # 20 % 20 = 0
-        assert abs(result_dict["value"][100] - 150.0) < 0.0001  # 100 * 1.5
+        Every value that comes back was computed by Spark from the data Python
+        sent; nothing is read back from where it was written.
+        """
+        import pyarrow as pa
 
-        arena.close()
+        size = 10_000
+        source = pa.table(
+            {
+                "id": pa.array(range(size), type=pa.int64()),
+                "category": pa.array([i % 20 for i in range(size)], type=pa.int64()),
+                "value": pa.array(
+                    [float(i) * 1.5 for i in range(size)], type=pa.float64()
+                ),
+            }
+        )
+
+        df = dataframe_from_arrow(spark_client, spark_session, source)
+        summary = (
+            df.where("id % 2 = 0")
+            .selectExpr("category", "value", "value * 2 AS doubled")
+            .groupBy("category")
+            .agg({"value": "sum", "doubled": "max", "category": "count"})
+        )
+        result = arrow_from_dataframe(spark_client, summary).sort_by("category")
+
+        even = [i for i in range(size) if i % 2 == 0]
+        expected_categories = sorted({i % 20 for i in even})
+        assert result.column("category").to_pylist() == expected_categories
+        assert result.num_rows == 10  # even ids only reach the even categories
+        by_name = {
+            name: result.column(name).to_pylist() for name in result.column_names
+        }
+        assert by_name["count(category)"] == [
+            sum(1 for i in even if i % 20 == c) for c in expected_categories
+        ]
+        assert by_name["sum(value)"] == [
+            sum(i * 1.5 for i in even if i % 20 == c) for c in expected_categories
+        ]
+        assert by_name["max(doubled)"] == [
+            max(i * 3.0 for i in even if i % 20 == c) for c in expected_categories
+        ]
 
     def test_large_join_and_collect(self, spark_session, spark_client):
         """Test joining large DataFrames and collecting results.

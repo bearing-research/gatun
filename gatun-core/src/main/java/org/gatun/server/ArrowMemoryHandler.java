@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -19,7 +21,9 @@ import org.apache.arrow.vector.TypeLayout;
 import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.vector.dictionary.DictionaryProvider;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.ipc.ReadChannel;
 import org.apache.arrow.vector.ipc.WriteChannel;
 import org.apache.arrow.vector.ipc.message.ArrowFieldNode;
@@ -28,6 +32,7 @@ import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.VectorSchemaRootAppender;
 import org.gatun.PayloadTooLargeException;
 import org.gatun.protocol.ArrowBatchDescriptor;
 import org.gatun.protocol.BufferDescriptor;
@@ -125,6 +130,160 @@ public class ArrowMemoryHandler implements AutoCloseable {
       }
     }
     return totalBytes;
+  }
+
+  /**
+   * Where the free part of the payload zone starts: just past the batch loaded by {@link
+   * #processArrowBuffers}, or 0 when none is loaded. Anything written before this offset would
+   * overwrite data that batch still points at.
+   */
+  public long getLoadedEnd() {
+    return (loadedEnd + ALIGNMENT - 1) & ~((long) ALIGNMENT - 1);
+  }
+
+  /**
+   * Read an Arrow IPC stream into a table that owns its memory. The result does not point into
+   * shared memory, so it can be handed to any Java code and outlives the payload zone's contents.
+   * The caller closes it.
+   *
+   * @param stream exactly the bytes of the stream
+   */
+  public VectorSchemaRoot readIpcTable(MemorySegment stream) throws IOException {
+    try (ArrowStreamReader reader =
+        new ArrowStreamReader(new SegmentReadChannel(stream), allocator)) {
+      VectorSchemaRoot source = reader.getVectorSchemaRoot();
+      Schema schema = source.getSchema();
+      for (Field field : schema.getFields()) {
+        requireNoDictionary(field);
+      }
+
+      VectorSchemaRoot table = VectorSchemaRoot.create(schema, allocator);
+      try {
+        boolean first = true;
+        while (reader.loadNextBatch()) {
+          if (first) {
+            // Share the reader's buffers instead of copying them; they are reference counted,
+            // so they stay alive in the table after the reader lets go of them.
+            try (ArrowRecordBatch batch = new VectorUnloader(source).getRecordBatch()) {
+              new VectorLoader(table).load(batch);
+            }
+            first = false;
+          } else {
+            VectorSchemaRootAppender.append(false, table, source);
+          }
+        }
+        if (first) {
+          // A stream with a schema and no batches is an empty table. Its vectors are left
+          // unallocated: allocating would reserve a default-sized block for every column.
+          table.setRowCount(0);
+        }
+        return table;
+      } catch (Throwable t) {
+        table.close();
+        throw t;
+      }
+    }
+  }
+
+  private static void requireNoDictionary(Field field) {
+    if (field.getDictionary() != null) {
+      throw new IllegalArgumentException(
+          "Dictionary-encoded column '"
+              + field.getName()
+              + "' cannot be turned into a Java table; decode it before sending");
+    }
+    for (Field child : field.getChildren()) {
+      requireNoDictionary(child);
+    }
+  }
+
+  /**
+   * Write a table as an Arrow IPC stream at the start of {@code dest}.
+   *
+   * @return the length of the stream
+   * @throws PayloadTooLargeException if the stream does not fit; {@code dest} then holds a
+   *     truncated stream
+   */
+  public long writeIpcTable(VectorSchemaRoot table, MemorySegment dest) throws IOException {
+    SegmentChannel channel = new SegmentChannel(dest);
+    // An empty provider turns a dictionary-encoded column into a clear error rather than an NPE
+    try (ArrowStreamWriter writer =
+        new ArrowStreamWriter(table, new DictionaryProvider.MapDictionaryProvider(), channel)) {
+      writer.start();
+      writer.writeBatch();
+      writer.end();
+    }
+    if (channel.written > dest.byteSize()) {
+      throw new PayloadTooLargeException("Arrow data to return", channel.written, dest.byteSize());
+    }
+    return channel.written;
+  }
+
+  /**
+   * Reads from a memory segment straight into the reader's buffers. Going through an InputStream
+   * instead would copy every byte twice, a few kilobytes at a time.
+   */
+  private static final class SegmentReadChannel implements ReadableByteChannel {
+    private final MemorySegment source;
+    private long position = 0;
+
+    SegmentReadChannel(MemorySegment source) {
+      this.source = source;
+    }
+
+    @Override
+    public int read(ByteBuffer dst) {
+      long remaining = source.byteSize() - position;
+      if (remaining <= 0) {
+        return -1;
+      }
+      int count = (int) Math.min(dst.remaining(), remaining);
+      MemorySegment.copy(source, position, MemorySegment.ofBuffer(dst), 0, count);
+      dst.position(dst.position() + count);
+      position += count;
+      return count;
+    }
+
+    @Override
+    public boolean isOpen() {
+      return true;
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  /**
+   * Writes into a memory segment. Bytes past the end are counted but dropped, so a stream that does
+   * not fit can be reported with the size it needed.
+   */
+  private static final class SegmentChannel implements WritableByteChannel {
+    private final MemorySegment dest;
+    private long written = 0;
+
+    SegmentChannel(MemorySegment dest) {
+      this.dest = dest;
+    }
+
+    @Override
+    public int write(ByteBuffer src) {
+      int count = src.remaining();
+      long room = dest.byteSize() - written;
+      if (room >= count) {
+        MemorySegment.copy(MemorySegment.ofBuffer(src), 0, dest, written, count);
+      }
+      src.position(src.limit());
+      written += count;
+      return count;
+    }
+
+    @Override
+    public boolean isOpen() {
+      return true;
+    }
+
+    @Override
+    public void close() {}
   }
 
   /** What a transfer from Python delivered: rows received and payload bytes they occupy. */

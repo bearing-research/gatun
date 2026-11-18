@@ -408,3 +408,21 @@ class TestAllowingYourOwnClasses:
             assert counter.incrementAndGet() == 42
         finally:
             client.close()
+
+
+class TestArrowTablesAsJavaObjects:
+    """Test the 'Arrow Tables as Java Objects' example."""
+
+    def test_to_java_and_back(self, client):
+        import pyarrow as pa
+
+        table = pa.table({"x": [1, 2, 3], "name": ["a", "b", "c"]})
+
+        root = client.arrow_to_java(table)
+        assert root.getRowCount() == 3
+        assert root.getVector("x").get(2) == 3
+
+        produced = root.slice(1, 2)
+        result = client.arrow_from_java(produced)
+        assert result.to_pydict() == {"x": [2, 3], "name": ["b", "c"]}
+        produced.close()

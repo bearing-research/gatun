@@ -69,6 +69,23 @@ public class GatunServer {
     }
   }
 
+  // --- ARROW TABLES MADE FOR CLIENTS ---
+  // Tables created by ArrowToObject hold off-heap memory that no garbage collector reclaims, so
+  // the server closes each one when its last registry entry goes away. Tables that Java code
+  // produced itself are not in here: whoever made them closes them.
+  private final Map<Object, OwnedTable> ownedTables = new java.util.IdentityHashMap<>();
+
+  private static final class OwnedTable {
+    int references = 0; // registry entries pointing at the table; guarded by ownedTables
+    final long bytes;
+    final SessionQuota quota;
+
+    OwnedTable(long bytes, SessionQuota quota) {
+      this.bytes = bytes;
+      this.quota = quota;
+    }
+  }
+
   // --- THE OBJECT REGISTRY ---
   private final Map<Long, Object> objectRegistry = new ConcurrentHashMap<>();
   private final AtomicLong objectIdCounter = new AtomicLong(1);
@@ -658,6 +675,84 @@ public class GatunServer {
             observer.onArrowTransfer(
                 "java_to_python", writeResult.numRows, writeResult.totalBytesWritten, false);
           }
+          // --- ARROW TABLE AS A JAVA OBJECT (Python -> Java) ---
+          else if (cmd.action() == Action.ArrowToObject) {
+            BufferDescriptor stream = cmd.arrowStream();
+            if (stream == null) {
+              throw new IllegalArgumentException("ArrowToObject requires arrow_stream");
+            }
+            long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
+            long offset = stream.offset();
+            long length = stream.length();
+            // The values are unsigned on the wire; negative here means larger than any zone
+            if (offset < 0
+                || length <= 0
+                || offset > payloadSize
+                || length > payloadSize - offset) {
+              throw new IllegalArgumentException(
+                  String.format(
+                      "Arrow stream is outside the payload zone: offset=%s length=%s, zone is %d"
+                          + " bytes",
+                      Long.toUnsignedString(offset), Long.toUnsignedString(length), payloadSize));
+            }
+            if (offset < arrowHandler.getLoadedEnd()) {
+              throw new IllegalStateException(
+                  String.format(
+                      "Arrow stream at offset %d overlaps the batch loaded by send_arrow_buffers,"
+                          + " which ends at offset %d. Reset the payload arena first.",
+                      offset, arrowHandler.getLoadedEnd()));
+            }
+
+            // Refuse before reading; both are taken only once the table exists
+            quota.checkObjectLimit();
+            quota.holdArrowBytes(length);
+            VectorSchemaRoot table;
+            try {
+              table = arrowHandler.readIpcTable(sharedMem.asSlice(PAYLOAD_OFFSET + offset, length));
+            } catch (Throwable t) {
+              quota.releaseHeldArrowBytes(length);
+              throw t;
+            }
+            try {
+              quota.allocateObject();
+            } catch (RuntimeException e) {
+              // A callback on another thread took the last slot since the check above
+              quota.releaseHeldArrowBytes(length);
+              table.close();
+              throw e;
+            }
+            synchronized (ownedTables) {
+              ownedTables.put(table, new OwnedTable(length, quota));
+            }
+            long newId = objectIdCounter.getAndIncrement();
+            putObject(newId, table);
+            sessionObjectIds.add(newId);
+            observer.onArrowTransfer("python_to_java", table.getRowCount(), length, false);
+            result = new ObjectRefT(newId);
+          }
+          // --- ARROW TABLE HELD BY A JAVA OBJECT (Java -> Python) ---
+          else if (cmd.action() == Action.ArrowFromObject) {
+            long targetId = cmd.targetId();
+            Object target = objectRegistry.get(targetId);
+            if (target == null) throw new RuntimeException("Object " + targetId + " not found");
+            if (!(target instanceof VectorSchemaRoot table)) {
+              throw new IllegalArgumentException(
+                  "Object "
+                      + targetId
+                      + " is a "
+                      + target.getClass().getName()
+                      + ", not an org.apache.arrow.vector.VectorSchemaRoot");
+            }
+            // Everything past the batch loaded by send_arrow_buffers (if any) is free to use
+            long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
+            long start = Math.min(arrowHandler.getLoadedEnd(), payloadSize);
+            long length =
+                arrowHandler.writeIpcTable(
+                    table, sharedMem.asSlice(PAYLOAD_OFFSET + start, payloadSize - start));
+            observer.onArrowTransfer("java_to_python", table.getRowCount(), length, false);
+            responseOffset = packArrowStreamResponse(builder, start, length);
+            responsePacked = true;
+          }
           // --- CALLBACK BLOCK ---
           else if (cmd.action() == Action.RegisterCallback) {
             // Register a Python callback and create a Java proxy
@@ -1218,13 +1313,42 @@ public class GatunServer {
   /** Add an object to the registry. All registrations go through here so they are observed. */
   private void putObject(long objectId, Object obj) {
     objectRegistry.put(objectId, obj);
+    synchronized (ownedTables) {
+      OwnedTable owned = ownedTables.get(obj);
+      if (owned != null) {
+        owned.references++;
+      }
+    }
     observeRegistry(objectId, "add", obj.getClass().getName(), 1);
   }
 
   /** Remove an object from the registry; unknown IDs are ignored. */
   private void removeObject(long objectId) {
-    if (objectRegistry.remove(objectId) != null) {
+    Object removed = objectRegistry.remove(objectId);
+    if (removed != null) {
       observeRegistry(objectId, "remove", null, -1);
+      releaseOwnedTable(removed);
+    }
+  }
+
+  /**
+   * Close a table made by ArrowToObject once its last registry entry is gone. The same table can be
+   * registered under several IDs, for example after a Java method returned it again.
+   */
+  private void releaseOwnedTable(Object obj) {
+    OwnedTable owned;
+    synchronized (ownedTables) {
+      owned = ownedTables.get(obj);
+      if (owned == null || --owned.references > 0) {
+        return;
+      }
+      ownedTables.remove(obj);
+    }
+    owned.quota.releaseHeldArrowBytes(owned.bytes);
+    try {
+      ((VectorSchemaRoot) obj).close();
+    } catch (RuntimeException e) {
+      LOG.log(Level.WARNING, "Failed to close an Arrow table", e);
     }
   }
 
@@ -2384,6 +2508,15 @@ public class GatunServer {
   }
 
   /** Pack an Arrow write result into a response with ArrowBatchDescriptor. */
+  /** A response that says where in the payload zone an Arrow IPC stream was written. */
+  private int packArrowStreamResponse(FlatBufferBuilder builder, long offset, long length) {
+    int stream = BufferDescriptor.createBufferDescriptor(builder, offset, length);
+    Response.startResponse(builder);
+    Response.addIsError(builder, false);
+    Response.addArrowStream(builder, stream);
+    return Response.endResponse(builder);
+  }
+
   private int packArrowResponse(
       FlatBufferBuilder builder, ArrowMemoryHandler.ArrowWriteResult result) {
     // Build schema bytes vector if present

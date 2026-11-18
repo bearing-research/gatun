@@ -233,6 +233,8 @@ public class Metrics {
       case Action.CreateObjects -> "CreateObjects";
       case Action.Batch -> "Batch";
       case Action.GetMetrics -> "GetMetrics";
+      case Action.ArrowToObject -> "ArrowToObject";
+      case Action.ArrowFromObject -> "ArrowFromObject";
       default -> "Unknown(" + action + ")";
     };
   }

@@ -473,8 +473,10 @@ class StaleArenaError(RuntimeError):
     The underlying shared memory buffers may have been overwritten or unmapped.
     """
 
-    def __init__(self, table_epoch: int, current_epoch: int):
-        if current_epoch == -1:
+    def __init__(self, table_epoch: int, current_epoch: int, reason: str | None = None):
+        if reason is not None:
+            msg = f"Arrow table from epoch {table_epoch} is invalid: {reason}"
+        elif current_epoch == -1:
             # Client was closed - shm is unmapped
             msg = (
                 f"Arrow table from epoch {table_epoch} is invalid: client was closed. "
@@ -506,6 +508,7 @@ class ArrowTableView:
         self._table = table
         self._epoch = epoch
         self._client = client
+        self._payload_generation = client._payload_generation
 
     def _check_epoch(self):
         """Raise StaleArenaError if epoch changed or client closed."""
@@ -518,6 +521,13 @@ class ArrowTableView:
         current = self._client._arena_epoch
         if self._epoch != current:
             raise StaleArenaError(self._epoch, current)
+        if self._payload_generation != self._client._payload_generation:
+            raise StaleArenaError(
+                self._epoch,
+                current,
+                reason="a later Arrow transfer reused the shared memory it "
+                "pointed at. Copy the data out first.",
+            )
 
     @property
     def table(self) -> pa.Table:
@@ -1326,6 +1336,93 @@ def _unpack_array_impl(array_val, client: Any, ref_class: Any):
         return result
 
 
+def _arrow_ipc_stream(table: pa.Table | pa.RecordBatch) -> pa.Buffer:
+    """Serialize a table as an Arrow IPC stream for arrow_to_java()."""
+    from gatun.arena import UnsupportedArrowTypeError, _check_type_recursive
+
+    if isinstance(table, pa.RecordBatch):
+        table = pa.Table.from_batches([table])
+    elif not isinstance(table, pa.Table):
+        raise TypeError(
+            f"Expected a pyarrow Table or RecordBatch, got {type(table).__name__}"
+        )
+
+    dictionary_columns: list[str] = []
+    _check_type_recursive(table.schema, dictionary_columns)
+    if dictionary_columns:
+        raise UnsupportedArrowTypeError(
+            "Dictionary-encoded columns cannot be turned into a Java table: "
+            f"{', '.join(dictionary_columns)}. Decode them first, for example with "
+            "pyarrow.compute.dictionary_decode()."
+        )
+
+    # One chunk per column, so the table arrives as a single record batch and
+    # Java can keep its buffers as they are instead of stitching batches together.
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table.combine_chunks())
+    return sink.getvalue()
+
+
+def _write_arrow_stream(
+    client: Any, stream: pa.Buffer, offset: int, zone: str = "Arrow table"
+) -> None:
+    """Copy an IPC stream into the payload zone at the given offset.
+
+    Raises PayloadTooLargeError when it does not fit between there and the
+    response zone.
+    """
+    assert client.shm is not None, "Not connected"
+    available = client.response_offset - client.payload_offset - offset
+    if stream.size > available:
+        raise PayloadTooLargeError(stream.size, max(available, 0), zone)
+    payload_base = ctypes.addressof(ctypes.c_char.from_buffer(client.shm))
+    ctypes.memmove(
+        payload_base + client.payload_offset + offset, stream.address, stream.size
+    )
+
+
+def _finish_arrow_to_object(builder: Any, offset: int, length: int) -> Any:
+    """Build the ArrowToObject command for a stream already in the payload zone."""
+    BufferDescriptor.Start(builder)
+    BufferDescriptor.AddOffset(builder, offset)
+    BufferDescriptor.AddLength(builder, length)
+    stream = BufferDescriptor.End(builder)
+
+    Cmd.CommandStart(builder)
+    Cmd.CommandAddAction(builder, Act.Action.ArrowToObject)
+    Cmd.CommandAddArrowStream(builder, stream)
+    builder.Finish(Cmd.CommandEnd(builder))
+    return builder.Output()
+
+
+def _finish_arrow_from_object(builder: Any, object_id: int) -> Any:
+    """Build the ArrowFromObject command."""
+    Cmd.CommandStart(builder)
+    Cmd.CommandAddAction(builder, Act.Action.ArrowFromObject)
+    Cmd.CommandAddTargetId(builder, object_id)
+    builder.Finish(Cmd.CommandEnd(builder))
+    return builder.Output()
+
+
+def _read_arrow_stream(client: Any, location: tuple[int, int]) -> pa.Table:
+    """Read the IPC stream the server wrote into the payload zone.
+
+    The bytes are copied out of shared memory first, so the table owns its data
+    and stays valid whatever happens to the zone or the connection afterwards.
+    """
+    offset, length = location
+    assert client.shm is not None, "Not connected"
+    start = client.payload_offset + offset
+    if offset < 0 or length < 0 or start + length > client.response_offset:
+        raise ProtocolDesyncError(
+            f"Arrow stream at offset {offset} with length {length} is outside "
+            "the payload zone"
+        )
+    data = client.shm[start : start + length]
+    return pa.ipc.open_stream(data).read_all()
+
+
 def _close_shared_memory(client: Any) -> None:
     """Release a client's mapping of the shared memory file, best effort.
 
@@ -1815,6 +1912,14 @@ class GatunClient(_ValueEncoder):
         # Arena epoch for lifetime safety - tracks current valid epoch
         self._arena_epoch: int = 0
 
+        # Where the batch Java loaded in place (send_arrow_buffers) ends in the
+        # payload zone; anything written before this would corrupt it
+        self._arrow_loaded_end: int = 0
+
+        # Bumped whenever something is written into the part of the payload
+        # zone that ArrowTableViews point at; see _note_payload_write
+        self._payload_generation: int = 0
+
         # FlatBuffers builder pool - reuse builders to reduce allocation overhead
         # Small builder for simple commands (256 bytes initial)
         self._builder_small = flatbuffers.Builder(256)
@@ -2224,7 +2329,11 @@ class GatunClient(_ValueEncoder):
                 )
                 self._raise_java_exception(error_type, error_msg)
 
-            # 4. Check for Arrow batch response
+            # 4. Check for Arrow responses
+            arrow_stream = resp.ArrowStream()
+            if arrow_stream is not None:
+                return arrow_stream.Offset(), arrow_stream.Length()
+
             arrow_batch = resp.ArrowBatch()
             if arrow_batch is not None and arrow_batch.NumRows() >= 0:
                 return self._unpack_arrow_batch(arrow_batch)
@@ -3099,8 +3208,6 @@ class GatunClient(_ValueEncoder):
         Note: Arrow IPC serialization still occurs (table → IPC format).
         For true zero-copy, use send_arrow_buffers() instead.
         """
-        max_payload_size = self.response_offset - self.payload_offset
-
         # Serialize to an in-memory buffer first
         # Arrow's IPC serialization is already optimized and this is fast
         sink = pa.BufferOutputStream()
@@ -3108,16 +3215,10 @@ class GatunClient(_ValueEncoder):
             writer.write_table(table)
 
         ipc_buffer = sink.getvalue()
-        bytes_written = ipc_buffer.size
-
-        if bytes_written > max_payload_size:
-            raise PayloadTooLargeError(bytes_written, max_payload_size, "Arrow batch")
 
         # Copy IPC data to shared memory payload zone using single memmove
-        assert self.shm is not None, "Not connected"
-        payload_base = ctypes.addressof(ctypes.c_char.from_buffer(self.shm))
-        payload_addr = payload_base + self.payload_offset
-        ctypes.memmove(payload_addr, ipc_buffer.address, bytes_written)
+        _write_arrow_stream(self, ipc_buffer, 0, "Arrow batch")
+        self._note_payload_write(ipc_buffer.size)
 
         # Build Command
         builder = self._get_builder()
@@ -3250,6 +3351,10 @@ class GatunClient(_ValueEncoder):
 
         # 1. Copy table buffers into the arena
         buffer_infos, field_nodes = copy_arrow_table_to_arena(table, arena)
+        loaded_end = max(
+            (info.offset + info.length for info in buffer_infos), default=0
+        )
+        self._note_payload_write(loaded_end)
 
         # 2. Compute schema hash and check cache
         schema_hash = compute_schema_hash(table.schema)
@@ -3319,6 +3424,7 @@ class GatunClient(_ValueEncoder):
         # the cache claiming it does, or every later send would omit it.
         if include_schema and schema_cache is not None:
             schema_cache[schema_hash] = True
+        self._arrow_loaded_end = loaded_end
         return response
 
     def reset_payload_arena(self):
@@ -3341,7 +3447,20 @@ class GatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        return self._send_raw(builder.Output())
+        response = self._send_raw(builder.Output())
+        # Only once Java has let go of the batch is its memory free to reuse
+        self._arrow_loaded_end = 0
+        return response
+
+    def _note_payload_write(self, end: int) -> None:
+        """Record that the payload zone was overwritten up to offset `end`.
+
+        Tables from get_arrow_data() point into the second half of the zone. A
+        write that reaches it invalidates them, so that they raise
+        StaleArenaError instead of returning whatever was written over them.
+        """
+        if end > (self.response_offset - self.payload_offset) // 2:
+            self._payload_generation += 1
 
     def get_arrow_data(self) -> ArrowTableView:
         """Retrieve Arrow data from Java via zero-copy transfer.
@@ -3387,7 +3506,82 @@ class GatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        return cast(ArrowTableView, self._send_raw(builder.Output()))
+        view = cast(ArrowTableView, self._send_raw(builder.Output()))
+        # Java wrote over the region earlier views point at; only this one is current
+        self._payload_generation += 1
+        view._payload_generation = self._payload_generation
+        return view
+
+    def arrow_to_java(self, table: pa.Table | pa.RecordBatch) -> JavaObject:
+        """Copy an Arrow table into the JVM and return a handle to it.
+
+        The handle refers to an org.apache.arrow.vector.VectorSchemaRoot that owns
+        its memory. Pass it to any Java method that takes one, call its methods,
+        or get a table back with arrow_from_java(). Java releases the table's
+        memory when the handle is garbage collected (or the connection closes),
+        so Java code that needs the data for longer must copy it.
+
+        The table is sent in one piece and must fit in the payload zone; connect
+        with more memory, or send it in slices, if it does not.
+
+        Args:
+            table: A pyarrow Table or RecordBatch.
+
+        Returns:
+            JavaObject wrapping the VectorSchemaRoot.
+
+        Raises:
+            PayloadTooLargeError: If the table does not fit in shared memory.
+            UnsupportedArrowTypeError: If a column is dictionary-encoded.
+
+        Example:
+            root = client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
+            root.getRowCount()                      # 3
+            client.jvm.com.example.Stats.sum(root)  # your own Java code
+        """
+        stream = _arrow_ipc_stream(table)
+        # Stay clear of a batch Java is still reading in place
+        offset = (self._arrow_loaded_end + 63) & ~63
+        _write_arrow_stream(self, stream, offset)
+        self._note_payload_write(offset + stream.size)
+
+        command = _finish_arrow_to_object(self._get_builder(), offset, stream.size)
+        return cast(JavaObject, self._send_raw(command))
+
+    def arrow_from_java(self, table: JavaObject | int) -> pa.Table:
+        """Copy an Arrow table held by a Java object into Python.
+
+        Works for any org.apache.arrow.vector.VectorSchemaRoot the JVM holds:
+        one made by arrow_to_java(), or one that Java code produced. The result
+        is an ordinary pyarrow Table that owns its data.
+
+        The Java table is left as it is. One that Java code created is that
+        code's to release; call close() on the handle when you are done with it.
+
+        Args:
+            table: JavaObject (or object ID) of a VectorSchemaRoot.
+
+        Raises:
+            PayloadTooLargeError: If the table does not fit in shared memory.
+                Connect with more memory, or fetch root.slice(start, length)
+                pieces.
+            JavaIllegalArgumentException: If the object is not a VectorSchemaRoot.
+
+        Example:
+            result = client.jvm.com.example.Reports.build()  # a VectorSchemaRoot
+            table = client.arrow_from_java(result)
+            result.close()
+        """
+        object_id = table.object_id if isinstance(table, JavaObject) else table
+        command = _finish_arrow_from_object(self._get_builder(), object_id)
+        try:
+            offset, length = self._send_raw(command)
+        except PayloadTooLargeError:
+            # Java filled what room there was before finding it was not enough
+            self._payload_generation += 1
+            raise
+        self._note_payload_write(offset + length)
+        return _read_arrow_stream(self, (offset, length))
 
     def _get_request_id(self) -> int:
         """Get the next request ID for cancellation support."""
