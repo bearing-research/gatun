@@ -56,6 +56,25 @@ public class SessionQuota {
     touchActivity();
   }
 
+  /**
+   * Count objects that are already registered for the session. Used for objects the server hands
+   * out as a side effect (callback arguments, objects nested in a returned collection), which
+   * cannot be refused at that point. They still occupy slots, so later allocations see them, and
+   * releasing them keeps the count balanced.
+   */
+  public void countRegisteredObjects(int n) {
+    if (n <= 0) {
+      return;
+    }
+    int newCount = objectCount.addAndGet(n);
+    totalObjectsCreated.addAndGet(n);
+
+    int peak = peakObjectCount.get();
+    while (newCount > peak && !peakObjectCount.compareAndSet(peak, newCount)) {
+      peak = peakObjectCount.get();
+    }
+  }
+
   /** Release an object slot. */
   public void releaseObject() {
     objectCount.decrementAndGet();

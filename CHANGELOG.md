@@ -15,10 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Direction field on Arrow batch descriptors
 - Arrow memory architecture documentation
 
+### Changed
+- Protocol version is now 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together
+- The async client accepts `datetime` / `date` / `time` arguments
+- Executing a batch from inside a callback raises `ReentrancyError`, like any other call
+
 ### Fixed
 - `pytest` no longer collects tests from an extracted Spark distribution (`testpaths`)
 - `spotlessCheck` no longer fails on generated FlatBuffers code
 - CI now runs the Python 3.14 job on Python 3.14
+- Nested lists and dicts passed as arguments are no longer corrupted (`[[1, 2], [3, 4]]` arrived as `[[1, 2], 2]`)
+- Garbage-collected `JavaObject` wrappers no longer break the connection: frees are queued and sent before the next request instead of from the finalizer. This fixes callbacks that receive Java objects and connections dying after many objects were dropped at once
+- `datetime`, `date` and `time` arguments no longer kill the connection, and can be returned from callbacks
+- A batch no longer loses a target object whose last reference is dropped before the batch runs
+- Objects passed to callbacks are counted against `max_objects`, so freeing them no longer lowers the session's object count below the real one
 
 ## [0.2.1] - 2026-01-17
 

@@ -41,7 +41,7 @@ public class GatunServer {
 
   // Protocol version - increment when making breaking changes to the protocol
   // Version 2: Per-client shared memory (handshake includes SHM path)
-  public static final int PROTOCOL_VERSION = 2;
+  public static final int PROTOCOL_VERSION = 3;
 
   private final Path socketPath;
   private final long memorySize;
@@ -127,12 +127,18 @@ public class GatunServer {
     final MemorySegment sharedMem;
     final Object callbackLock; // Lock for serializing callback round-trips
     final Set<Long> sessionObjectIds; // Track object IDs for cleanup
+    final SessionQuota quota;
 
-    SessionContext(SocketChannel channel, MemorySegment sharedMem, Set<Long> sessionObjectIds) {
+    SessionContext(
+        SocketChannel channel,
+        MemorySegment sharedMem,
+        Set<Long> sessionObjectIds,
+        SessionQuota quota) {
       this.channel = channel;
       this.sharedMem = sharedMem;
       this.callbackLock = new Object();
       this.sessionObjectIds = sessionObjectIds;
+      this.quota = quota;
     }
   }
 
@@ -152,6 +158,9 @@ public class GatunServer {
   // --- REUSABLE FLATBUFFER TEMP OBJECTS ---
   // These are ThreadLocal to avoid per-request allocation overhead.
   // FlatBuffer table wrappers are lightweight and can be reused via Init().
+  // Only leaf value types are shared this way. Container types (ListVal, MapVal, ArrayVal) must
+  // NOT be: convertArgument recurses into their elements, and a shared wrapper would be
+  // re-pointed at the inner collection while the outer loop is still reading from it.
   private static final ThreadLocal<StringVal> tempStringVal =
       ThreadLocal.withInitial(StringVal::new);
   private static final ThreadLocal<IntVal> tempIntVal = ThreadLocal.withInitial(IntVal::new);
@@ -161,9 +170,6 @@ public class GatunServer {
   private static final ThreadLocal<CharVal> tempCharVal = ThreadLocal.withInitial(CharVal::new);
   private static final ThreadLocal<ObjectRef> tempObjectRef =
       ThreadLocal.withInitial(ObjectRef::new);
-  private static final ThreadLocal<ListVal> tempListVal = ThreadLocal.withInitial(ListVal::new);
-  private static final ThreadLocal<MapVal> tempMapVal = ThreadLocal.withInitial(MapVal::new);
-  private static final ThreadLocal<ArrayVal> tempArrayVal = ThreadLocal.withInitial(ArrayVal::new);
   private static final ThreadLocal<CallbackRef> tempCallbackRef =
       ThreadLocal.withInitial(CallbackRef::new);
 
@@ -289,7 +295,7 @@ public class GatunServer {
       LOG.fine("Session " + sessionId + " SHM mapped at: " + sessionShmPath);
 
       // Set up session context for callbacks (captured by callback proxies)
-      SessionContext ctx = new SessionContext(client, sharedMem, sessionObjectIds);
+      SessionContext ctx = new SessionContext(client, sharedMem, sessionObjectIds, quota);
       sessionContext.set(ctx);
 
       // --- HANDSHAKE: Send Protocol Version, Memory Size, and SHM Path to Client ---
@@ -453,12 +459,7 @@ public class GatunServer {
             LOG.fine("Created object ID " + newId + " of type " + className);
 
           } else if (cmd.action() == Action.FreeObject) {
-            long targetId = cmd.targetId();
-            if (sessionObjectIds.contains(targetId)) {
-              objectRegistry.remove(targetId);
-              sessionObjectIds.remove(targetId);
-              quota.releaseObject();
-            }
+            freeObjects(cmd, sessionObjectIds, quota);
             result = null;
           } else if (cmd.action() == Action.InvokeMethod) {
             long targetId = cmd.targetId();
@@ -1032,8 +1033,10 @@ public class GatunServer {
                 // Execute sub-command and get result
                 Object subResult =
                     executeCommand(subCmd, sessionObjectIds, sessionCallbackIds, sharedMem, quota);
+                int registeredBefore = sessionObjectIds.size();
                 subResponseOffsets[i] =
                     packSuccessWithSession(builder, subResult, sessionObjectIds);
+                quota.countRegisteredObjects(sessionObjectIds.size() - registeredBefore);
                 executedCount++;
               } catch (Throwable subT) {
                 // Pack error for this sub-command
@@ -1212,6 +1215,34 @@ public class GatunServer {
   }
 
   /**
+   * Handle FreeObject. The object ID is in target_id, or, to release many objects in one round
+   * trip, the IDs are passed as integer args and target_id is ignored. Unknown and already-freed
+   * IDs are ignored.
+   */
+  private void freeObjects(Command cmd, Set<Long> sessionObjectIds, SessionQuota quota) {
+    int idCount = cmd.argsLength();
+    if (idCount == 0) {
+      freeObject(cmd.targetId(), sessionObjectIds, quota);
+      return;
+    }
+    IntVal iv = tempIntVal.get();
+    for (int i = 0; i < idCount; i++) {
+      Argument arg = cmd.args(i);
+      if (arg.valType() == Value.IntVal) {
+        arg.val(iv);
+        freeObject(iv.v(), sessionObjectIds, quota);
+      }
+    }
+  }
+
+  private void freeObject(long objectId, Set<Long> sessionObjectIds, SessionQuota quota) {
+    if (sessionObjectIds.remove(objectId)) {
+      objectRegistry.remove(objectId);
+      quota.releaseObject();
+    }
+  }
+
+  /**
    * Execute a single command and return the result.
    *
    * <p>This method is used by batch processing to execute sub-commands. It handles all action types
@@ -1282,12 +1313,7 @@ public class GatunServer {
       result = new ObjectRefT(newId);
 
     } else if (cmd.action() == Action.FreeObject) {
-      long targetId = cmd.targetId();
-      if (sessionObjectIds.contains(targetId)) {
-        objectRegistry.remove(targetId);
-        sessionObjectIds.remove(targetId);
-        quota.releaseObject();
-      }
+      freeObjects(cmd, sessionObjectIds, quota);
       result = null;
 
     } else if (cmd.action() == Action.InvokeMethod) {
@@ -1569,7 +1595,7 @@ public class GatunServer {
     } else if (valType == Value.ListVal) {
       // Convert Python list to Java ArrayList
       // Use fast path for homogeneous lists (all elements same type)
-      ListVal lv = (ListVal) arg.val(tempListVal.get());
+      ListVal lv = (ListVal) arg.val(new ListVal());
       int len = lv.itemsLength();
       // Check collection size limit
       ResourceLimits.checkCollectionSize(len);
@@ -1671,7 +1697,7 @@ public class GatunServer {
       type = java.util.ArrayList.class;
     } else if (valType == Value.MapVal) {
       // Convert Python dict to Java HashMap
-      MapVal mv = (MapVal) arg.val(tempMapVal.get());
+      MapVal mv = (MapVal) arg.val(new MapVal());
       int mapSize = mv.entriesLength();
       // Check collection size limit
       ResourceLimits.checkCollectionSize(mapSize);
@@ -1700,8 +1726,13 @@ public class GatunServer {
       type = Object.class;
     } else if (valType == Value.ArrayVal) {
       // Convert ArrayVal to Java array
-      ArrayVal av = (ArrayVal) arg.val(tempArrayVal.get());
+      ArrayVal av = (ArrayVal) arg.val(new ArrayVal());
       value = convertArrayVal(av);
+      type = value.getClass();
+    } else if (valType == Value.TemporalVal) {
+      // Python datetime / date / time
+      TemporalVal tv = (TemporalVal) arg.val(new TemporalVal());
+      value = convertTemporalVal(tv.kind(), tv.v());
       type = value.getClass();
     } else {
       value = null;
@@ -1759,6 +1790,22 @@ public class GatunServer {
         }
       }
     };
+  }
+
+  /** Convert a TemporalVal to the java.sql type that matches its kind. */
+  private static Object convertTemporalVal(byte kind, long v) {
+    if (kind == TemporalKind.Timestamp) {
+      // v is microseconds since the epoch; floor so that pre-1970 values keep a positive
+      // sub-second part, as Timestamp requires.
+      java.sql.Timestamp ts = new java.sql.Timestamp(Math.floorDiv(v, 1_000_000L) * 1000L);
+      ts.setNanos((int) Math.floorMod(v, 1_000_000L) * 1000);
+      return ts;
+    } else if (kind == TemporalKind.Date) {
+      return java.sql.Date.valueOf(java.time.LocalDate.ofEpochDay(v));
+    } else if (kind == TemporalKind.Time) {
+      return java.sql.Time.valueOf(java.time.LocalTime.ofSecondOfDay(v));
+    }
+    throw new IllegalArgumentException("Unknown temporal kind: " + kind);
   }
 
   // --- HELPER: Convert ArrayVal to Java array ---
@@ -2100,6 +2147,9 @@ public class GatunServer {
       FlatBufferBuilder builder = new FlatBufferBuilder(1024);
 
       // Build callback arguments
+      // Objects passed to the callback are registered for the session while packing; count
+      // them, because the client frees them like any other object.
+      int registeredBefore = ctx.sessionObjectIds.size();
       int[] argOffsets = new int[args.length];
       for (int i = 0; i < args.length; i++) {
         int[] packed = packValue(builder, args[i], ctx.sessionObjectIds);
@@ -2108,6 +2158,7 @@ public class GatunServer {
         Argument.addVal(builder, packed[1]);
         argOffsets[i] = Argument.endArgument(builder);
       }
+      ctx.quota.countRegisteredObjects(ctx.sessionObjectIds.size() - registeredBefore);
 
       int argsVec = Response.createCallbackArgsVector(builder, argOffsets);
       int methodOff = builder.createString(methodName);

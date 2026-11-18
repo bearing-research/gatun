@@ -30,7 +30,8 @@ def test_security_access_denied(client):
     client.free_object(valid_id)
 
     # 2. Second Free (The "Hacker" / Double-Free)
-    # With Fire-and-Forget, this should NOT raise. It should be silently ignored.
+    # Frees are queued and sent before the next request; the server ignores a
+    # double free, so this must fail neither here nor on the next call.
     client.free_object(valid_id)
 
     # 3. VERIFICATION:

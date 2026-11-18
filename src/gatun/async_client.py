@@ -46,6 +46,7 @@ from gatun.client import (
     PayloadTooLargeError,
     ProtocolDesyncError,
     SocketTimeoutError,
+    _encode_temporal,
     _raise_java_exception_impl,
 )
 from gatun.generated.org.gatun.protocol import Action as Act
@@ -689,7 +690,16 @@ class AsyncGatunClient:
         elif value is None:
             return Value.Value.NullVal, 0
         else:
-            raise TypeError(f"Unsupported type: {type(value)}")
+            temporal = _encode_temporal(value)
+            if temporal is None:
+                raise TypeError(f"Unsupported type: {type(value)}")
+            from gatun.generated.org.gatun.protocol import TemporalVal
+
+            kind, temporal_value = temporal
+            TemporalVal.Start(builder)
+            TemporalVal.AddKind(builder, kind)
+            TemporalVal.AddV(builder, temporal_value)
+            return Value.Value.TemporalVal, TemporalVal.End(builder)
 
     def _build_argument(self, builder, value):
         """Convert a Python value to a FlatBuffer Argument."""

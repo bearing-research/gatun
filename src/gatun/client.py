@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import array
+import calendar
 import ctypes
+import datetime
 import logging
 import mmap
 import os
@@ -9,7 +11,7 @@ import socket
 import struct
 import time
 import weakref
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Self, cast
 
@@ -43,11 +45,44 @@ from gatun.generated.org.gatun.protocol import (
     ObjectSpec,
     Response,
     StringVal,
+    TemporalKind,
+    TemporalVal,
     Value,
 )
 from gatun.generated.org.gatun.protocol import Command as Cmd
 
 logger = logging.getLogger(__name__)
+
+
+# Object IDs released per FreeObject command. Each ID costs about 40 bytes, so a full
+# chunk stays well inside the 64KB command zone.
+_FREE_CHUNK_SIZE = 512
+
+_EPOCH_ORDINAL = datetime.date(1970, 1, 1).toordinal()
+
+
+def _encode_temporal(value: Any) -> tuple[int, int] | None:
+    """Encode a datetime/date/time as (TemporalKind, integer) for a TemporalVal.
+
+    Returns None for any other type. The server builds the matching java.sql
+    object, so no Java call is needed on this side.
+    """
+    # datetime is a subclass of date, so it has to be tested first
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is not None:
+            epoch_secs = calendar.timegm(value.utctimetuple())
+        else:
+            # Naive datetime: local time
+            epoch_secs = int(time.mktime(value.timetuple()))
+        micros = epoch_secs * 1_000_000 + value.microsecond
+        return TemporalKind.TemporalKind.Timestamp, micros
+    if isinstance(value, datetime.date):
+        return TemporalKind.TemporalKind.Date, value.toordinal() - _EPOCH_ORDINAL
+    if isinstance(value, datetime.time):
+        # java.sql.Time has whole-second resolution
+        seconds = value.hour * 3600 + value.minute * 60 + value.second
+        return TemporalKind.TemporalKind.Time, seconds
+    return None
 
 
 def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int):
@@ -83,7 +118,7 @@ def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int)
 
 # Protocol version - must match the server version
 # Version 2: Per-client shared memory (handshake includes SHM path)
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 # Memory zone sizes - must match GatunServer.java constants
 COMMAND_ZONE_SIZE = 65536  # 64KB for commands
@@ -735,8 +770,8 @@ class JavaObject:
     def __init__(self, client, object_id):
         self.client = client
         self.object_id = object_id
-        # When this object is GC'd, tell Java to free the ID
-        self._finalizer = weakref.finalize(self, client.free_object, object_id)
+        # When this object is GC'd, queue its ID to be freed on the Java side
+        self._finalizer = weakref.finalize(self, client._queue_free, object_id)
 
     def detach(self):
         """Prevents automatic freeing on GC (useful for manual testing)."""
@@ -1223,9 +1258,15 @@ class GatunClient:
         # Bounded to prevent memory bloat in long-running applications
         self._string_cache: _LRUCache[bytes] = _LRUCache(_CACHE_MAX_SIZE)
 
-        # Count of fire-and-forget commands sent without reading responses
-        # These responses must be drained before the next synchronous command
-        self._pending_responses: int = 0
+        # Object IDs whose JavaObject wrappers have been garbage collected and still
+        # need a FreeObject on the server. Finalizers only
+        # append here; the IDs are sent just before the next request, from the
+        # requesting thread. A finalizer can run at any point (in the middle of
+        # another request, inside a callback, on another thread, at interpreter
+        # exit), so it must never touch the socket or the command zone itself.
+        self._pending_frees: deque[int] = deque()
+        # Dedicated builder, so flushing frees never disturbs a command being built
+        self._free_builder = flatbuffers.Builder(64)
 
         # Reentrancy detection - tracks if we're inside a callback.
         # Nested Java calls from callbacks would deadlock the single-stream protocol.
@@ -1377,11 +1418,11 @@ class GatunClient:
 
         return ScopedArenaContext(self)
 
-    def _send_raw(self, data: bytes, wait_for_response=True, expects_response=True):
-        """
-        Writes command to SHM and signals Java.
-        If wait_for_response is False, returns immediately (Fire-and-Forget).
-        If expects_response is False, Java won't send a response (used for CallbackResponse).
+    def _send_raw(self, data: bytes, expects_response: bool = True):
+        """Write a command to SHM, signal Java and return the parsed response.
+
+        With expects_response=False the command is one-way: Java sends no reply and
+        nothing is read. That is only true of CallbackResponse.
         """
         # 0a. Check if connection is dead - fail fast
         if self._dead:
@@ -1403,12 +1444,19 @@ class GatunClient:
         if len(data) > max_command_size:
             raise PayloadTooLargeError(len(data), max_command_size, "Command")
 
-        # 2. Drain any pending responses from fire-and-forget commands
-        # This must happen before writing to shared memory to avoid race conditions
-        if wait_for_response:
-            self._drain_pending_responses()
+        # 2. Release objects whose wrappers were garbage collected since the last
+        # request. This is a round trip of its own, so it has to finish before our
+        # own command goes into shared memory.
+        if expects_response and self._pending_frees:
+            self._flush_pending_frees()
 
-        # 3. Write to Shared Memory
+        self._write_command(data)
+        if expects_response:
+            return self._read_response()
+        return None
+
+    def _write_command(self, data: bytes) -> None:
+        """Write one command to shared memory and signal Java."""
         self.shm.seek(self.command_offset)
         self.shm.write(data)
         # Flush to ensure writes are visible to Java before signaling.
@@ -1416,7 +1464,7 @@ class GatunClient:
         # provides a memory barrier that guarantees ordering.
         self.shm.flush()
 
-        # 4. Signal Java (Send Length)
+        # Signal Java (Send Length)
         # Verify socket is open (check None first to avoid AttributeError)
         if not self.sock or self.sock.fileno() == -1:
             self._mark_dead()
@@ -1428,14 +1476,60 @@ class GatunClient:
             self._mark_dead()
             raise ProtocolDesyncError(f"Socket error sending command: {e}")
 
-        # 5. Handle Response
-        if wait_for_response:
-            return self._read_response()
-        elif expects_response:
-            # Track that we have a pending response to drain later
-            # (fire-and-forget commands like FreeObject still get responses)
-            self._pending_responses += 1
-        # If not wait_for_response and not expects_response: truly one-way (CallbackResponse)
+    def _queue_free(self, object_id: int) -> None:
+        """Queue a Java object for release. Called by JavaObject finalizers.
+
+        A finalizer can run at any moment (in the middle of another request, inside
+        a callback, on another thread, at interpreter exit), so this must not touch
+        the socket or the shared command zone. The next request sends the queue.
+        """
+        if not self._dead:
+            self._pending_frees.append(object_id)
+
+    def _flush_pending_frees(self) -> None:
+        """Send FreeObject for every queued object ID, many IDs per round trip.
+
+        Runs on the requesting thread, between requests, so it cannot interleave
+        with another command.
+        """
+        frees = self._pending_frees
+        builder = self._free_builder
+        while frees:
+            ids: list[int] = []
+            try:
+                while len(ids) < _FREE_CHUNK_SIZE:
+                    ids.append(frees.popleft())
+            except IndexError:
+                pass  # queue drained
+            if not ids:
+                break
+
+            builder.Clear()
+            arg_offsets = []
+            for object_id in ids:
+                IntVal.Start(builder)
+                IntVal.AddV(builder, object_id)
+                val_off = IntVal.End(builder)
+                Argument.Start(builder)
+                Argument.AddValType(builder, Value.Value.IntVal)
+                Argument.AddVal(builder, val_off)
+                arg_offsets.append(Argument.End(builder))
+            Cmd.CommandStartArgsVector(builder, len(arg_offsets))
+            for offset in reversed(arg_offsets):
+                builder.PrependUOffsetTRelative(offset)
+            args_vec = builder.EndVector()
+            Cmd.CommandStart(builder)
+            Cmd.CommandAddAction(builder, Act.Action.FreeObject)
+            Cmd.CommandAddArgs(builder, args_vec)
+            builder.Finish(Cmd.CommandEnd(builder))
+
+            self._write_command(builder.Output())
+            try:
+                self._read_response()
+            except JavaException as e:
+                # The server ignores unknown IDs, so this is unexpected, and it
+                # must not fail the caller's unrelated request.
+                logger.debug("FreeObject for %d objects failed: %s", len(ids), e)
 
     def _mark_dead(self):
         """Mark client as dead after protocol desync.
@@ -1454,7 +1548,7 @@ class GatunClient:
             return  # Already dead
 
         self._dead = True
-        self._pending_responses = 0
+        self._pending_frees.clear()
 
         # Shutdown socket to unblock any pending reads, then close
         try:
@@ -1467,121 +1561,6 @@ class GatunClient:
                 self.sock = None
         except OSError:
             pass
-
-    def _drain_pending_responses(self, timeout: float = 5.0, max_drain: int = 100):
-        """Drain any pending responses from fire-and-forget commands.
-
-        Fire-and-forget commands (like FreeObject) still get responses from Java.
-        We must read and discard these responses before the next synchronous
-        command to keep the response stream in sync.
-
-        IMPORTANT: This must handle callback requests that may arrive during drain.
-        If Java sends a callback request, we must handle it (execute the callback
-        and send CallbackResponse) before continuing to drain. Otherwise Java will
-        block waiting for our callback response and we'll deadlock.
-
-        Args:
-            timeout: Timeout in seconds for each individual response read.
-                    If a single drain times out, we treat it as a desync.
-            max_drain: Maximum number of responses to drain in one call.
-                      Prevents infinite loops if _pending_responses is wrong.
-
-        Raises:
-            ProtocolDesyncError: If drain times out or response size is invalid.
-                                Connection is closed before raising.
-        """
-        drained = 0
-        errors_discarded = 0
-        # Track total reads to prevent infinite callback loops
-        total_reads = 0
-        max_total_reads = max_drain * 10  # Allow callbacks but not infinite
-
-        while self._pending_responses > 0 and drained < max_drain:
-            if total_reads >= max_total_reads:
-                self._mark_dead()
-                raise ProtocolDesyncError(
-                    f"Too many reads during drain ({total_reads}), possible callback loop"
-                )
-            total_reads += 1
-
-            try:
-                # Read response length with timeout
-                sz_data = _recv_exactly(self.sock, 4, timeout=timeout)
-                sz = struct.unpack("<I", sz_data)[0]
-
-                # Validate response size (same checks as _read_response)
-                max_response_size = self.memory_size - self.response_offset
-                if sz == 0 or sz > RESPONSE_ZONE_SIZE or sz > max_response_size:
-                    self._mark_dead()
-                    raise ProtocolDesyncError(
-                        f"Invalid response size during drain: {sz}", response_size=sz
-                    )
-
-                # Read response data from SHM
-                self.shm.seek(self.response_offset)
-                resp_buf = self.shm.read(sz)
-
-                # Validate we got all the bytes (mmap.read can return fewer)
-                if len(resp_buf) != sz:
-                    self._mark_dead()
-                    raise ProtocolDesyncError(
-                        f"SHM read returned {len(resp_buf)} bytes, expected {sz}",
-                        response_size=sz,
-                    )
-
-                # Parse the response to check if it's a callback
-                resp = Response.Response.GetRootAsResponse(resp_buf, 0)
-
-                if resp.IsCallback():
-                    # Must handle callback - Java is blocked waiting for our response
-                    # This does NOT count as draining a pending response
-                    self._handle_callback(resp)
-                    continue
-
-                # It's a real response - drain complete for this one
-                # Log discarded errors for diagnosability (fire-and-forget commands
-                # that failed may indicate issues even if we don't raise here)
-                if resp.IsError():
-                    errors_discarded += 1
-                    error_msg = resp.ErrorMsg()
-                    if error_msg:
-                        error_text = error_msg.decode("utf-8", errors="replace")
-                        # Truncate long error messages for logging
-                        if len(error_text) > 200:
-                            error_text = error_text[:200] + "..."
-                        logger.debug("Discarded error during drain: %s", error_text)
-
-                self._pending_responses -= 1
-                drained += 1
-
-            except SocketTimeoutError:
-                # Timeout during drain means protocol desync - close connection
-                self._mark_dead()
-                raise ProtocolDesyncError(
-                    f"Timeout draining pending responses (drained {drained})"
-                )
-            except (RuntimeError, OSError, BrokenPipeError, ConnectionResetError) as e:
-                # Socket error during drain (e.g., from _handle_callback sending response,
-                # or "Socket closed unexpectedly" from _recv_exactly)
-                self._mark_dead()
-                raise ProtocolDesyncError(f"Socket error during drain: {e}")
-
-        if self._pending_responses > 0:
-            # Hit max_drain limit - likely a bug or desync
-            remaining = self._pending_responses
-            self._mark_dead()
-            raise ProtocolDesyncError(
-                f"Too many pending responses to drain: {remaining + drained} "
-                f"(max_drain={max_drain})"
-            )
-
-        # Log summary if we discarded any errors
-        if errors_discarded > 0:
-            logger.debug(
-                "Drain completed: %d responses drained, %d errors discarded",
-                drained,
-                errors_discarded,
-            )
 
     def _unpack_value(self, val_type: int, val_table: Any) -> Any:
         """Unpack a FlatBuffer Value union to a Python object."""
@@ -2032,9 +2011,7 @@ class GatunClient:
 
         # Send it (don't wait for response - Java is waiting for this)
         # Java doesn't send a response for CallbackResponse, so expects_response=False
-        self._send_raw(
-            builder.Output(), wait_for_response=False, expects_response=False
-        )
+        self._send_raw(builder.Output(), expects_response=False)
 
     def create_object(self, class_name, *args):
         builder = self._get_builder(large=True)
@@ -2760,60 +2737,13 @@ class GatunClient:
             NullVal.Start(builder)
             return Value.Value.NullVal, NullVal.End(builder)
         else:
-            # Check for datetime types (import here to avoid circular imports)
-            import calendar
-            import datetime
-            import time as time_module
-
-            if isinstance(value, datetime.datetime):
-                # Convert datetime to java.sql.Timestamp
-                # First calculate epoch milliseconds
-                epoch_secs: float
-                if value.tzinfo is not None:
-                    # Timezone-aware datetime
-                    epoch_secs = calendar.timegm(value.utctimetuple())
-                else:
-                    # Naive datetime - treat as local time
-                    epoch_secs = time_module.mktime(value.timetuple())
-                epoch_millis = int(epoch_secs * 1000) + value.microsecond // 1000
-                nanos = value.microsecond * 1000
-
-                # Create java.sql.Timestamp object
-                timestamp = self.create_object("java.sql.Timestamp", epoch_millis)
-                if nanos > 0:
-                    timestamp.setNanos(nanos)
-                # Detach the finalizer to prevent premature GC from freeing
-                # the Java object before the outer command uses it
-                timestamp.detach()
-                ObjectRef.Start(builder)
-                ObjectRef.AddId(builder, timestamp.object_id)
-                return Value.Value.ObjectRef, ObjectRef.End(builder)
-            elif isinstance(value, datetime.date):
-                # Convert date to java.sql.Date using valueOf
-                # java.sql.Date.valueOf expects "YYYY-MM-DD" format
-                date_str = value.isoformat()
-                date_obj = self.invoke_static_method(
-                    "java.sql.Date", "valueOf", date_str
-                )
-                # Detach the finalizer to prevent premature GC from freeing
-                # the Java object before the outer command uses it
-                date_obj.detach()
-                ObjectRef.Start(builder)
-                ObjectRef.AddId(builder, date_obj.object_id)
-                return Value.Value.ObjectRef, ObjectRef.End(builder)
-            elif isinstance(value, datetime.time):
-                # Convert time to java.sql.Time using valueOf
-                # java.sql.Time.valueOf expects "HH:MM:SS" format
-                time_str = value.strftime("%H:%M:%S")
-                time_obj = self.invoke_static_method(
-                    "java.sql.Time", "valueOf", time_str
-                )
-                # Detach the finalizer to prevent premature GC from freeing
-                # the Java object before the outer command uses it
-                time_obj.detach()
-                ObjectRef.Start(builder)
-                ObjectRef.AddId(builder, time_obj.object_id)
-                return Value.Value.ObjectRef, ObjectRef.End(builder)
+            temporal = _encode_temporal(value)
+            if temporal is not None:
+                kind, temporal_value = temporal
+                TemporalVal.Start(builder)
+                TemporalVal.AddKind(builder, kind)
+                TemporalVal.AddV(builder, temporal_value)
+                return Value.Value.TemporalVal, TemporalVal.End(builder)
             else:
                 raise TypeError(f"Unsupported argument type: {type(value)}")
 
@@ -3057,29 +2987,21 @@ class GatunClient:
             return Value.Value.ArrayVal, ArrayVal.End(builder)
 
     def free_object(self, object_id):
-        """Sends FreeObject to release a Java object (fire-and-forget).
+        """Release a Java object.
 
-        This is called from the weak reference finalizer when JavaObjects are
-        garbage collected. It uses fire-and-forget mode to avoid blocking GC
-        with a round-trip, which significantly improves throughput.
+        Sent to the server straight away, except inside a callback, where it goes
+        out with the next request. The server ignores an unknown or already-freed
+        ID. JavaObject wrappers release themselves when garbage collected, so this
+        is only needed for objects that were detach()ed.
         """
-        if self.sock is None or self.sock.fileno() == -1:
+        if self._dead or self.sock is None or self.sock.fileno() == -1:
             return
-
-        builder = self._get_builder()
-        Cmd.CommandStart(builder)
-        Cmd.CommandAddAction(builder, Act.Action.FreeObject)
-        Cmd.CommandAddTargetId(builder, object_id)
-        cmd_offset = Cmd.CommandEnd(builder)
-        builder.Finish(cmd_offset)
-
-        try:
-            # Fire-and-forget: don't wait for response since FreeObject
-            # just returns null and we don't care about the result.
-            # This avoids blocking GC with a socket round-trip.
-            self._send_raw(builder.Output(), wait_for_response=False)
-        except OSError:
-            pass
+        self._pending_frees.append(object_id)
+        if not self._in_callback:
+            try:
+                self._flush_pending_frees()
+            except OSError:
+                pass
 
     def send_arrow_table(self, table):
         """Send an Arrow table to Java via shared memory.
@@ -3539,6 +3461,10 @@ class BatchContext:
         self._client = client
         self._stop_on_error = stop_on_error
         self._command_data: list[tuple[int, int, str | None, tuple]] = []
+        # Targets of queued commands. Only their IDs go into _command_data, so
+        # without this a target whose last reference is dropped inside the batch
+        # would be freed before the batch runs.
+        self._targets: list[JavaObject] = []
         self._results: list = []
         self._executed = False
 
@@ -3576,6 +3502,7 @@ class BatchContext:
             BatchResult that will contain the return value after execute().
         """
         idx = len(self._command_data)
+        self._targets.append(obj)
         self._command_data.append(
             (Act.Action.InvokeMethod, obj.object_id, method_name, args)
         )
@@ -3608,6 +3535,7 @@ class BatchContext:
             BatchResult that will contain the field value after execute().
         """
         idx = len(self._command_data)
+        self._targets.append(obj)
         self._command_data.append((Act.Action.GetField, obj.object_id, field_name, ()))
         return BatchResult(self, idx)
 
@@ -3623,6 +3551,7 @@ class BatchContext:
             BatchResult (value will be None after execute()).
         """
         idx = len(self._command_data)
+        self._targets.append(obj)
         self._command_data.append(
             (Act.Action.SetField, obj.object_id, field_name, (value,))
         )
@@ -3714,8 +3643,14 @@ class BatchContext:
         if len(data) > max_command_size:
             raise PayloadTooLargeError(len(data), max_command_size, "Command")
 
-        # Drain pending responses
-        self._client._drain_pending_responses()
+        # A batch is a request like any other: not allowed while Java is waiting
+        # for a callback's result
+        if self._client._in_callback:
+            raise ReentrancyError("Cannot execute a batch from within a callback.")
+
+        # Release objects whose wrappers were garbage collected since the last request
+        if self._client._pending_frees:
+            self._client._flush_pending_frees()
 
         # Write to shared memory
         self._client.shm.seek(self._client.command_offset)
@@ -3757,6 +3692,7 @@ class BatchContext:
 
         self._client.shm.seek(self._client.response_offset)
         resp_buf = self._client.shm.read(sz)
+        self._targets.clear()
 
         # Parse response
         resp = Response.Response.GetRootAsResponse(resp_buf, 0)
