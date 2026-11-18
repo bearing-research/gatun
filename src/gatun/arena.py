@@ -33,6 +33,7 @@ from __future__ import annotations
 import ctypes
 import io
 import mmap
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Self
 
@@ -255,16 +256,6 @@ class PayloadArena:
         return False
 
 
-# Nested Arrow types that require recursive field node extraction
-_NESTED_TYPES = (
-    pa.ListType,
-    pa.LargeListType,
-    pa.FixedSizeListType,
-    pa.StructType,
-    pa.MapType,
-    pa.UnionType,
-)
-
 # Dictionary type needs special handling (not yet supported)
 _UNSUPPORTED_TYPES = (pa.DictionaryType,)
 
@@ -273,16 +264,79 @@ class UnsupportedArrowTypeError(TypeError):
     """Raised when an Arrow schema contains unsupported types."""
 
 
+def _iter_types(
+    schema_or_type: pa.Schema | pa.DataType, path: str = ""
+) -> Iterator[tuple[str, pa.DataType]]:
+    """Yield (path, type) for every type in a schema or type, parents first.
+
+    An extension type is reported as its storage type, which is what its arrays
+    are made of and what the schema says on the wire.
+    """
+    if isinstance(schema_or_type, pa.Schema):
+        for field in schema_or_type:
+            field_path = field.name if not path else f"{path}.{field.name}"
+            yield from _iter_types(field.type, field_path)
+        return
+
+    arrow_type = schema_or_type
+    while isinstance(arrow_type, pa.BaseExtensionType):
+        arrow_type = arrow_type.storage_type
+    yield path, arrow_type
+
+    if isinstance(arrow_type, (pa.ListType, pa.LargeListType, pa.FixedSizeListType)):
+        yield from _iter_types(arrow_type.value_type, f"{path}[]")
+    elif isinstance(arrow_type, pa.MapType):
+        yield from _iter_types(arrow_type.key_type, f"{path}.key")
+        yield from _iter_types(arrow_type.item_type, f"{path}.value")
+    elif isinstance(arrow_type, (pa.StructType, pa.UnionType)):
+        for i in range(arrow_type.num_fields):
+            field = arrow_type.field(i)
+            field_path = f"{path}.{field.name}" if path else field.name
+            yield from _iter_types(field.type, field_path)
+
+
+def _has_known_layout(arrow_type: pa.DataType) -> bool:
+    """Whether the buffer transfer knows which buffers an array of this type has.
+
+    Java checks a batch against a fixed number of buffers per type and the
+    descriptor has no room for anything else, so types whose buffer count varies
+    from array to array (string_view, binary_view) cannot be carried, and nor can
+    types whose values live outside the array (dictionary) or that this module
+    does not know how to walk (list_view, run_end_encoded).
+    """
+    types = pa.types
+    return bool(
+        types.is_null(arrow_type)
+        or types.is_primitive(arrow_type)  # booleans, numbers, dates and times
+        or types.is_decimal(arrow_type)
+        or types.is_fixed_size_binary(arrow_type)
+        or types.is_string(arrow_type)
+        or types.is_large_string(arrow_type)
+        or types.is_binary(arrow_type)
+        or types.is_large_binary(arrow_type)
+        or types.is_list(arrow_type)
+        or types.is_large_list(arrow_type)
+        or types.is_fixed_size_list(arrow_type)
+        or types.is_struct(arrow_type)
+        or types.is_map(arrow_type)
+        or types.is_union(arrow_type)
+    )
+
+
 def _validate_supported_schema(schema: pa.Schema) -> None:
-    """Validate that schema contains only supported types.
+    """Validate that the buffer transfer can carry every type in a schema.
 
-    Currently supports:
-    - Primitive types: int, float, bool, string, binary, etc.
-    - Date/time types: date32, date64, timestamp, time32, time64, duration
+    Supported:
+    - Primitive types: null, bool, int, float, decimal, string, binary and their
+      large and fixed-size variants
+    - Date/time types: date32, date64, timestamp, time32, time64, duration, interval
     - Nested types: list, large_list, fixed_size_list, struct, map, union
+    - Extension types over any of the above (sent as their storage)
 
-    Not yet supported:
+    Not supported:
     - Dictionary (requires separate dictionary/indices handling)
+    - string_view, binary_view (a varying number of buffers per array)
+    - list_view, large_list_view, run_end_encoded
 
     Args:
         schema: Arrow schema to validate
@@ -290,8 +344,11 @@ def _validate_supported_schema(schema: pa.Schema) -> None:
     Raises:
         UnsupportedArrowTypeError: If schema contains unsupported types
     """
-    unsupported: list[str] = []
-    _check_type_recursive(schema, unsupported)
+    unsupported = [
+        f"{path}: {arrow_type}"
+        for path, arrow_type in _iter_types(schema)
+        if not _has_known_layout(arrow_type)
+    ]
 
     if unsupported:
         raise UnsupportedArrowTypeError(
@@ -304,34 +361,53 @@ def _validate_supported_schema(schema: pa.Schema) -> None:
 def _check_type_recursive(
     schema_or_type: pa.Schema | pa.DataType, unsupported: list[str], path: str = ""
 ) -> None:
-    """Recursively check types for unsupported ones."""
-    if isinstance(schema_or_type, pa.Schema):
-        for field in schema_or_type:
-            field_path = field.name if not path else f"{path}.{field.name}"
-            _check_type_recursive(field.type, unsupported, field_path)
-    elif isinstance(schema_or_type, _UNSUPPORTED_TYPES):
-        unsupported.append(f"{path}: {schema_or_type}")
-    elif isinstance(
-        schema_or_type, (pa.ListType, pa.LargeListType, pa.FixedSizeListType)
-    ):
-        _check_type_recursive(schema_or_type.value_type, unsupported, f"{path}[]")
-    elif isinstance(schema_or_type, pa.StructType):
-        for i in range(schema_or_type.num_fields):
-            field = schema_or_type.field(i)
-            field_path = f"{path}.{field.name}" if path else field.name
-            _check_type_recursive(field.type, unsupported, field_path)
-    elif isinstance(schema_or_type, pa.MapType):
-        _check_type_recursive(schema_or_type.key_type, unsupported, f"{path}.key")
-        _check_type_recursive(schema_or_type.item_type, unsupported, f"{path}.value")
-    elif isinstance(schema_or_type, pa.UnionType):
-        for i in range(schema_or_type.num_fields):
-            field = schema_or_type.field(i)
-            _check_type_recursive(field.type, unsupported, f"{path}.{field.name}")
+    """Collect the dictionary-encoded types in a schema, which no transfer supports."""
+    unsupported.extend(
+        f"{type_path}: {arrow_type}"
+        for type_path, arrow_type in _iter_types(schema_or_type, path)
+        if isinstance(arrow_type, _UNSUPPORTED_TYPES)
+    )
 
 
 # Array.nbytes counts the bytes an array refers to, slice or not, but leaves out the
 # final entry of each offsets buffer. One 64-bit offset per buffer covers that.
 _OFFSET_SLACK = 8
+
+
+def _storage(array: pa.Array) -> pa.Array:
+    """The array that holds an extension array's buffers and children."""
+    while isinstance(array, pa.ExtensionArray):
+        array = array.storage
+    return array
+
+
+def _child_arrays(array: pa.Array) -> list[pa.Array]:
+    """The arrays that follow this one in Arrow's depth-first order.
+
+    Each child's field node and buffers are emitted as it is returned here, so
+    this is also where an offset in a child has to be looked for.
+    """
+    arr_type = array.type
+    if isinstance(
+        arr_type, (pa.ListType, pa.LargeListType, pa.FixedSizeListType, pa.MapType)
+    ):
+        # One child. For a map it is the struct of entries, which in turn has the
+        # key and value arrays as its children.
+        return [array.values]
+    if isinstance(arr_type, (pa.StructType, pa.UnionType)):
+        return [array.field(i) for i in range(arr_type.num_fields)]
+    return []
+
+
+def _has_offset(array: pa.Array) -> bool:
+    """Whether this array, or any array nested in it, starts part-way into its buffers.
+
+    Java reads every buffer from its first byte, so an array with an offset has to
+    be rebuilt before it is copied. A parent's offset says nothing about its
+    children: ``StructArray.from_arrays([child.slice(2)])`` has offset 0 itself.
+    """
+    array = _storage(array)
+    return array.offset != 0 or any(_has_offset(c) for c in _child_arrays(array))
 
 
 def _is_slice(array: pa.Array) -> bool:
@@ -340,58 +416,88 @@ def _is_slice(array: pa.Array) -> bool:
     True for any slice of a larger array, including one that starts at row 0, such
     as the first batch of ``table.to_batches()``.
     """
-    if array.offset != 0:
+    if _has_offset(array):
         return True
+    # With no offset anywhere, Java reads the right rows whatever this returns:
+    # rows past the end are only copied for nothing. Comparing byte counts can
+    # miss a few of those, and that is all it can get wrong.
     buffer_count = sum(buf is not None for buf in array.buffers())
     unused = array.get_total_buffer_size() - array.nbytes
     return bool(unused > _OFFSET_SLACK * buffer_count)
 
 
 def _get_own_buffers(array: pa.Array) -> list[pa.Buffer | None]:
-    """Get only this array's own buffers (not children's buffers).
+    """Get only this array's own buffers (not children's buffers), as Java expects them.
 
-    For nested types, array.buffers() includes children's buffers, but Arrow IPC
-    format requires buffers in DFS order. We extract only the parent's buffers here
-    and handle children recursively.
+    ``array.buffers()`` lists this array's buffers followed by its children's.
+    ``DataType.num_buffers`` says how many are its own, and for most types that is
+    also what Arrow Java's TypeLayout has:
+    - Fixed width (int, float, bool, decimal, ...): [validity, data]
+    - String/Binary and their large variants: [validity, offsets, data]
+    - List, LargeList, Map: [validity, offsets]
+    - FixedSizeList, Struct: [validity]
 
-    Buffer layout per array type (from Arrow spec):
-    - Primitive (int, float, bool, etc.): [validity, data]
-    - String/Binary: [validity, offsets, data]
-    - LargeString/LargeBinary: [validity, offsets (64-bit), data]
-    - List: [validity, offsets]
-    - LargeList: [validity, offsets (64-bit)]
-    - FixedSizeList: [validity]
-    - Struct: [validity]
-    - Map: [validity, offsets] (like List)
-    - DenseUnion: [type_ids, offsets]
-    - SparseUnion: [type_ids]
+    Two types differ, because Arrow C++ keeps a slot that the IPC format and Java
+    do not have:
+    - Null: C++ has one buffer that is always absent; Java has none
+    - Union: C++ has an always-absent validity slot first; Java has [type_ids] for
+      a sparse union and [type_ids, offsets] for a dense one
     """
     arr_type = array.type
-    all_buffers: list[pa.Buffer | None] = array.buffers()
+    own: list[pa.Buffer | None] = array.buffers()[: arr_type.num_buffers]
+    if pa.types.is_null(arr_type):
+        return []
+    if pa.types.is_union(arr_type):
+        return own[1:]
+    return own
 
-    # For nested types, we only want the parent's buffers, not children's
-    if isinstance(arr_type, (pa.ListType, pa.LargeListType)):
-        # List: validity + offsets (2 buffers), rest are child's
-        return all_buffers[:2]
-    elif isinstance(arr_type, pa.FixedSizeListType):
-        # FixedSizeList: validity only (1 buffer)
-        return all_buffers[:1]
-    elif isinstance(arr_type, pa.StructType):
-        # Struct: validity only (1 buffer)
-        return all_buffers[:1]
-    elif isinstance(arr_type, pa.MapType):
-        # Map: validity + offsets (2 buffers)
-        return all_buffers[:2]
-    elif isinstance(arr_type, pa.UnionType):
-        if arr_type.mode == "dense":
-            # DenseUnion: type_ids + offsets (2 buffers)
-            return all_buffers[:2]
-        else:
-            # SparseUnion: type_ids only (1 buffer)
-            return all_buffers[:1]
-    else:
-        # Primitive types: all buffers belong to this array
-        return all_buffers
+
+def _compact_dense_union(array: pa.UnionArray) -> pa.UnionArray:
+    """Rebuild a dense union so that each child holds exactly the values in use.
+
+    Arrow allows a child to hold values that no slot of the union points at, and
+    slicing a dense union leaves such values behind. Arrow Java does not: it sets
+    each child's length to the number of slots of that child's type
+    (DenseUnionVector.setValueCount), which cuts a longer child short and leaves
+    offsets pointing past its end. So the children are reduced to the values the
+    slots use, in slot order, and the offsets renumbered to match.
+
+    The array must have no offset, which holds for everything that reaches
+    _extract_field_nodes_and_buffers_recursive.
+    """
+    # Only unions need compute functions, and importing them is not free
+    import pyarrow.compute as pc
+
+    type_ids = array.type_codes
+    offsets = array.offsets
+    compact_offsets = offsets
+    slots_of_child: list[pa.BooleanArray] = []
+    # A plain 1 would widen the result to int64; union offsets are int32
+    one = pa.scalar(1, pa.int32())
+    for code in array.type.type_codes:
+        slots = pc.equal(type_ids, code)
+        position = pc.subtract(pc.cumulative_sum(pc.cast(slots, pa.int32())), one)
+        compact_offsets = pc.if_else(slots, position, compact_offsets)
+        slots_of_child.append(slots)
+
+    if compact_offsets.equals(offsets) and all(
+        len(array.field(i)) == slots.true_count
+        for i, slots in enumerate(slots_of_child)
+    ):
+        return array
+
+    children = [
+        array.field(i).take(offsets.filter(slots))
+        for i, slots in enumerate(slots_of_child)
+    ]
+    union_type = array.type
+    return pa.UnionArray.from_dense(
+        type_ids,
+        compact_offsets,
+        children,
+        [union_type.field(i).name for i in range(union_type.num_fields)],
+        union_type.type_codes,
+    )
 
 
 def _extract_field_nodes_and_buffers_recursive(
@@ -415,82 +521,17 @@ def _extract_field_nodes_and_buffers_recursive(
         field_nodes: List to append (length, null_count) tuples to
         buffers: List to append buffers to
     """
-    # Emit this array's field node
+    # The schema describes an extension column by its storage type, so that is
+    # the layout Java expects
+    array = _storage(array)
+    if pa.types.is_union(array.type) and array.type.mode == "dense":
+        array = _compact_dense_union(array)
+
     field_nodes.append((len(array), array.null_count))
+    buffers.extend(_get_own_buffers(array))
 
-    # Emit this array's own buffers (not children's)
-    own_buffers = _get_own_buffers(array)
-    buffers.extend(own_buffers)
-
-    # Recurse into children based on type
-    arr_type = array.type
-
-    if isinstance(arr_type, (pa.ListType, pa.LargeListType, pa.FixedSizeListType)):
-        # List types have a single child: the values array
-        _extract_field_nodes_and_buffers_recursive(array.values, field_nodes, buffers)
-
-    elif isinstance(arr_type, pa.StructType):
-        # Struct types have multiple children: one per field
-        for i in range(arr_type.num_fields):
-            _extract_field_nodes_and_buffers_recursive(
-                array.field(i), field_nodes, buffers
-            )
-
-    elif isinstance(arr_type, pa.MapType):
-        # Map is internally list<struct<key, value>>
-        # The .values property gives us the struct array (entries)
-        # which contains the key and value child arrays
-        _extract_field_nodes_and_buffers_recursive(array.values, field_nodes, buffers)
-
-    elif isinstance(arr_type, pa.UnionType):
-        # Union types have multiple children: one per type code
-        for i in range(arr_type.num_fields):
-            _extract_field_nodes_and_buffers_recursive(
-                array.field(i), field_nodes, buffers
-            )
-
-
-def _extract_field_nodes_recursive(
-    array: pa.Array, field_nodes: list[tuple[int, int]]
-) -> None:
-    """Extract field nodes from an array in depth-first pre-order.
-
-    Arrow IPC format requires field nodes in depth-first pre-order traversal.
-    For nested types, we emit the parent node first, then recurse into children.
-
-    Note: This function is kept for backwards compatibility. Prefer using
-    _extract_field_nodes_and_buffers_recursive which extracts both in lockstep.
-
-    Args:
-        array: The Arrow array to extract nodes from
-        field_nodes: List to append (length, null_count) tuples to
-    """
-    # Emit this array's field node
-    field_nodes.append((len(array), array.null_count))
-
-    # Recurse into children based on type
-    arr_type = array.type
-
-    if isinstance(arr_type, (pa.ListType, pa.LargeListType, pa.FixedSizeListType)):
-        # List types have a single child: the values array
-        _extract_field_nodes_recursive(array.values, field_nodes)
-
-    elif isinstance(arr_type, pa.StructType):
-        # Struct types have multiple children: one per field
-        for i in range(arr_type.num_fields):
-            _extract_field_nodes_recursive(array.field(i), field_nodes)
-
-    elif isinstance(arr_type, pa.MapType):
-        # Map is internally list<struct<key, value>>
-        # The .values property gives us the struct array (entries)
-        # which contains the key and value child arrays
-        # Field nodes: map -> struct (entries) -> key, value
-        _extract_field_nodes_recursive(array.values, field_nodes)
-
-    elif isinstance(arr_type, pa.UnionType):
-        # Union types have multiple children: one per type code
-        for i in range(arr_type.num_fields):
-            _extract_field_nodes_recursive(array.field(i), field_nodes)
+    for child in _child_arrays(array):
+        _extract_field_nodes_and_buffers_recursive(child, field_nodes, buffers)
 
 
 def copy_arrow_table_to_arena(
@@ -537,13 +578,16 @@ def copy_arrow_table_to_arena(
     table = table.combine_chunks()
 
     for column in table.columns:
-        # After combine_chunks(), each column has exactly one chunk
-        chunk = column.chunks[0]
+        # After combine_chunks() a column has one chunk, or none at all if the
+        # table was built from no batches; that one still needs its (empty) buffers.
+        # pa.nulls can build every type, unions included, which pa.array cannot.
+        chunk = column.chunks[0] if column.num_chunks else pa.nulls(0, column.type)
 
         # Compact sliced arrays. A slice shares its parent's buffers, so they hold
         # rows before the slice (which must not be read as its own) and after it
         # (which would be copied for nothing). concat_arrays builds a new array
-        # with offset 0 and buffers that hold only its rows.
+        # whose buffers hold only its rows and that has offset 0 at every level
+        # of nesting.
         if _is_slice(chunk):
             chunk = pa.concat_arrays([chunk])
 
@@ -623,6 +667,20 @@ def estimate_arrow_size(table: pa.Table | pa.RecordBatch) -> int:
             # Add maximum alignment padding (64 bytes) per buffer
             total += size + PayloadArena.ALIGNMENT * len(buffer_sizes)
     return total
+
+
+def _copy_table(table: pa.Table) -> pa.Table:
+    """Copy a table into memory that pyarrow owns, keeping its schema exactly.
+
+    Going through Python objects instead would let pyarrow infer the types again:
+    int32 comes back as int64, timestamp[s] as timestamp[us], an all-null string
+    column as null. The IPC format carries the schema itself and copies each
+    buffer once.
+    """
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return pa.ipc.open_stream(sink.getvalue()).read_all()
 
 
 class ScopedArenaContext:
@@ -722,13 +780,8 @@ class ScopedArenaContext:
         if not self._entered or self._arena is None:
             raise RuntimeError("receive() must be called within a context manager")
 
-        # Get the view (backed by shared memory)
-        view = self._client.get_arrow_data()
-
-        # Return a copy to ensure validity after context exit
-        # to_pandas().to_arrow() would work but is slower
-        # Using pa.Table.from_batches with a RecordBatch copy
-        return pa.table(view.to_pydict())
+        # The view points into shared memory that the next transfer reuses
+        return _copy_table(self._client.get_arrow_data().table)
 
     @property
     def arena(self) -> PayloadArena | None:

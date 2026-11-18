@@ -37,12 +37,12 @@ The protocol is implemented several times over, so a wire-level change usually t
 - `GatunServer.handleClient` — top-level dispatch (an `if/else if` chain on `cmd.action()`); new actions also need a name in `Metrics.getActionName`
 - `GatunServer.executeCommand` — a second, separate dispatch used only for sub-commands inside `Action.Batch`; an action missing here works standalone but fails in `client.batch()`
 - `src/gatun/client.py` — sync client, plus `BatchContext` if the action should be batchable
-- `src/gatun/async_client.py` — shares value encoding and decoding with the sync client (the `_ValueEncoder` mixin and `_unpack_value_impl` in `client.py`) but has its own `_read_response`, and implements only a subset of the sync API (no `batch`, `cancel`, `reflect`, static-field access, or `send_arrow_buffers` / `get_arrow_data`; it does have `arrow_to_java` / `arrow_from_java`)
+- `src/gatun/async_client.py` — shares value encoding and decoding with the sync client (the `_ValueEncoder` mixin and `_unpack_value_impl` in `client.py`) but has its own `_read_response`, and implements only a subset of the sync API (no `batch`, `cancel`, or `send_arrow_buffers` / `get_arrow_data`; it does have `reflect`, `get_static_field` and `arrow_to_java` / `arrow_from_java`)
 - `PROTOCOL_VERSION` in both `GatunServer.java` and `client.py` for breaking changes
 
 Java-side responsibilities are split: `GatunServer` (dispatch, object/callback registries, allowlist, value packing), `MethodResolver` (overload scoring, varargs), `ReflectionCache` (class/method/field/handle caches), `ArrowMemoryHandler` (Arrow IPC + buffer-descriptor transfer, epoch checks; one instance per session, since the loaded batch points into that session's shared memory), `ResourceLimits` + `SessionQuota` (per-session limits), `observability/` (logging, metrics, JFR).
 
-On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which asks the server (`Action.Reflect`) whether a dotted path is a class, method, or field and caches the answer in a process-global LRU. An `ALL_UPPERCASE` attribute on a capitalized parent is fetched eagerly as a static field.
+On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which asks the server (`Action.Reflect`) whether a dotted path is a class, method, or field and caches the answer in a per-client LRU (`_reflect_cached`; "none" is cached only for a name inside a known class, since a name that is not a class yet may become one). Names starting with `_` raise `AttributeError` without asking. An attribute of a capitalized parent that the server says is a field is fetched eagerly as a static field; spelling does not decide (`Encoders.STRING` is a method, `System.out` a field).
 
 ### Protocol Handshake
 Format: `[4 bytes: version][4 bytes: arena_epoch][8 bytes: memory size][2 bytes: shm_path_len][N bytes: shm_path]`
@@ -109,9 +109,11 @@ The shadow JAR relocates Netty (`gatun.shaded.io.netty`) so it can coexist with 
 - Java 22+ required. 22 is the first release where the Foreign Function & Memory API (`java.lang.foreign`, used to map the shared memory) is final; on 21 it needed `--enable-preview`. The Gradle toolchain and `--release` are pinned to 22 so the JAR runs on 22 and later, and CI runs on 22 to exercise that floor. Do not raise it casually.
 - Python 3.13+ required (3.14 also supported)
 - Arrow memory requires JVM flags: `--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED`
-- Python client uses `weakref.finalize` for automatic Java object cleanup. The finalizer only queues the object ID (`GatunClient._queue_free`); the queue is sent as chunked `FreeObject` commands just before the next request, because a finalizer can fire in the middle of another exchange. Never send on the socket from a finalizer. An explicit `client.free_object(id)` is sent immediately.
+- Both clients use `weakref.finalize` for automatic Java object cleanup (`detach()` opts a handle out). The finalizer only queues the object ID (`GatunClient._queue_free`); the queue is sent as chunked `FreeObject` commands just before the next request, because a finalizer can fire in the middle of another exchange. Never send on the socket from a finalizer. An explicit `client.free_object(id)` is sent immediately.
 - `_build_value` must not make Java calls: the outer command is half-built in a pooled builder and the channel carries one request at a time. Values that need a Java-side object are encoded on the wire instead (see `TemporalVal` for `datetime` / `date` / `time`).
-- Socket path: Generated randomly in `/tmp/gatun_<pid>_<random>.sock` by default
+- Socket path: Generated randomly in `/tmp/gatun_<pid>_<random>.sock` by default. The launcher refuses a fixed `socket_path` that a live server is listening on
+- The launched server runs in its own process group and is passed `-Dgatun.parent.pid`; it exits when that process is gone (`GatunServer.watchParent`), which covers a Python process that was killed
+- A table from `get_arrow_data().table` is built on `pa.py_buffer(memoryview(shm)[...])`, so it holds a buffer export of the mapping and keeps it alive past `close()`. Do not go back to `pa.foreign_buffer` on a raw address there: such a table reads unmapped memory after `close()`
 - Use `T | None` syntax instead of `Optional[T]`
 - No fallback imports (e.g., no `tomli` for older Python)
 
@@ -299,18 +301,29 @@ Workarounds:
 - Use pure Python logic in callbacks (no Java calls)
 - Pre-create any Java objects you need before the callback is invoked
 
+Java may invoke a callback only on the thread running the request, during that request; `GatunServer.invokeCallback` refuses any other thread with `IllegalStateException`. Serving other threads would take more than a lock: each session maps its shared memory with `Arena.ofConfined()`, so no other thread can touch it. Default methods of the interface (`Comparator.reversed()`) run in Java and never reach Python.
+
 ### Request Cancellation
-Cancel long-running requests:
+Cancel the request running on a client, from another thread:
 ```python
 from gatun import CancelledException
 
-request_id = client._get_request_id()
-# ... start long operation in another thread ...
-client.cancel(request_id)  # Returns True on acknowledgement
-
-# Java side can check: GatunServer.checkCancelled() throws InterruptedException
-# Maps to CancelledException in Python
+threading.Timer(0.5, client.cancel).start()
+try:
+    client.jvm.java.lang.Thread.sleep(60_000)   # needs allowed_classes=["java.lang.Thread"]
+except CancelledException:
+    ...
+# client.cancel() returns True if a request was interrupted, False if none was running
 ```
+- The session's channel is busy with the request being cancelled, so `cancel()` opens a short-lived second connection and sends `Action.Cancel` with `target_name` set to the session's SHM path. The server looks the session up in `GatunServer.sessions` and interrupts its thread (`SessionControl.cancel`).
+- The interrupt is delivered only while the thread runs Java code, never during socket I/O (`beginSocketUse` / `endSocketUse`): interrupting a blocked channel read would close the channel. A cancel that arrives during a callback exchange takes effect when the exchange ends.
+- `InterruptedException` maps to `CancelledException`. Java code can poll `GatunServer.checkCancelled()`.
+- Sync client only. With `gatun.limits.max_sessions` reached, the second connection waits two seconds for a slot (`takeSessionSlot`), is refused, and `cancel()` returns False.
+
+### Threads and Connection State
+- The sync client is thread-safe by serialization: `_send_raw` holds `_exchange_lock` (an `RLock`) for the whole exchange, callbacks included. Commands are built before the lock is taken, so the builder pool is per thread (`_get_builder`), and the methods that use the payload zone around their request hold the lock throughout (`@_holding_channel`). Reentrancy is per thread (`_callback_threads`) and per context (`_callback_scopes`, a `ContextVar` that tasks started by a callback inherit; the scope's `active` flag lets a task that outlives its callback call Java). A plain thread started by a sync callback inherits nothing: if the callback waits for it, it waits for the callback timeout.
+- Any `BaseException` that interrupts an exchange after the command was written (timeout, `KeyboardInterrupt`, task cancellation) marks the client dead: the answer is still coming and the next request would read it. A mapped Java exception does not. After `close()` or death, calls raise `DeadConnectionError`.
+- Timeouts of `None`, `0`, negative or `inf` mean no timeout (`_usable_timeout`). `connect()` / `aconnect()` take `socket_timeout` and `callback_timeout`, and use the configured `connect_timeout` for the handshake.
 
 ### is_instance_of
 Check if a Java object is an instance of a class (equivalent to `instanceof`):
@@ -432,7 +445,7 @@ result = client.arrow_from_java(produced)  # pyarrow.Table that owns its data
 produced.close()                          # Java-made tables are the caller's to close
 ```
 - Wire: `Action.ArrowToObject` / `ArrowFromObject`; the table travels as an Arrow IPC stream in the payload zone, located by `arrow_stream` (a `BufferDescriptor`) on `Command` / `Response`. Both clients implement them; they are not batchable.
-- A table made by `arrow_to_java` owns its memory (it does not point into shared memory). `GatunServer.ownedTables` counts the registry entries that refer to it and closes it with the last one, so freeing the handle releases the memory (async handles have no finalizer and must be freed explicitly). It is charged to `max_arrow_bytes` until then, separately from the arena's count, which `reset_payload_arena` clears.
+- A table made by `arrow_to_java` owns its memory (it does not point into shared memory). `GatunServer.ownedTables` counts the registry entries that refer to it and closes it with the last one, so freeing the handle releases the memory. It is charged to `max_arrow_bytes` until then, separately from the arena's count, which `reset_payload_arena` clears.
 - The stream is written after any batch loaded in place by `send_arrow_buffers` (the client tracks its end in `_arrow_loaded_end`; the server refuses an overlapping stream). Any write that reaches the second half of the payload zone, where `ArrowTableView`s point, invalidates them (`GatunClient._note_payload_write`).
 - One transfer must fit in the payload zone; move larger tables in slices.
 - In the async client anything that touches the payload zone runs inside `_send_raw`'s lock (its `prepare` / `finish` hooks), since tasks share one zone.
@@ -633,18 +646,25 @@ client = connect(
 ```
 The same lists can come from `[tool.gatun] allowed_classes` / `allowed_prefixes` in `pyproject.toml` or from `GATUN_ALLOWED_CLASSES` / `GATUN_ALLOWED_PREFIXES` (comma-separated). All sources are combined and added to the built-in list; nothing removes a built-in entry. The launcher passes them to the server as the `gatun.allowlist.classes` / `gatun.allowlist.prefixes` system properties, read once at JVM start.
 
-In tests, pass `allowed_classes` to `connect()` rather than editing the built-in list. The allowlist gates object creation and static method/field access.
+In tests, pass `allowed_classes` to `connect()` rather than editing the built-in list. A nested class may be listed, and named, as `a.b.Outer.Inner` or `a.b.Outer$Inner`.
+
+What the allowlist covers, and what it does not (the README's "What the Allowlist Is and Is Not" is the user-facing version; keep the two in step):
+- It gates object creation and static method/field access by class name (`requireClassAllowed`).
+- Instance members are open on whatever an allowed call returns, except objects of `ClassAllowlist.RESTRICTED_TYPES` (reflection objects, method handles, class loaders, `Runtime`, `Process*`, `Thread`, `Module`), which need their type in `allowed_classes` (`checkInstanceMember`, called at every instance method/field site). `REFUSED_MEMBERS` (`System.exit` / `load` / `loadLibrary`, `Class.newInstance`) are refused whatever is allowed.
+- Class lookup never initializes: `ReflectionCache` loads with `Class.forName(name, false, loader)`, and `Class.forName` called from Python is swapped for `ReflectionCache.classForName` in `CachedMethod`.
+- It is a guardrail, not a sandbox. Allowed prefixes and classpath JARs can do anything, and `GetField` / `SetField` reach non-public fields (`get_fields(sb, ["count"])` relies on that). The trust boundary is the OS user: see Session Isolation.
 
 ### Resource Limits
-Per-session limits (object count, string length, list entries, nesting depth, batch size, Arrow bytes, idle timeout) are defined in `ResourceLimits.java` as `gatun.limits.*` system properties read once at JVM start. Override them per server with `connect(extra_jvm_flags=["-Dgatun.limits.max_objects=5"])`; see `tests/test_resource_limits.py`.
+Per-session limits (object count, string length, list entries, nesting depth, batch size, Arrow bytes, idle timeout) and the server-wide `max_sessions` are defined in `ResourceLimits.java` as `gatun.limits.*` system properties read once at JVM start. An idle session is closed by a reaper thread when its timeout passes; idle time runs from the end of the last request. Override them per server with `connect(extra_jvm_flags=["-Dgatun.limits.max_objects=5"])`; see `tests/test_resource_limits.py`.
 
 ### Session Isolation
+- The trust boundary is the OS user: the socket and every SHM file are `0600`, the server checks the peer's UID on accept (`SO_PEERCRED`), and it creates each SHM file itself (`CREATE_NEW`) after deleting whatever was at that path
 - Each client session gets its own shared memory file (per-client SHM)
-- Multiple clients can connect concurrently without data races
-- Each client session tracks its own object IDs
+- Object IDs come from one server-wide counter, but a session reaches only the IDs it created: every lookup goes through `sessionObject` / `requireSessionObject`, for targets and for `ObjectRef` arguments alike. Use those, never the registry directly, when adding an action
 - Objects are automatically cleaned up when session ends
-- SHM files are deleted when the client disconnects
+- SHM files are deleted when the client disconnects. They are sparse (not zero-filled); the server checks for free space before creating one and refuses the session if there is not enough
 - Double-free attempts are silently ignored
+- Each command is copied out of shared memory before it is read (`commandCopy` in `handleClient`): a callback's answer arrives in the command zone while a batch or `InvokeMethods` request is still being worked through
 
 ## Observability
 
@@ -730,7 +750,7 @@ Each session maintains a ring buffer of the last 64 requests. On errors, recent 
 Configure via `pyproject.toml`:
 ```toml
 [tool.gatun]
-memory = "64MB"
+memory = "64MB"                  # KB/MB/GB, a fraction ("1.5GB") or bytes; minimum 192KB
 socket_path = "/tmp/gatun.sock"  # Optional: fixed path instead of random
 jvm_flags = ["-Xmx512m"]         # Appended to the launcher's default flags
 connect_timeout = 5.0            # seconds

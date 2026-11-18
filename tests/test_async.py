@@ -2,7 +2,9 @@
 
 import pytest
 
+from gatun import JavaException
 from gatun.async_client import AsyncGatunClient, AsyncJavaObject, run_sync
+from gatun.client import DeadConnectionError, SocketTimeoutError
 
 
 @pytest.fixture
@@ -537,3 +539,258 @@ class TestAsyncArrowTransfer:
         )
         result = await async_client.send_arrow_table(table)
         assert "1000 rows" in result
+
+
+class TestAsyncHandlesAreFreed:
+    """A collected handle releases its Java object, as the sync client's does."""
+
+    async def test_collected_object_is_freed_with_the_next_request(self, async_client):
+        import gc
+
+        items = await async_client.create_object("java.util.ArrayList")
+        object_id = items.object_id
+        del items
+        gc.collect()
+
+        assert list(async_client._pending_frees) == [object_id]
+        await async_client.ping()
+        assert not async_client._pending_frees
+        with pytest.raises(JavaException, match="not found"):
+            await async_client.invoke_method(object_id, "size")
+
+    async def test_temporary_wrapper_lives_through_its_own_call(self, async_client):
+        """`await (await make()).size()`: nothing but the pending call refers to
+        the wrapper, and it must not be freed ahead of that call."""
+        import gc
+
+        size = await (await async_client.create_object("java.util.ArrayList")).size()
+        assert size == 0
+
+        add = (await async_client.create_object("java.util.ArrayList")).add
+        gc.collect()
+        assert await add("x") is True
+
+        items = await async_client.create_object("java.util.ArrayList")
+        await items.add("a")
+        assert await (await items.stream()).count() == 1
+
+    async def test_detached_object_is_kept(self, async_client):
+        import gc
+
+        items = await async_client.create_object("java.util.ArrayList")
+        object_id = items.object_id
+        items.detach()
+        del items
+        gc.collect()
+
+        await async_client.ping()
+        assert await async_client.invoke_method(object_id, "size") == 0
+        await async_client.free_object(object_id)
+
+    async def test_object_freed_by_hand_is_not_freed_again(self, async_client):
+        import gc
+
+        items = await async_client.create_object("java.util.ArrayList")
+        async with items:
+            assert await items.size() == 0
+        del items
+        gc.collect()
+
+        assert not async_client._pending_frees
+
+
+class TestAsyncConnectionState:
+    async def test_timeout_leaves_the_client_dead(self):
+        """The late answer is still coming; the next request must not read it."""
+        from gatun import aconnect
+
+        client = await aconnect(
+            memory="16MB", allowed_classes=["java.lang.Thread"], socket_timeout=0.5
+        )
+        try:
+            with pytest.raises(SocketTimeoutError):
+                await client.jvm.java.lang.Thread.sleep(5000)
+            with pytest.raises(DeadConnectionError):
+                await client.ping()
+        finally:
+            await client.close()
+
+    async def test_cancelled_task_leaves_the_client_dead(self):
+        import asyncio
+
+        from gatun import aconnect
+
+        client = await aconnect(memory="16MB", allowed_classes=["java.lang.Thread"])
+        try:
+            task = asyncio.ensure_future(client.jvm.java.lang.Thread.sleep(5000))
+            await asyncio.sleep(0.3)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            with pytest.raises(DeadConnectionError):
+                await client.ping()
+        finally:
+            await client.close()
+
+    async def test_java_exception_leaves_the_client_usable(self, async_client):
+        with pytest.raises(JavaException):
+            await async_client.invoke_static_method(
+                "java.lang.Integer", "parseInt", "not a number"
+            )
+        assert await async_client.ping() is True
+
+    async def test_use_after_close(self, java_gateway):
+        client = AsyncGatunClient(java_gateway.socket_path)
+        assert await client.connect()
+        await client.close()
+        with pytest.raises(DeadConnectionError, match="closed"):
+            await client.ping()
+
+    async def test_failed_connect_keeps_the_reason(self, tmp_path):
+        client = AsyncGatunClient(str(tmp_path / "nothing.sock"))
+        assert await client.connect() is False
+        assert isinstance(client.connect_error, OSError)
+        with pytest.raises(RuntimeError) as exc_info:
+            await AsyncGatunClient(str(tmp_path / "nothing.sock")).__aenter__()
+        assert isinstance(exc_info.value.__cause__, OSError)
+
+    @pytest.mark.parametrize("timeout", [0, float("inf"), None])
+    async def test_values_that_mean_no_timeout(self, java_gateway, timeout):
+        client = AsyncGatunClient(
+            java_gateway.socket_path, socket_timeout=timeout, callback_timeout=timeout
+        )
+        try:
+            assert await client.connect()
+            assert await client.ping() is True
+            doubled = await client.register_callback(
+                lambda value: value * 2, "java.util.function.UnaryOperator"
+            )
+            items = await client.create_object("java.util.ArrayList")
+            await items.add(4)
+            await items.replaceAll(doubled)
+            assert await items.get(0) == 8
+        finally:
+            await client.close()
+
+
+class TestAsyncReentrancy:
+    async def test_other_tasks_are_not_blocked_by_a_callback(self, async_client):
+        """Only the task running the callback is reentrant, not every task."""
+        import asyncio
+
+        outcome = []
+
+        async def slow(a, b):
+            await asyncio.sleep(0.05)
+            return a - b
+
+        async def other():
+            await asyncio.sleep(0.02)
+            outcome.append(await async_client.ping())
+
+        comparator = await async_client.register_callback(slow, "java.util.Comparator")
+        items = await async_client.create_object("java.util.ArrayList")
+        for value in (3, 2, 1):
+            await items.add(value)
+
+        task = asyncio.ensure_future(other())
+        await async_client.invoke_static_method(
+            "java.util.Collections", "sort", items, comparator
+        )
+        await task
+        assert outcome == [True]
+
+    async def test_java_call_from_a_task_the_callback_waits_for(self, async_client):
+        """A helper task the callback awaits is as reentrant as the callback."""
+        import asyncio
+
+        seen = []
+
+        async def helper():
+            try:
+                await async_client.ping()
+            except Exception as e:  # noqa: BLE001 - recorded for the assertion
+                seen.append(type(e).__name__)
+
+        async def delegating(a, b):
+            await asyncio.wait_for(asyncio.gather(helper(), helper()), timeout=5)
+            return 0
+
+        comparator = await async_client.register_callback(
+            delegating, "java.util.Comparator"
+        )
+        items = await async_client.create_object("java.util.ArrayList")
+        await items.add(2)
+        await items.add(1)
+        await async_client.invoke_static_method(
+            "java.util.Collections", "sort", items, comparator
+        )
+        assert seen and set(seen) == {"ReentrancyError"}
+
+    async def test_task_started_by_a_callback_may_call_java_afterwards(
+        self, async_client
+    ):
+        """Queueing work for later is the way to call Java because of a callback."""
+        import asyncio
+
+        outcome = []
+        tasks = []
+        release = asyncio.Event()
+
+        async def later():
+            await release.wait()
+            outcome.append(await async_client.ping())
+
+        async def queueing(a, b):
+            if not tasks:
+                tasks.append(asyncio.ensure_future(later()))
+            return 0
+
+        comparator = await async_client.register_callback(
+            queueing, "java.util.Comparator"
+        )
+        items = await async_client.create_object("java.util.ArrayList")
+        await items.add(2)
+        await items.add(1)
+        await async_client.invoke_static_method(
+            "java.util.Collections", "sort", items, comparator
+        )
+        release.set()
+        await tasks[0]
+        assert outcome == [True]
+
+    async def test_java_call_inside_a_callback_is_refused(self, async_client):
+        seen = []
+
+        async def nested(a, b):
+            try:
+                await async_client.ping()
+            except Exception as e:  # noqa: BLE001 - recorded for the assertion
+                seen.append(type(e).__name__)
+            return 0
+
+        comparator = await async_client.register_callback(
+            nested, "java.util.Comparator"
+        )
+        items = await async_client.create_object("java.util.ArrayList")
+        await items.add(2)
+        await items.add(1)
+        await async_client.invoke_static_method(
+            "java.util.Collections", "sort", items, comparator
+        )
+        assert seen and set(seen) == {"ReentrancyError"}
+
+
+class TestAsyncJvmView:
+    async def test_the_server_decides_what_a_path_is(self, async_client):
+        assert await async_client.reflect("java.util.ArrayList") == "class"
+        assert await async_client.reflect("java.lang.Math.max") == "method"
+        assert await async_client.reflect("java.lang.Integer.MAX_VALUE") == "field"
+
+    async def test_static_field(self, async_client):
+        value = await async_client.get_static_field("java.lang.Integer", "MAX_VALUE")
+        assert value == 2147483647
+
+    async def test_calling_a_field_says_so(self, async_client):
+        with pytest.raises(TypeError, match="static field"):
+            await async_client.jvm.java.lang.Integer.MAX_VALUE()

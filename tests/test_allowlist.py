@@ -262,3 +262,148 @@ class TestValidation:
 
         assert result.returncode != 0
         assert "Invalid entry in gatun.allowlist.prefixes" in result.stderr
+
+
+class TestReflectionIsNotAWayAround:
+    """`java.lang.Class` is allowed, and a Class hands out Methods and loaders."""
+
+    def test_method_object_cannot_be_invoked(self, client):
+        runtime = client.jvm.java.lang.Class.forName("java.lang.Runtime")
+        get_runtime = runtime.getMethod("getRuntime")
+
+        with pytest.raises(JavaSecurityException) as exc_info:
+            get_runtime.invoke(None)
+
+        message = str(exc_info.value)
+        assert "java.lang.reflect.Method" in message
+        assert "allowed_classes" in message
+
+    def test_constructor_object_cannot_be_used(self, client):
+        builder = client.jvm.java.lang.Class.forName("java.lang.ProcessBuilder")
+        constructors = builder.getConstructors()
+
+        with pytest.raises(JavaSecurityException, match="Constructor"):
+            client.jvm.java.lang.reflect.Array.get(constructors, 0).newInstance()
+
+    def test_class_loader_cannot_be_used(self, client):
+        own_class = client.jvm.java.lang.Class.forName("org.gatun.server.GatunServer")
+        loader = own_class.getClassLoader()
+
+        with pytest.raises(JavaSecurityException, match="ClassLoader"):
+            loader.loadClass("java.lang.Runtime")
+
+    def test_class_cannot_be_instantiated_by_reflection(self, client):
+        builder = client.jvm.java.lang.Class.forName("java.lang.ProcessBuilder")
+        with pytest.raises(JavaSecurityException, match="newInstance is not allowed"):
+            builder.newInstance()
+
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [("exit", (0,)), ("load", ("/tmp/x.dylib",)), ("loadLibrary", ("x",))],
+    )
+    def test_system_methods_that_reach_outside_are_refused(self, client, method, args):
+        with pytest.raises(JavaSecurityException, match=f"System.{method}"):
+            client.invoke_static_method("java.lang.System", method, *args)
+        assert client.ping() is True
+
+    def test_other_system_methods_still_work(self, client):
+        assert client.jvm.java.lang.System.currentTimeMillis() > 0
+        client.jvm.java.lang.System.setProperty("gatun.test.property", "1")
+        assert client.jvm.java.lang.System.getProperty("gatun.test.property") == "1"
+
+    def test_reflection_objects_can_still_be_passed_around(self, client):
+        """Only using one from Python is refused; Java code may be handed one."""
+        size = client.jvm.java.lang.Class.forName("java.util.ArrayList").getMethod(
+            "size"
+        )
+        described = client.jvm.java.lang.String.valueOf(size)
+        assert described == "public int java.util.ArrayList.size()"
+
+    def test_looking_a_class_up_does_not_initialize_it(self, compile_java):
+        """Naming a class must not run its static initializer.
+
+        It used to: any class on the classpath could be made to run code, allowed
+        or not, by asking what it was or by calling `Class.forName` on it.
+        """
+        classes = compile_java(
+            "Loud",
+            "public class Loud {\n"
+            '  static { System.setProperty("gatun.test.loud", "ran"); }\n'
+            '  public static String hello() { return "hello"; }\n'
+            "}\n",
+        )
+
+        client = connect(memory="16MB", classpath=[classes])
+        try:
+            System = client.jvm.java.lang.System
+            assert client.reflect("Loud") == "class"
+            assert client.reflect("Loud.hello") == "method"
+            found = client.jvm.java.lang.Class.forName("Loud")
+            assert found.getName() == "Loud"
+            # Through an instance, and asking for initialization outright
+            loader = found.getClassLoader()
+            assert found.forName("Loud", True, loader).getName() == "Loud"
+            with pytest.raises(JavaSecurityException, match="Class not allowed"):
+                client.invoke_static_method("Loud", "hello")
+            assert System.getProperty("gatun.test.loud") is None
+        finally:
+            client.close()
+
+        # Allowed and used, it is initialized as usual
+        client = connect(memory="16MB", classpath=[classes], allowed_classes=["Loud"])
+        try:
+            assert client.invoke_static_method("Loud", "hello") == "hello"
+            assert client.jvm.java.lang.System.getProperty("gatun.test.loud") == "ran"
+        finally:
+            client.close()
+
+    def test_restricted_type_can_be_allowed(self):
+        client = connect(memory="16MB", allowed_classes=["java.lang.reflect.Method"])
+        try:
+            size = client.jvm.java.lang.Class.forName("java.util.ArrayList").getMethod(
+                "size"
+            )
+            assert size.getName() == "size"
+            items = client.jvm.java.util.ArrayList()
+            items.add("a")
+            assert size.invoke(items) == 1
+        finally:
+            client.close()
+
+    def test_thread_objects_need_allowing(self):
+        client = connect(memory="16MB", allowed_classes=["java.lang.Thread"])
+        try:
+            thread = client.jvm.java.lang.Thread.currentThread()
+            assert thread.isAlive() is True
+        finally:
+            client.close()
+
+
+class TestNestedClasses:
+    def test_nested_class_by_its_source_name(self):
+        client = connect(
+            memory="16MB", allowed_classes=["java.util.AbstractMap.SimpleEntry"]
+        )
+        try:
+            entry = client.jvm.java.util.AbstractMap.SimpleEntry("k", 1)
+            assert entry.getKey() == "k"
+            assert client.reflect("java.util.AbstractMap.SimpleEntry") == "class"
+        finally:
+            client.close()
+
+    def test_nested_class_by_its_binary_name(self):
+        client = connect(
+            memory="16MB", allowed_classes=["java.util.AbstractMap$SimpleEntry"]
+        )
+        try:
+            entry = client.create_object("java.util.AbstractMap$SimpleEntry", "k", 1)
+            assert entry.getValue() == 1
+            # Allowed under one spelling means allowed under the other
+            entry = client.jvm.java.util.AbstractMap.SimpleEntry("k", 2)
+            assert entry.getValue() == 2
+        finally:
+            client.close()
+
+    def test_nested_class_is_refused_unless_allowed(self, client):
+        with pytest.raises(JavaSecurityException, match="Class not allowed"):
+            client.jvm.java.util.AbstractMap.SimpleEntry("k", 1)

@@ -309,6 +309,33 @@ async def main():
 asyncio.run(main())
 ```
 
+Java may call a callback only on the thread that is running your request, while that request is running. A callback handed to another Java thread (an executor, `CompletableFuture.runAsync`) fails there with an `IllegalStateException`: the client has one channel, and it is busy with the request. A callback cannot call Java either (`ReentrancyError`), and neither can a task it awaits. In the sync client, do not make a callback wait for another *thread* that calls Java on the same client: that thread waits for the request to finish, and the request is waiting for the callback. The callback timeout ends the wait with `CallbackTimeoutError`; with `callback_timeout=None` nothing does. Work queued by a callback and run after the request is fine.
+
+### Cancelling a Request
+
+`client.cancel()` interrupts the request that is running on the client, from another thread:
+
+```python
+import threading
+from gatun import CancelledException, connect
+
+client = connect(allowed_classes=["java.lang.Thread"])
+
+threading.Timer(0.5, client.cancel).start()
+try:
+    client.jvm.java.lang.Thread.sleep(60_000)
+except CancelledException:
+    print("cancelled")
+
+client.ping()  # the client is still usable
+```
+
+It works by interrupting the Java thread, so it stops code that responds to interruption (blocking calls, `GatunServer.checkCancelled()`), and returns `False` when nothing was running. A request that never checks for interruption runs to its end. `cancel()` makes a short connection of its own, so on a server with `gatun.limits.max_sessions` set it needs a free slot.
+
+### Threads
+
+A `GatunClient` can be shared between threads. Requests are serialized: one runs at a time, and the others wait. For parallel work, give each thread its own client (`GatunClient(client.socket_path)` connects another session to the same server).
+
 ### Type Checking with is_instance_of
 
 ```python
@@ -849,6 +876,19 @@ export GATUN_MEMORY=64MB
 export GATUN_SOCKET_PATH=/tmp/gatun.sock
 ```
 
+`memory` takes `KB` / `MB` / `GB` (or `K` / `M` / `G`), a fraction such as `"1.5GB"`, or a number of bytes; the minimum is 192KB. With a fixed `socket_path`, launching fails if a live server is already listening there.
+
+Timeouts are per client:
+
+```python
+client = connect(
+    socket_timeout=120.0,   # seconds to wait for a response (default 30)
+    callback_timeout=None,  # seconds a callback may run (default 30); None, 0 or inf: no limit
+)
+```
+
+After a timeout the client is dead (`DeadConnectionError` on the next call): the late answer is still on its way and would be read as the next request's. Connect a new client.
+
 ### Allowing Your Own Classes
 
 The server only lets a client create objects of, or call static members on, allowlisted classes. The built-in list covers common JDK collections, strings and boxed types, plus `org.apache.spark.`, `org.apache.log4j.` and `scala.`. Anything else raises `JavaSecurityException` until you allow it:
@@ -877,6 +917,23 @@ allowed_prefixes = ["com.example"]
 ```bash
 export GATUN_ALLOWED_PREFIXES=com.example,org.acme
 ```
+
+A nested class is named either way: `java.util.AbstractMap.SimpleEntry` or `java.util.AbstractMap$SimpleEntry`.
+
+### What the Allowlist Is and Is Not
+
+The server trusts the operating-system user it runs as, and nobody else:
+
+- Its socket and shared memory files are owner-only (`0600`), and it refuses connections from other users.
+- Each session reaches only the objects it created. Another session cannot call, read, free or pass an object by guessing its ID.
+
+Inside that boundary, the allowlist is a guardrail against accidents and against class names that come from somewhere you do not control. It is not a sandbox:
+
+- It decides which classes can be instantiated and which static members can be used. Instance methods are open on whatever an allowed call returns, with these exceptions: objects that would undo the list (`java.lang.reflect.Method` / `Constructor` / `Field`, method handles, class loaders, `Runtime`, `Process`, `ProcessBuilder`, `Thread`, `Module`) cannot be used from Python unless you put their type in `allowed_classes`, and `System.exit`, `System.load`, `System.loadLibrary` and `Class.newInstance` are always refused.
+- Naming a class does not run its static initializer, and neither does `Class.forName` called from Python. A class is initialized when something allowed first uses it.
+- Anything you allow can do what it does. The built-in `org.apache.spark.` and `scala.` prefixes, and any JAR you add, include classes that read files and start processes. Field access (`get_field`, `get_fields`) reaches non-public fields.
+
+Do not expose a Gatun socket to code or users you do not trust with the JVM.
 
 ## Supported Types
 

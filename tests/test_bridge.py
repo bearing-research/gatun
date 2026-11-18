@@ -368,6 +368,8 @@ def test_gatun_adapter_passes_classpath(monkeypatch):
         classpath=["/a.jar", "/b.jar"],
         allowed_classes=["com.example.Thing"],
         allowed_prefixes=["com.example.lib"],
+        socket_timeout=120.0,
+        callback_timeout=None,
     )
 
     assert seen == {
@@ -375,4 +377,6 @@ def test_gatun_adapter_passes_classpath(monkeypatch):
         "classpath": ["/a.jar", "/b.jar"],
         "allowed_classes": ["com.example.Thing"],
         "allowed_prefixes": ["com.example.lib"],
+        "socket_timeout": 120.0,
+        "callback_timeout": None,
     }

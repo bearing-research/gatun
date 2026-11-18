@@ -274,7 +274,9 @@ public class Metrics {
       long total = totalCount.sum();
       if (total == 0) return 0;
 
-      long target = (long) (total * percentile);
+      // The rank of the sample to report, at least the first: truncating gave rank 0 for small
+      // counts, which the empty first bucket already satisfied
+      long target = Math.max(1, (long) Math.ceil(total * percentile));
       long cumulative = 0;
 
       for (int i = 0; i < buckets.length; i++) {

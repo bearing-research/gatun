@@ -169,3 +169,13 @@ def test_nested_array_argument(client):
         element_type="Object",
     )
     assert client.jvm.java.util.Arrays.deepToString(nested) == "[[1, 2], [3, 4]]"
+
+
+def test_map_with_a_list_key(client):
+    """A Java List is a fine map key; a Python list is not hashable."""
+    by_pair = client.jvm.java.util.HashMap()
+    by_pair.put([1, 2], "pair")
+    by_pair.put("plain", "text")
+
+    copy = client.invoke_method(by_pair.object_id, "clone")
+    assert copy == {(1, 2): "pair", "plain": "text"}

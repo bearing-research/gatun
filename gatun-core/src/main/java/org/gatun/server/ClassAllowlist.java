@@ -3,6 +3,7 @@ package org.gatun.server;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -62,11 +63,38 @@ final class ClassAllowlist {
           "scala." // Scala standard library
           );
 
+  // Instances of these types can load any class or run any code, whatever the list above says:
+  // obj.getClass().getMethod(...).invoke(...) reaches java.lang.Runtime in three calls. Their
+  // methods and fields are usable only when the type itself has been allowed.
+  private static final List<Class<?>> RESTRICTED_TYPES =
+      List.of(
+          java.lang.reflect.AccessibleObject.class, // Method, Constructor, Field
+          java.lang.invoke.MethodHandle.class,
+          java.lang.invoke.VarHandle.class,
+          java.lang.invoke.MethodHandles.Lookup.class,
+          ClassLoader.class,
+          Module.class,
+          ModuleLayer.class,
+          Runtime.class,
+          ProcessBuilder.class,
+          Process.class,
+          ProcessHandle.class,
+          Thread.class,
+          ThreadGroup.class);
+
+  // Members of allowed classes that stay refused: they end the server for every session, load
+  // native code, or create an object of a class that was never checked.
+  private static final Map<String, Set<String>> REFUSED_MEMBERS =
+      Map.of(
+          "java.lang.System", Set.of("exit", "load", "loadLibrary"),
+          "java.lang.Class", Set.of("newInstance"));
+
   // A dotted Java name: identifiers separated by single dots ('$' covers nested classes)
   private static final Pattern QUALIFIED_NAME =
       Pattern.compile("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*");
 
   private final Set<String> classes;
+  private final Set<String> dottedClasses; // the same names with '$' written as '.'
   private final List<String> prefixes;
 
   ClassAllowlist(List<String> extraClasses, List<String> extraPrefixes) {
@@ -83,6 +111,11 @@ final class ClassAllowlist {
       }
     }
     this.classes = Set.copyOf(allClasses);
+    Set<String> dotted = new HashSet<>();
+    for (String className : allClasses) {
+      dotted.add(className.replace('$', '.'));
+    }
+    this.dottedClasses = Set.copyOf(dotted);
     this.prefixes = List.copyOf(allPrefixes);
   }
 
@@ -97,7 +130,8 @@ final class ClassAllowlist {
     if (className == null) {
       return false;
     }
-    if (classes.contains(className)) {
+    // A nested class may be named with a dot or with the '$' of its binary name
+    if (classes.contains(className) || dottedClasses.contains(className.replace('$', '.'))) {
       return true;
     }
     for (String prefix : prefixes) {
@@ -107,6 +141,57 @@ final class ClassAllowlist {
     }
     return false;
   }
+
+  /** Refuse a static method or field that stays off limits even though its class is allowed. */
+  void checkStaticMember(String className, String member) {
+    Set<String> refused = REFUSED_MEMBERS.get(className);
+    if (refused != null && refused.contains(member)) {
+      throw new SecurityException(className + "." + member + " is not allowed");
+    }
+  }
+
+  /**
+   * Refuse a method call or field access on an object the allowlist has to cover even though no
+   * class name was given: instance members are otherwise open, because the objects a permitted call
+   * returns can be of any class.
+   */
+  void checkInstanceMember(Object target, String member) {
+    Class<?> type = target.getClass();
+    String restricted = restrictedTypes.get(type);
+    if (!restricted.isEmpty()) {
+      throw new SecurityException(
+          "Objects of type "
+              + type.getName()
+              + " cannot be used from Python unless "
+              + restricted
+              + " is allowed. To allow it, pass allowed_classes to connect() or set the "
+              + CLASSES_PROPERTY
+              + " system property.");
+    }
+    checkStaticMember(type.getName(), member);
+  }
+
+  // The name to allow for a class whose instances are restricted, or "" if they are not. Cached
+  // per class: this runs on every method call.
+  private final ClassValue<String> restrictedTypes =
+      new ClassValue<>() {
+        @Override
+        protected String computeValue(Class<?> type) {
+          for (Class<?> restricted : RESTRICTED_TYPES) {
+            if (restricted.isAssignableFrom(type)) {
+              if (isAllowed(restricted.getName()) || isAllowed(type.getName())) {
+                return "";
+              }
+              // A Method is allowed by its own name; a class loader or thread by the public
+              // type, since the concrete class is often internal
+              return restricted == java.lang.reflect.AccessibleObject.class
+                  ? type.getName()
+                  : restricted.getName();
+            }
+          }
+          return "";
+        }
+      };
 
   /** What was added to the built-in list, for the startup log. */
   String describeAdditions() {

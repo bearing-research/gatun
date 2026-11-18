@@ -16,12 +16,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Arrow memory architecture documentation
 - `client.arrow_to_java(table)` and `client.arrow_from_java(obj)`, on both clients. A sent table becomes an `org.apache.arrow.vector.VectorSchemaRoot` object that any Java method can receive, and any `VectorSchemaRoot` the JVM holds, including one Java code produced, can be fetched as a `pyarrow.Table`. Before this, sent Arrow data could only be read back by the client that sent it
 - `allowed_classes` and `allowed_prefixes` arguments to `connect()`, `aconnect()`, `launch_gateway()` and `GatunAdapter`, also settable in `pyproject.toml` and through `GATUN_ALLOWED_CLASSES` / `GATUN_ALLOWED_PREFIXES`. Using a library outside the built-in allowlist no longer needs a source edit and a rebuild
+- `socket_timeout` and `callback_timeout` arguments to `connect()`, `aconnect()` and `GatunAdapter`; the handshake uses the configured `connect_timeout`
+- `gatun.limits.max_sessions` caps the sessions a server serves at once (default: unlimited). A connection that arrives while every slot is taken waits up to two seconds for one before it is refused
+- The async client has `reflect()` and `get_static_field()`, and its JVM view asks the server whether a path is a class or a static method instead of guessing from the spelling
+- Nested classes can be named the way Java source names them (`client.jvm.java.util.AbstractMap.SimpleEntry`), in the JVM view and in the allow lists
+- `memory` accepts `K` / `M` / `G` suffixes, fractions (`"1.5GB"`), a byte count, or an int
 
 ### Changed
 - Protocol version is now 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together
 - The async client accepts `datetime` / `date` / `time` arguments
 - Executing a batch from inside a callback raises `ReentrancyError`, like any other call
 - Connecting no longer writes zeros over the whole shared memory file: about 7 ms instead of 260 ms at 64MB, and no longer proportional to the memory size. Disk (or tmpfs) pages are now allocated as they are first used rather than all at connect time
+- **`client.cancel()` takes no arguments and interrupts the session's running request** from another thread. The old `cancel(request_id)` could not work: it queued behind the request it was meant to stop. `_get_request_id()` is gone. A cancelled request raises `CancelledException`, and the session stays usable
+- Objects belong to the session that created them. Another session that guesses an object ID gets "not found", whether it uses the ID as a target or as an argument
+- The server's socket and its shared memory files are readable and writable by their owner only, the server refuses connections from other users, and it creates each shared memory file itself rather than mapping whatever exists at that path
+- Reflection is no longer a way around the class allowlist: objects of `java.lang.reflect.Method` / `Constructor` / `Field`, method handles, class loaders, `Runtime`, `Process*`, `Thread` and `Module` cannot be used from Python unless their type is listed in `allowed_classes`; `System.exit`, `System.load`, `System.loadLibrary` and `Class.newInstance` are refused outright; and naming a class, or calling `Class.forName` on it, no longer runs its static initializer
+- A stale or foreign `JavaObject` passed as an argument is an error; it used to arrive in Java as `null`
+- A type hint that names an unknown class is an error; it used to be ignored
+- A Python list of ints becomes a Java list of all `Integer` or all `Long`, never a mix decided value by value
+- Python callbacks may only be invoked on the thread running the request, during that request. Java code that calls one from another thread gets an `IllegalStateException` instead of corrupting the request in progress
+- The sync client can be shared between threads: requests are serialized, one at a time, and each thread builds its commands in its own buffers. Reentrancy is tracked per thread and per context, so a callback's own thread, and tasks it starts and waits for, are refused, while unrelated threads and tasks wait their turn. A sync callback that waits for another thread calling Java on the same client waits until its callback timeout
+- A client used after `close()` raises `DeadConnectionError` rather than failing somewhere inside the transport
+- Async `JavaObject` handles are freed when garbage-collected, like sync ones; `detach()` opts out
+- The reflection cache behind `client.jvm` belongs to each client instead of the process, and names that did not resolve are asked again
+- `send_arrow_table()` accepts a table with no rows ("Received 0 rows"); it used to fail with "Arrow Stream Empty"
+- `send_arrow_buffers()` refuses an arena that is not the client's own (`client.get_payload_arena()`), and rejects view types (`string_view`, `list_view`), run-end-encoded and dictionary columns up front; extension types travel as their storage
+- `JavaArray(element_type=...)` rejects unknown element types instead of sending them as `Object[]`
+- The launched server runs in its own process group, exits when the Python process that launched it is gone, and `launch_gateway()` refuses a fixed `socket_path` that a live server is already using
+- Connecting checks that the filesystem has room for the whole shared memory file and refuses the session if not, with the reason in the error. The file is still sparse, so this is a check and not a reservation: it catches a disk that cannot hold the file, not several sessions that later fill it between them
 
 ### Fixed
 - `pytest` no longer collects tests from an extracted Spark distribution (`testpaths`)
@@ -54,6 +76,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Concurrent `send_arrow_table()` calls on one async client no longer overwrite each other's data: the payload zone is written only once the request holds the channel
 - A table from `get_arrow_data()` raises `StaleArenaError` once a later transfer has written over the memory it points at (a larger send, or a newer `get_arrow_data()`), instead of returning that transfer's bytes
 - `GatunAdapter(classpath=...)` passes the classpath on
+- A callback made during a batch, `invoke_methods()` or `create_objects()` no longer corrupts the rest of that request: the server reads each command from a private copy, since the callback's answer arrives in the same memory
+- Callbacks in a batch are served; they used to deadlock the batch
+- A table from `get_arrow_data().table` stays valid after `client.close()`: it now keeps the shared memory mapped for as long as it is alive, instead of pointing at unmapped memory
+- `Float.valueOf(1.5)`, `Short.valueOf(7)` and other methods taking `float`, `short` or `byte` can be called with Python floats and ints (range-checked); a `TypeHint` converts the value as well as choosing the overload
+- `list.stream().count()` and other no-argument methods on objects of non-public classes work; static no-argument methods can be called through an instance
+- An array passed for a varargs parameter is used as the varargs array (`String.format("%s-%s", JavaArray(["a", "b"]))`)
+- Overloads that score equally are chosen by specificity, not by the order reflection lists them in, and a boxed argument prefers a reference parameter over a primitive one (`list.remove(TypeHint(5, "java.lang.Integer"))` removes the value 5)
+- Interface default methods on a callback proxy (`comparator.reversed()`, `predicate.negate()`) run as Java wrote them instead of being sent to Python
+- A callback that returns `None` or the wrong type for a primitive return type is reported as such; int results are widened for `long` / `double` methods
+- Callback arguments or results too large for the channel produce an error instead of a dead connection
+- A Ctrl-C, timeout or task cancellation in the middle of an exchange marks the client dead instead of letting the next request read the previous answer; the async client had no such protection at all
+- `socket_timeout=0`, negative values and `float("inf")` mean "no timeout"; they used to fail every read or raise inside the socket
+- A failed `connect()` keeps the reason (`client.connect_error`), and `connect()` / `with GatunClient(...)` raise with it as the cause
+- A batch that could not be sent can be executed again, and results of a batch that failed as a whole say so
+- Maps with `List` keys can be returned (the keys become tuples)
+- The server answers a malformed command, an unknown action and a self-containing collection with an error instead of a success, a dropped connection or a stack overflow; long stack traces are shortened to fit the response zone, frame by frame, so every `Caused by` line survives
+- An idle session is closed when its timeout passes, not when its next request arrives, and that request gets an error naming the timeout. Idle time is counted from the end of the last request, so a request longer than the timeout no longer ends its own session
+- The accept loop survives a failed `accept()` (too many open files, for example)
+- Metrics percentiles for a single sample no longer read from an empty bucket
+- The server's reflection caches no longer take a lock on every lookup; they could also corrupt their own ordering under concurrent sessions
+- Arrow buffer transfer handles sliced nested columns, unions, null columns, tables with no chunks, and all-empty string columns; `arrow_context().receive()` keeps the schema (metadata, nullability)
+- `send_arrow_table_batched()` sizes batches from the whole table and splits a batch that still does not fit, instead of sizing from the first 100 rows
+- A failed `reset_payload_arena()` no longer leaves the client's epoch ahead of the server's
+- The launcher reaps a server it had to kill, leaves ignored signals ignored, does not stop the parent's server from a forked child, keeps only a tail of the server's output, drains that output during startup, and stops the server when startup times out or is interrupted
+- `client.jvm.Encoders.STRING()`-style uppercase static methods and lowercase static fields (`System.out`) resolve by what they are, not how they are spelled
 
 ## [0.2.1] - 2026-01-17
 

@@ -20,9 +20,12 @@ Example using run_sync with existing sync client:
 
 import asyncio
 import inspect
+import logging
 import mmap
 import os
 import struct
+import weakref
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -38,20 +41,32 @@ from gatun.client import (
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
     HANDSHAKE_TIMEOUT,
+    MAX_CALLBACK_ERROR_SIZE,
     PROTOCOL_VERSION,
     RESPONSE_ZONE_SIZE,
     CallbackTimeoutError,
+    DeadConnectionError,
+    JavaException,
     JavaObject,
     PayloadTooLargeError,
     ProtocolDesyncError,
+    ReentrancyError,
     SocketTimeoutError,
     _arrow_ipc_stream,
+    _build_free_command,
     _close_shared_memory,
+    _enter_callback,
+    _exit_callback,
     _finish_arrow_from_object,
     _finish_arrow_to_object,
+    _in_callback_of,
+    _LRUCache,
     _raise_java_exception_impl,
     _read_arrow_stream,
+    _remember_reflection,
+    _take_free_chunk,
     _unpack_value_impl,
+    _usable_timeout,
     _ValueEncoder,
     _write_arrow_stream,
 )
@@ -65,6 +80,8 @@ from gatun.generated.org.gatun.protocol import (
     ObjectSpec,
     Response,
 )
+
+logger = logging.getLogger(__name__)
 
 # Default thread pool for run_sync
 _default_executor: ThreadPoolExecutor | None = None
@@ -124,20 +141,28 @@ class AsyncJavaObject:
     def __init__(self, client: "AsyncGatunClient", object_id: int):
         self._client = client
         self.object_id = object_id
+        # A finalizer cannot await, so it only queues the ID; the client sends
+        # the queue ahead of its next request
+        self._finalizer = weakref.finalize(self, client._queue_free, object_id)
 
     def __getattr__(self, name: str):
         """Return an async method invoker for the given name."""
         if name.startswith("_"):
             raise AttributeError(name)
-        return _AsyncMethodInvoker(self._client, self.object_id, name)
+        return _AsyncMethodInvoker(self, name)
 
     def __repr__(self):
         return f"<AsyncJavaObject id={self.object_id}>"
+
+    def detach(self) -> None:
+        """Keep the Java object alive after this wrapper is garbage collected."""
+        self._finalizer.detach()
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._finalizer.detach()
         await self._client.free_object(self.object_id)
         return False
 
@@ -145,14 +170,17 @@ class AsyncJavaObject:
 class _AsyncMethodInvoker:
     """Callable that invokes a method asynchronously on a Java object."""
 
-    def __init__(self, client: "AsyncGatunClient", object_id: int, method_name: str):
-        self._client = client
-        self._object_id = object_id
+    def __init__(self, target: AsyncJavaObject, method_name: str):
+        # The wrapper itself, not just its ID: in `await (await make()).size()`
+        # this is the only reference left to the wrapper, and a collected wrapper
+        # frees its Java object ahead of the very call being made on it
+        self._target = target
         self._method_name = method_name
 
     async def __call__(self, *args):
-        return await self._client.invoke_method(
-            self._object_id, self._method_name, *args
+        target = self._target
+        return await target._client.invoke_method(
+            target.object_id, self._method_name, *args
         )
 
 
@@ -183,21 +211,20 @@ class AsyncJavaClass:
         return AsyncJavaClass(self._client, f"{self._path}.{name}")
 
     async def __call__(self, *args):
-        # Determine if this is a constructor or static method call
-        parts = self._path.split(".")
-        if parts[-1][0].islower():
-            # Static method call
-            last_dot = self._path.rfind(".")
-            if last_dot == -1:
+        # The server says whether the path is a class or a static method. The
+        # spelling only decides when it cannot tell (a class that will not load,
+        # which create_object then reports properly).
+        kind = await self._client._reflect_cached(self._path)
+        class_name, _, member = self._path.rpartition(".")
+        if kind == "field":
+            raise TypeError(f"{self._path} is a static field, not a method")
+        if kind == "none":
+            kind = "method" if class_name and member[:1].islower() else "class"
+        if kind == "method":
+            if not class_name:
                 raise ValueError(f"Invalid method path: {self._path}")
-            class_name = self._path[:last_dot]
-            method_name = self._path[last_dot + 1 :]
-            return await self._client.invoke_static_method(
-                class_name, method_name, *args
-            )
-        else:
-            # Constructor call
-            return await self._client.create_object(self._path, *args)
+            return await self._client.invoke_static_method(class_name, member, *args)
+        return await self._client.create_object(self._path, *args)
 
     def __repr__(self):
         return f"<AsyncJVM {self._path}>"
@@ -257,9 +284,9 @@ class AsyncGatunClient(_ValueEncoder):
             None  # Set during connect() from server handshake
         )
         # None disables the corresponding timeout
-        self.callback_timeout = callback_timeout
-        self.socket_timeout = socket_timeout
-        self.handshake_timeout = handshake_timeout
+        self.callback_timeout = _usable_timeout(callback_timeout)
+        self.socket_timeout = _usable_timeout(socket_timeout)
+        self.handshake_timeout = _usable_timeout(handshake_timeout)
         # Server process launched for this client by aconnect(); stopped on close()
         self._server_session: Any = None
 
@@ -278,9 +305,25 @@ class AsyncGatunClient(_ValueEncoder):
         self._jvm: AsyncJVMView | None = None
         self._callbacks: dict[int, Callable[..., Any]] = {}
 
-        # Reentrancy detection - tracks if we're inside a callback
-        # Nested Java calls from callbacks would deadlock
-        self._in_callback: bool = False
+        # Tasks that are running a callback. A Java call from one of them would
+        # wait for a channel that is waiting for it. Other tasks are unaffected:
+        # they queue on the lock like any other request.
+        self._callback_tasks: set[asyncio.Task[Any]] = set()
+
+        # Set once an exchange was abandoned midway (timeout, cancellation, bad
+        # response). Its reply may still arrive, and the next request would take
+        # it for its own, so the connection is not used again.
+        self._dead = False
+        self._closed = False
+        # Why the last connect() failed, for callers that report it
+        self.connect_error: BaseException | None = None
+
+        # IDs of collected AsyncJavaObjects, released ahead of the next request
+        self._pending_frees: deque[int] = deque()
+        self._free_builder = flatbuffers.Builder(64)
+
+        # What the server said each dotted path is (class, method, field)
+        self._reflect_cache: _LRUCache[str] = _LRUCache(1024)
 
     @property
     def jvm(self) -> AsyncJVMView:
@@ -345,9 +388,36 @@ class AsyncGatunClient(_ValueEncoder):
             self.shm_file = open(self.memory_path, "r+b")  # noqa: ASYNC230, SIM115
             self.shm = mmap.mmap(self.shm_file.fileno(), self.memory_size)
 
+            self.connect_error = None
             return True
-        except Exception:  # noqa: BLE001 - connect() reports every failure as False
+        except Exception as e:  # noqa: BLE001 - connect() reports every failure as False
+            logger.error("Connection failed: %s", e)
+            self.connect_error = e
             return False
+
+    def _queue_free(self, object_id: int) -> None:
+        """Queue a Java object for release. Called by AsyncJavaObject finalizers."""
+        if not self._dead and not self._closed:
+            self._pending_frees.append(object_id)
+
+    def _mark_dead(self) -> None:
+        """Stop using the connection after an exchange was abandoned midway."""
+        if self._dead:
+            return
+        self._dead = True
+        self._pending_frees.clear()
+        writer, self._writer = self._writer, None
+        self._reader = None
+        if writer is not None:
+            try:
+                writer.close()
+            except (OSError, RuntimeError):
+                pass  # already closed, or its event loop is gone
+
+    @property
+    def _in_callback(self) -> bool:
+        """Whether a callback is running, in any task."""
+        return bool(self._callback_tasks)
 
     async def _send_raw(
         self,
@@ -365,11 +435,18 @@ class AsyncGatunClient(_ValueEncoder):
         another task's request can run before the lock is taken or after it is
         released, and it uses the same zone.
         """
-        # Check for reentrancy - nested calls from callbacks would deadlock
-        # Exception: CallbackResponse is sent during callback handling
-        if self._in_callback and expects_response:
-            from gatun.client import ReentrancyError
-
+        if self._closed:
+            raise DeadConnectionError("Client is closed. Create a new client.")
+        if self._dead:
+            raise DeadConnectionError(
+                "Connection is dead after a timeout, cancellation or protocol "
+                "error. Create a new client."
+            )
+        # A call from a callback would deadlock: from the task running it, or from
+        # a task it started and may be waiting for (gather, create_task)
+        if expects_response and (
+            asyncio.current_task() in self._callback_tasks or _in_callback_of(self)
+        ):
             raise ReentrancyError(
                 "Cannot call Java from within a callback. "
                 "Nested calls would deadlock because the original request is still waiting. "
@@ -377,23 +454,50 @@ class AsyncGatunClient(_ValueEncoder):
             )
 
         async with self._lock:
+            if self._dead or self._writer is None:
+                raise DeadConnectionError("Connection is closed. Create a new client.")
             max_command_size = self.payload_offset
             if len(data) > max_command_size:
                 raise PayloadTooLargeError(len(data), max_command_size, "Command")
+
+            # Release objects whose wrappers were garbage collected
+            while self._pending_frees:
+                ids = _take_free_chunk(self._pending_frees)
+                if not ids:
+                    break
+                try:
+                    await self._exchange(_build_free_command(self._free_builder, ids))
+                except JavaException as e:
+                    logger.debug("FreeObject for %d objects failed: %s", len(ids), e)
+
             if prepare is not None:
                 prepare()
+            response = await self._exchange(data, wait_for_response)
+            if wait_for_response:
+                return finish(response) if finish is not None else response
 
-            # Write to shared memory (sync - mmap doesn't have async API)
-            self.shm.seek(self.command_offset)
-            self.shm.write(data)
+    async def _exchange(self, data: bytes, wait_for_response: bool = True):
+        """One command and its response. The caller holds the lock."""
+        assert self.shm is not None and self._writer is not None
+        # Write to shared memory (sync - mmap doesn't have async API)
+        self.shm.seek(self.command_offset)
+        self.shm.write(data)
 
+        try:
             # Signal Java
             self._writer.write(struct.pack("<I", len(data)))
             await self._writer.drain()
-
-            if wait_for_response:
-                response = await self._read_response()
-                return finish(response) if finish is not None else response
+            if not wait_for_response:
+                return None
+            return await self._read_response()
+        except JavaException:
+            raise  # a complete response that happens to be an error
+        except BaseException as e:
+            # Whatever else ends the exchange (a timeout, the task being
+            # cancelled, a closed socket) leaves a reply that may still arrive
+            if not getattr(e, "_gatun_complete", False):
+                self._mark_dead()
+            raise
 
     async def _read_response(self):
         """Read and parse response from the server.
@@ -448,7 +552,14 @@ class AsyncGatunClient(_ValueEncoder):
                     if error_type_bytes
                     else "java.lang.RuntimeException"
                 )
-                _raise_java_exception_impl(error_type, error_msg)
+                try:
+                    _raise_java_exception_impl(error_type, error_msg)
+                except Exception as e:
+                    # Not every server error maps to a JavaException subclass
+                    # (PayloadTooLargeError, CancelledException); all of them
+                    # arrived as a complete response
+                    e._gatun_complete = True  # type: ignore[attr-defined]
+                    raise
 
             # Location of an Arrow IPC stream (arrow_from_java)
             arrow_stream = resp.ArrowStream()
@@ -461,12 +572,9 @@ class AsyncGatunClient(_ValueEncoder):
     async def _handle_callback(self, resp):
         """Handle a callback invocation request from Java.
 
-        Sets _in_callback flag to detect and prevent reentrant calls, which would
-        deadlock. The flag is always cleared in finally to ensure cleanup even if
-        the callback raises an exception.
+        The task is recorded while its callback runs, so that a Java call made
+        from it is refused instead of deadlocking.
         """
-        from gatun.client import ReentrancyError
-
         callback_id = resp.CallbackId()
 
         # Unpack callback arguments
@@ -484,36 +592,28 @@ class AsyncGatunClient(_ValueEncoder):
             return
 
         # Execute the callback with reentrancy guard and timeout
-        self._in_callback = True
+        task = asyncio.current_task()
+        if task is not None:
+            self._callback_tasks.add(task)
+        scope, token = _enter_callback(self)
         try:
             if inspect.iscoroutinefunction(callback_fn):
-                # Async callback - use wait_for for timeout
-                if self.callback_timeout is not None:
-                    try:
-                        result = await asyncio.wait_for(
-                            callback_fn(*args), timeout=self.callback_timeout
-                        )
-                    except TimeoutError:
-                        raise CallbackTimeoutError(
-                            f"Callback execution timed out after {self.callback_timeout}s"
-                        )
-                else:
-                    result = await callback_fn(*args)
+                pending = callback_fn(*args)
             else:
-                # Sync callback - run in executor with timeout
-                loop = asyncio.get_running_loop()
-                if self.callback_timeout is not None:
-                    try:
-                        result = await asyncio.wait_for(
-                            loop.run_in_executor(None, callback_fn, *args),
-                            timeout=self.callback_timeout,
-                        )
-                    except TimeoutError:
-                        raise CallbackTimeoutError(
-                            f"Callback execution timed out after {self.callback_timeout}s"
-                        )
-                else:
-                    result = await loop.run_in_executor(None, callback_fn, *args)
+                # A sync callback runs in a worker thread so it cannot stall the loop
+                pending = asyncio.get_running_loop().run_in_executor(
+                    None, callback_fn, *args
+                )
+            timeout = self.callback_timeout
+            if timeout is not None:
+                try:
+                    result = await asyncio.wait_for(pending, timeout=timeout)
+                except TimeoutError:
+                    raise CallbackTimeoutError(
+                        f"Callback execution timed out after {timeout}s"
+                    )
+            else:
+                result = await pending
             await self._send_callback_response(callback_id, result, False, None)
         except ReentrancyError:
             # Propagate reentrancy error with clear message
@@ -523,13 +623,12 @@ class AsyncGatunClient(_ValueEncoder):
                 True,
                 "ReentrancyError: Cannot call Java from within a callback",
             )
-        except CallbackTimeoutError as e:
-            # Propagate timeout error
-            await self._send_callback_response(callback_id, None, True, str(e))
         except Exception as e:  # noqa: BLE001 - any callback failure is forwarded to Java
             await self._send_callback_response(callback_id, None, True, str(e))
         finally:
-            self._in_callback = False
+            _exit_callback(scope, token)
+            if task is not None:
+                self._callback_tasks.discard(task)
 
     async def _send_callback_response(
         self, callback_id: int, result, is_error: bool, error_msg: str | None
@@ -558,6 +657,9 @@ class AsyncGatunClient(_ValueEncoder):
         # Build target_name (error message if error)
         error_name_off = None
         if error_msg:
+            # Java is waiting for this response, so it has to fit the command zone
+            if len(error_msg) > MAX_CALLBACK_ERROR_SIZE:
+                error_msg = error_msg[:MAX_CALLBACK_ERROR_SIZE] + "...<truncated>"
             error_name_off = builder.CreateString(error_msg)
 
         # Build command
@@ -570,6 +672,15 @@ class AsyncGatunClient(_ValueEncoder):
         builder.Finish(cmd)
 
         data = builder.Output()
+        if len(data) > self.payload_offset and not is_error:
+            await self._send_callback_response(
+                callback_id,
+                None,
+                True,
+                f"Callback result is too large to return: {len(data):,} bytes "
+                f"exceeds the {self.payload_offset:,} byte command zone",
+            )
+            return
 
         # Write to command zone
         self.shm.seek(self.command_offset)
@@ -1036,9 +1147,39 @@ class AsyncGatunClient(_ValueEncoder):
 
         await self._send_raw(builder.Output())
 
+    async def reflect(self, full_name: str) -> str:
+        """Ask the server what a dotted name is.
+
+        Returns "class", "method", "field", or "none" if it cannot be resolved.
+        """
+        builder = flatbuffers.Builder(256)
+        name_off = builder.CreateString(full_name)
+        Cmd.CommandStart(builder)
+        Cmd.CommandAddAction(builder, Act.Action.Reflect)
+        Cmd.CommandAddTargetName(builder, name_off)
+        builder.Finish(Cmd.CommandEnd(builder))
+        return cast(str, await self._send_raw(builder.Output()))
+
+    async def _reflect_cached(self, full_name: str) -> str:
+        cached = self._reflect_cache.get(full_name)
+        if cached is None:
+            cached = await self.reflect(full_name)
+            _remember_reflection(self._reflect_cache, full_name, cached)
+        return cached
+
+    async def get_static_field(self, class_name: str, field_name: str):
+        """Get a static field value from a Java class."""
+        builder = flatbuffers.Builder(256)
+        name_off = builder.CreateString(f"{class_name}.{field_name}")
+        Cmd.CommandStart(builder)
+        Cmd.CommandAddAction(builder, Act.Action.GetStaticField)
+        Cmd.CommandAddTargetName(builder, name_off)
+        builder.Finish(Cmd.CommandEnd(builder))
+        return await self._send_raw(builder.Output())
+
     async def free_object(self, object_id: int):
         """Free a Java object asynchronously."""
-        if self._writer is None:
+        if self._writer is None or self._dead:
             return
 
         builder = flatbuffers.Builder(64)
@@ -1161,6 +1302,7 @@ class AsyncGatunClient(_ValueEncoder):
 
     async def close(self):
         """Close the connection."""
+        self._closed = True
         try:
             writer, self._writer = self._writer, None
             self._reader = None
@@ -1180,8 +1322,11 @@ class AsyncGatunClient(_ValueEncoder):
 
     async def __aenter__(self):
         # Only connect if not already connected
-        if self.shm is None:
-            await self.connect()
+        if self.shm is None and not await self.connect():
+            raise RuntimeError(
+                f"Failed to connect to Gatun server at {self.socket_path}: "
+                f"{self.connect_error}"
+            ) from self.connect_error
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):

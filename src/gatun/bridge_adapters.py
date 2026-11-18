@@ -16,6 +16,8 @@ from gatun.bridge import (
     JVMView,
 )
 from gatun.client import (
+    DEFAULT_CALLBACK_TIMEOUT,
+    DEFAULT_SOCKET_TIMEOUT,
     GatunClient,
     JavaObject,
 )
@@ -43,6 +45,8 @@ class GatunAdapter(BridgeAdapter):
         classpath: list[str] | None = None,
         allowed_classes: list[str] | None = None,
         allowed_prefixes: list[str] | None = None,
+        socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
+        callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
     ):
         """Create a new GatunAdapter.
 
@@ -51,6 +55,8 @@ class GatunAdapter(BridgeAdapter):
             classpath: Additional JAR files for the classpath
             allowed_classes: Class names allowed beyond the server's built-in list
             allowed_prefixes: Package prefixes allowed beyond the built-in list
+            socket_timeout: Seconds to wait for one call's response; None for no limit
+            callback_timeout: Seconds a Python callback may run; None for no limit
         """
         # connect() launches the server and returns a connected client
         self._client: GatunClient | None = gatun_connect(
@@ -58,6 +64,8 @@ class GatunAdapter(BridgeAdapter):
             classpath=classpath,
             allowed_classes=allowed_classes,
             allowed_prefixes=allowed_prefixes,
+            socket_timeout=socket_timeout,
+            callback_timeout=callback_timeout,
         )
 
     # === Object Lifecycle ===
@@ -247,13 +255,14 @@ class _GatunJVMViewAdapter(JVMView):
         """Navigate to package, class, or access static member."""
         result = getattr(self._jvm_view, name)
 
+        # A JavaObject is a value (a static field that holds an object). It is tested
+        # first because it answers every attribute name, "_path" included.
+        if isinstance(result, JavaObject):
+            return result
+
         # If it's a JVMView node, wrap it
         if hasattr(result, "_path"):
             return _GatunJVMViewAdapter(result, self._client)
-
-        # If it's a JavaObject, return as-is (it's a JVMRef)
-        if isinstance(result, JavaObject):
-            return result
 
         # Otherwise return the value (primitives, strings, etc.)
         return result

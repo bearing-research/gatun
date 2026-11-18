@@ -13,6 +13,8 @@ from gatun.async_client import (
     run_sync,
 )
 from gatun.client import (
+    DEFAULT_CALLBACK_TIMEOUT,
+    DEFAULT_SOCKET_TIMEOUT,
     PROTOCOL_VERSION,
     ArrowTableView,
     BatchContext,
@@ -97,6 +99,25 @@ __all__ = [
 ]
 
 
+def _connect_failure(
+    session: GatunSession, error: BaseException | None
+) -> RuntimeError:
+    """Stop a server that could not be connected to and describe the failure.
+
+    When the server refuses a session (no room for its shared memory, too many
+    sessions) the client only sees the socket close; the reason is in the
+    server's log, so its last lines go into the message.
+    """
+    session.stop()
+    lines = [line.rstrip() for line in session._stderr_lines[-12:] if line.strip()]
+    message = f"Failed to connect to Gatun Server: {error}"
+    if lines:
+        message += "\nServer output:\n" + "\n".join(lines)
+    failure = RuntimeError(message)
+    failure.__cause__ = error
+    return failure
+
+
 def connect(
     memory: str | None = None,
     socket_path: str | None = None,
@@ -107,6 +128,8 @@ def connect(
     extra_jvm_flags: list[str] | None = None,
     allowed_classes: list[str] | None = None,
     allowed_prefixes: list[str] | None = None,
+    socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
+    callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
 ):
     """Convenience: Launches server and returns connected client.
 
@@ -124,6 +147,12 @@ def connect(
                          static members on, in addition to the built-in list.
         allowed_prefixes: Package prefixes (e.g. "com.example") whose classes, and those of
                           their subpackages, are allowed likewise.
+        socket_timeout: Seconds to wait for the response to one call. A call that takes
+                        longer raises SocketTimeoutError and the client cannot be used
+                        again, so raise this for long-running Java calls. None waits
+                        without limit.
+        callback_timeout: Seconds a Python callback may run before Java is told it
+                          failed. None waits without limit.
 
     Configuration can be set in pyproject.toml:
         [tool.gatun]
@@ -158,10 +187,14 @@ def connect(
         allowed_prefixes=allowed_prefixes,
     )
 
-    client = GatunClient(session.socket_path)
+    client = GatunClient(
+        session.socket_path,
+        socket_timeout=socket_timeout,
+        callback_timeout=callback_timeout,
+        handshake_timeout=get_config().connect_timeout,
+    )
     if not client.connect():
-        session.stop()
-        raise RuntimeError("Failed to connect to Gatun Server")
+        raise _connect_failure(session, client.connect_error)
 
     # Attach session to client so it doesn't get GC'd
     client._server_session = session
@@ -178,6 +211,8 @@ async def aconnect(
     extra_jvm_flags: list[str] | None = None,
     allowed_classes: list[str] | None = None,
     allowed_prefixes: list[str] | None = None,
+    socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
+    callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
 ) -> AsyncGatunClient:
     """Async convenience: Launches server and returns connected async client.
 
@@ -195,6 +230,12 @@ async def aconnect(
                          static members on, in addition to the built-in list.
         allowed_prefixes: Package prefixes (e.g. "com.example") whose classes, and those of
                           their subpackages, are allowed likewise.
+        socket_timeout: Seconds to wait for the response to one call. A call that takes
+                        longer raises SocketTimeoutError and the client cannot be used
+                        again, so raise this for long-running Java calls. None waits
+                        without limit.
+        callback_timeout: Seconds a Python callback may run before Java is told it
+                          failed. None waits without limit.
 
     Example:
         async with await aconnect() as client:
@@ -226,10 +267,14 @@ async def aconnect(
         allowed_prefixes=allowed_prefixes,
     )
 
-    client = AsyncGatunClient(session.socket_path)
+    client = AsyncGatunClient(
+        session.socket_path,
+        socket_timeout=socket_timeout,
+        callback_timeout=callback_timeout,
+        handshake_timeout=get_config().connect_timeout,
+    )
     if not await client.connect():
-        session.stop()
-        raise RuntimeError("Failed to connect to Gatun Server")
+        raise _connect_failure(session, client.connect_error)
 
     # Attach session to client so it doesn't get GC'd
     client._server_session = session

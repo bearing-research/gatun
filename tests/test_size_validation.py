@@ -1,9 +1,12 @@
 """Tests for size validation of shared memory zones."""
 
+import flatbuffers
 import pytest
 
-from gatun import JavaException, JavaRuntimeException, PayloadTooLargeError
+from gatun import JavaException, PayloadTooLargeError
 from gatun.client import COMMAND_ZONE_SIZE, RESPONSE_ZONE_SIZE
+from gatun.generated.org.gatun.protocol import Action as Act
+from gatun.generated.org.gatun.protocol import Command as Cmd
 
 
 def test_payload_too_large_error_attributes():
@@ -171,16 +174,52 @@ def test_send_arrow_table_batched_small_table(client):
 
 
 def test_send_arrow_table_batched_empty_table(client):
-    """Test batched sending with an empty table."""
+    """A table with no rows is a table: the schema arrives and no rows do."""
     import pyarrow as pa
 
     table = pa.table({"col": pa.array([], type=pa.int64())})
 
-    # Empty tables produce an empty Arrow stream which Java rejects
-    with pytest.raises(JavaRuntimeException) as exc_info:
-        client.send_arrow_table_batched(table)
+    assert client.send_arrow_table(table) == "Received 0 rows"
+    assert client.send_arrow_table_batched(table) == ["Received 0 rows"]
 
-    assert "Arrow Stream Empty" in str(exc_info.value)
+
+def test_send_arrow_table_rejects_bytes_that_are_not_a_stream(client):
+    """Accepting an empty table must not mean accepting an empty payload."""
+    import pyarrow as pa
+
+    table = pa.table({"col": [1, 2, 3]})
+    assert client.send_arrow_table(table) == "Received 3 rows"
+
+    start = client.payload_offset
+    client.shm[start : start + 256] = b"\x00" * 256
+
+    builder = flatbuffers.Builder(64)
+    Cmd.CommandStart(builder)
+    Cmd.CommandAddAction(builder, Act.Action.SendArrowBatch)
+    builder.Finish(Cmd.CommandEnd(builder))
+    with pytest.raises(JavaException):
+        client._send_raw(builder.Output())
+    assert client.ping() is True
+
+
+def test_send_arrow_table_batched_rows_of_uneven_size(client):
+    """Batches are sized from the whole table, and split again if they do not fit.
+
+    Sizing them from the first rows sent later, larger rows in batches that
+    could not be sent.
+    """
+    import pyarrow as pa
+
+    payload = client.response_offset - client.payload_offset
+    small = ["x"] * 2000
+    large = ["y" * (payload // 40)] * 120  # three times the payload zone in all
+    table = pa.table({"col": small + large})
+
+    responses = client.send_arrow_table_batched(table)
+
+    assert len(responses) > 1
+    received = sum(int(r.split()[1]) for r in responses)
+    assert received == table.num_rows
 
 
 def test_send_arrow_table_batched_with_explicit_batch_size(client):

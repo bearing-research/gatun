@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import array
 import calendar
+import contextvars
 import ctypes
 import datetime
+import functools
 import logging
+import math
 import mmap
 import os
 import socket
 import struct
+import threading
 import time
 import weakref
 from collections import OrderedDict, deque
@@ -27,6 +31,7 @@ from gatun.generated.org.gatun.protocol import (
     ArrayVal,
     ArrowBatchDescriptor,
     BatchCommand,
+    BatchResponse,
     BoolVal,
     BufferDescriptor,
     CharVal,
@@ -59,6 +64,44 @@ logger = logging.getLogger(__name__)
 _FREE_CHUNK_SIZE = 512
 
 _EPOCH_ORDINAL = datetime.date(1970, 1, 1).toordinal()
+
+
+def _take_free_chunk(pending: deque[int]) -> list[int]:
+    """Remove and return the next object IDs to release, at most one command's worth.
+
+    Finalizers append to the queue from any thread while this runs, so it pops
+    one at a time instead of copying and clearing.
+    """
+    ids: list[int] = []
+    try:
+        while len(ids) < _FREE_CHUNK_SIZE:
+            ids.append(pending.popleft())
+    except IndexError:
+        pass  # queue drained
+    return ids
+
+
+def _build_free_command(builder: flatbuffers.Builder, ids: list[int]) -> bytes:
+    """Build a FreeObject command that releases every ID in one round trip."""
+    builder.Clear()
+    arg_offsets = []
+    for object_id in ids:
+        IntVal.Start(builder)
+        IntVal.AddV(builder, object_id)
+        val_off = IntVal.End(builder)
+        Argument.Start(builder)
+        Argument.AddValType(builder, Value.Value.IntVal)
+        Argument.AddVal(builder, val_off)
+        arg_offsets.append(Argument.End(builder))
+    Cmd.CommandStartArgsVector(builder, len(arg_offsets))
+    for offset in reversed(arg_offsets):
+        builder.PrependUOffsetTRelative(offset)
+    args_vec = builder.EndVector()
+    Cmd.CommandStart(builder)
+    Cmd.CommandAddAction(builder, Act.Action.FreeObject)
+    Cmd.CommandAddArgs(builder, args_vec)
+    builder.Finish(Cmd.CommandEnd(builder))
+    return bytes(builder.Output())
 
 
 def _encode_temporal(value: Any) -> tuple[int, int] | None:
@@ -185,10 +228,21 @@ class PayloadTooLargeError(Exception):
         self.payload_size = payload_size
         self.max_size = max_size
         self.zone = zone
+        # Only the payload zone grows with the memory setting; commands and
+        # responses have 64KB each whatever it is
+        if zone in ("Command", "Response"):
+            advice = (
+                f"{zone}s are limited to this size whatever the memory setting. "
+                "Split the call, or move bulk data as Arrow."
+            )
+        else:
+            advice = (
+                "Consider increasing memory size when connecting "
+                "(e.g., gatun.connect(memory='64MB'))"
+            )
         super().__init__(
             f"{zone} payload too large: {payload_size:,} bytes exceeds "
-            f"maximum {max_size:,} bytes. Consider increasing memory size "
-            f"when connecting (e.g., gatun.connect(memory='64MB'))"
+            f"maximum {max_size:,} bytes. {advice}"
         )
 
 
@@ -249,11 +303,18 @@ class JavaRuntimeException(JavaException):
 
 
 class CancelledException(Exception):
-    """Raised when a request is cancelled."""
+    """Raised when a request is cancelled.
 
-    def __init__(self, request_id: int):
+    `request_id` is set only when the server named a request; a request stopped
+    by `client.cancel()` is not numbered.
+    """
+
+    def __init__(self, request_id: int | None = None):
         self.request_id = request_id
-        super().__init__(f"Request {request_id} was cancelled")
+        if request_id is None:
+            super().__init__("The request was cancelled")
+        else:
+            super().__init__(f"Request {request_id} was cancelled")
 
 
 class ReentrancyError(Exception):
@@ -387,8 +448,7 @@ def _raise_java_exception_impl(error_type: str, error_msg: str) -> None:
     if error_type == "java.lang.InterruptedException":
         # Message format: "Request X was cancelled"
         match = re.search(r"Request (\d+) was cancelled", error_msg)
-        request_id = int(match.group(1)) if match else 0
-        raise CancelledException(request_id)
+        raise CancelledException(int(match.group(1)) if match else None)
 
     # Get the exception class, defaulting to JavaException
     exc_class = _JAVA_EXCEPTION_MAP.get(error_type, JavaException)
@@ -406,6 +466,18 @@ class SocketTimeoutError(Exception):
     """Raised when a socket read times out."""
 
 
+def _usable_timeout(timeout: float | None) -> float | None:
+    """A timeout as the socket and thread calls want it; None means no limit.
+
+    Zero, a negative number and infinity all mean "wait as long as it takes": a
+    zero deadline fails before reading anything, and the calls that take a
+    timeout reject infinity.
+    """
+    if timeout is None or timeout <= 0 or math.isinf(timeout):
+        return None
+    return timeout
+
+
 def _recv_exactly(sock, n, timeout: float | None = None):
     """Receive exactly n bytes from socket, handling partial reads.
 
@@ -419,6 +491,8 @@ def _recv_exactly(sock, n, timeout: float | None = None):
         SocketTimeoutError: If the timeout expires before receiving all bytes
         RuntimeError: If the socket closes unexpectedly
     """
+    timeout = _usable_timeout(timeout)
+
     # Fast path: no timeout specified, use socket's existing timeout
     # This avoids gettimeout/settimeout overhead in the common case
     if timeout is None:
@@ -614,7 +688,28 @@ class JavaArray(list):
     The element_type attribute stores the original Java array element type.
     """
 
+    ELEMENT_TYPES = frozenset(
+        {
+            "Int",
+            "Long",
+            "Double",
+            "Float",
+            "Bool",
+            "Byte",
+            "Short",
+            "Char",
+            "String",
+            "Object",
+        }
+    )
+
     def __init__(self, iterable=(), element_type: str = "Object"):
+        # A misspelt type ("int") used to be sent as Object[] without a word
+        if element_type not in self.ELEMENT_TYPES:
+            raise ValueError(
+                f"Unknown JavaArray element_type {element_type!r}; "
+                f"expected one of {sorted(self.ELEMENT_TYPES)}"
+            )
         super().__init__(iterable)
         self.element_type = element_type
 
@@ -674,6 +769,9 @@ def _get_own_buffer_count(arrow_type: pa.DataType) -> int:
         return 2
 
 
+_EMPTY_BUFFER = pa.py_buffer(b"")
+
+
 def _reconstruct_array_recursive(
     arrow_type: pa.DataType,
     buffers: list,
@@ -696,6 +794,17 @@ def _reconstruct_array_recursive(
     Returns:
         Tuple of (reconstructed array, next buffer index, next node index)
     """
+    if isinstance(arrow_type, pa.BaseExtensionType):
+        # The buffers are laid out as the storage type; the extension type only wraps them
+        storage, buffer_idx, node_idx = _reconstruct_array_recursive(
+            arrow_type.storage_type, buffers, field_nodes, buffer_idx, node_idx
+        )
+        return (
+            pa.ExtensionArray.from_storage(arrow_type, storage),
+            buffer_idx,
+            node_idx,
+        )
+
     # Get this array's field node
     length, null_count = field_nodes[node_idx]
     node_idx += 1
@@ -704,6 +813,17 @@ def _reconstruct_array_recursive(
     own_buffer_count = _get_own_buffer_count(arrow_type)
     own_buffers = buffers[buffer_idx : buffer_idx + own_buffer_count]
     buffer_idx += own_buffer_count
+
+    # A zero-length buffer arrives as None. That is right for a validity bitmap,
+    # which may be absent, but pyarrow requires every other buffer to exist: a
+    # string column with no characters in it (no rows, or only "" and nulls) has
+    # an empty data buffer, not a missing one. A union's buffers have no validity
+    # bitmap among them.
+    first_data = 0 if pa.types.is_union(arrow_type) else 1
+    own_buffers = [
+        _EMPTY_BUFFER if buf is None and i >= first_data else buf
+        for i, buf in enumerate(own_buffers)
+    ]
 
     # Handle nested types by recursively building children
     if pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
@@ -765,9 +885,15 @@ def _reconstruct_array_recursive(
                 field.type, buffers, field_nodes, buffer_idx, node_idx
             )
             children.append(child_array)
+        # pyarrow lists a union's buffers with a leading validity slot that is
+        # always empty; Arrow's layout, which Java sends, does not have it
         arr = pa.Array.from_buffers(
-            arrow_type, length, own_buffers, null_count, children=children
+            arrow_type, length, [None, *own_buffers], null_count, children=children
         )
+
+    elif pa.types.is_null(arrow_type):
+        # Java sends no buffers for a null column; there is nothing to wrap
+        arr = pa.nulls(length)
 
     else:
         # Primitive type (no children)
@@ -1010,10 +1136,7 @@ class JVMView:
                         # Try the package.name path - verify it exists first
                         full_path = f"{package}.{name}"
                         # Use reflection to check if this class exists
-                        cached_type = _reflect_cache.get(full_path)
-                        if cached_type is None:
-                            cached_type = self._client.reflect(full_path)
-                            _reflect_cache.set(full_path, cached_type)
+                        cached_type = self._client._reflect_cached(full_path)
                         if cached_type in ("class", "method", "field"):
                             return _JVMNode(self._client, full_path)
 
@@ -1049,18 +1172,24 @@ class _LRUCache[V]:
 
     def get(self, key: str) -> V | None:
         """Get a value from the cache, moving it to the end (most recent)."""
-        if key in self._cache:
+        # Threads sharing a client share this cache. Each step is atomic, but
+        # another thread may evict the key between two of them.
+        try:
             self._cache.move_to_end(key)
             return self._cache[key]
-        return None
+        except KeyError:
+            return None
 
     def set(self, key: str, value: V) -> None:
         """Set a value in the cache, evicting oldest if full."""
-        if key in self._cache:
+        try:
             self._cache.move_to_end(key)
-        else:
+        except KeyError:
             if len(self._cache) >= self._maxsize:
-                self._cache.popitem(last=False)  # Remove oldest
+                try:
+                    self._cache.popitem(last=False)  # Remove oldest
+                except KeyError:
+                    pass  # another thread emptied it
         self._cache[key] = value
 
     def __contains__(self, key: str) -> bool:
@@ -1078,12 +1207,6 @@ class _LRUCache[V]:
         return len(self._cache)
 
 
-# Cache for reflection results to avoid repeated Java calls
-# Maps fully qualified name -> type ("class", "method", "field", "none")
-# Bounded to prevent memory bloat in long-running applications
-_reflect_cache: _LRUCache[str] = _LRUCache(_CACHE_MAX_SIZE)
-
-
 class _JVMNode:
     """Hybrid node that can act as both a package path and a Java class.
 
@@ -1097,7 +1220,8 @@ class _JVMNode:
     - Static methods on classes
     - Static fields on classes
 
-    Results are cached globally for performance.
+    Results are cached per client: what a name means depends on the classpath of
+    the server that client is connected to.
     """
 
     def __init__(self, client, path):
@@ -1106,28 +1230,26 @@ class _JVMNode:
 
     def _get_type(self) -> str:
         """Get the type of this path via reflection (cached)."""
-        cached = _reflect_cache.get(self._path)
-        if cached is None:
-            cached = self._client.reflect(self._path)
-            _reflect_cache.set(self._path, cached)
-        return cached
+        return cast(str, self._client._reflect_cached(self._path))
 
     def __getattr__(self, name):
         """Navigate deeper or access static method/field."""
+        if name.startswith("_"):
+            # Python probing for a protocol (copy, pickle, IPython's _repr_html_),
+            # not a Java name. Each would otherwise be a question to the server.
+            raise AttributeError(name)
         new_path = f"{self._path}.{name}"
 
-        # Get the last segment of the current path to check if it looks like a class
-        last_segment = (
-            self._path.rsplit(".", 1)[-1] if "." in self._path else self._path
-        )
-        # If current segment starts with uppercase, it likely is a class
-        parent_looks_like_class = last_segment and last_segment[0].isupper()
-
-        # Heuristic: if parent looks like a class AND name is ALL_UPPERCASE,
-        # it's likely a static field constant - fetch it immediately
-        # Examples: MAX_VALUE, EMPTY_LIST, FATAL, INFO, DEBUG
-        if parent_looks_like_class and name.isupper():
-            # This looks like a constant field - fetch it immediately
+        # A static field's value is wanted now; anything else is navigated to and
+        # resolved when it is called. Only a member of a class can be a field, so
+        # the server is asked only when the parent is spelled like a class; the
+        # spelling of the name itself says nothing (Encoders.STRING is a method,
+        # System.out a field).
+        last_segment = self._path.rsplit(".", 1)[-1]
+        if (
+            last_segment[:1].isupper()
+            and self._client._reflect_cached(new_path) == "field"
+        ):
             return self._client.get_static_field(self._path, name)
 
         return _JVMNode(self._client, new_path)
@@ -1243,6 +1365,8 @@ def _unpack_value_impl(
             val = _unpack_value_impl(
                 val_arg.ValType(), val_arg.Val(), client, ref_class
             )
+            if isinstance(key, list):
+                key = tuple(key)  # a Java List key; lists are not hashable
             map_result[key] = val
         return map_result
     elif val_type == Value.Value.ArrayVal:
@@ -1439,6 +1563,78 @@ def _close_shared_memory(client: Any) -> None:
             resource.close()
         except (OSError, ValueError, BufferError):
             pass
+
+
+def _remember_reflection(cache: _LRUCache[str], full_name: str, kind: str) -> None:
+    """Cache what the server said a dotted name is.
+
+    "none" is kept only for a name inside a known class: a class's members are
+    settled, while a name that is not a class yet may become one (a JAR added
+    later), and asking again is how that is noticed.
+    """
+    parent = full_name.rpartition(".")[0]
+    if kind == "none":
+        if parent and cache.get(parent) == "class":
+            cache.set(full_name, kind)
+        return
+    cache.set(full_name, kind)
+    if kind != "class" and parent and cache.get(parent) is None:
+        # Something with a method or a field is a class
+        cache.set(parent, "class")
+
+
+class _CallbackScope:
+    """One running callback of one client."""
+
+    __slots__ = ("active", "client")
+
+    def __init__(self, client: Any):
+        self.client = client
+        self.active = True
+
+
+# The callbacks running in the current context. Tasks, and threads started with
+# a copy of the context (asyncio.to_thread), inherit it from the callback that
+# started them, which is how a Java call a callback hands to a helper is still
+# recognised as reentrant. A helper that outlives its callback is free to call
+# Java, hence the scope's `active` flag rather than the mere presence of a scope.
+_callback_scopes: contextvars.ContextVar[tuple[_CallbackScope, ...]] = (
+    contextvars.ContextVar("gatun_callback_scopes", default=())
+)
+
+
+def _enter_callback(client: Any) -> tuple[_CallbackScope, contextvars.Token]:
+    scope = _CallbackScope(client)
+    return scope, _callback_scopes.set((*_callback_scopes.get(), scope))
+
+
+def _exit_callback(scope: _CallbackScope, token: contextvars.Token) -> None:
+    scope.active = False
+    _callback_scopes.reset(token)
+
+
+def _in_callback_of(client: Any) -> bool:
+    """Whether the current context is inside a running callback of `client`."""
+    for scope in _callback_scopes.get():
+        if scope.active and scope.client is client:
+            return True
+    return False
+
+
+def _holding_channel(method):
+    """Run a client method with the channel held from start to finish.
+
+    For methods that use the payload zone around their request: the zone is
+    shared by every thread using the client, so writing it, sending the request
+    that refers to it and reading the answer out of it are one step.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._exchange_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class _ValueEncoder:
@@ -1879,9 +2075,9 @@ class GatunClient(_ValueEncoder):
             None  # Set during connect() from server handshake
         )
         # None disables the corresponding timeout
-        self.callback_timeout = callback_timeout
-        self.socket_timeout = socket_timeout
-        self.handshake_timeout = handshake_timeout
+        self.callback_timeout = _usable_timeout(callback_timeout)
+        self.socket_timeout = _usable_timeout(socket_timeout)
+        self.handshake_timeout = _usable_timeout(handshake_timeout)
         # Server process launched for this client by connect(); stopped on close()
         self._server_session: Any = None
 
@@ -1903,9 +2099,6 @@ class GatunClient(_ValueEncoder):
         # Callback registry: callback_id -> callable
         self._callbacks: dict[int, Callable[..., Any]] = {}
 
-        # Request ID counter for cancellation support
-        self._next_request_id = 1
-
         # Arrow schema cache for Java -> Python transfers: hash -> Schema
         self._arrow_schema_cache: dict[int, pa.Schema] = {}
 
@@ -1920,11 +2113,10 @@ class GatunClient(_ValueEncoder):
         # zone that ArrowTableViews point at; see _note_payload_write
         self._payload_generation: int = 0
 
-        # FlatBuffers builder pool - reuse builders to reduce allocation overhead
-        # Small builder for simple commands (256 bytes initial)
-        self._builder_small = flatbuffers.Builder(256)
-        # Large builder for commands with arguments/data (1024 bytes initial)
-        self._builder_large = flatbuffers.Builder(1024)
+        # FlatBuffers builder pool - reuse builders to reduce allocation overhead.
+        # One pool per thread: a command is built before the channel is taken,
+        # so threads sharing a client would otherwise build into the same buffer.
+        self._builders = threading.local()
 
         # String encoding cache - cache UTF-8 encoded bytes for commonly used strings
         # This avoids repeated str.encode() calls for class/method names
@@ -1941,15 +2133,33 @@ class GatunClient(_ValueEncoder):
         # Dedicated builder, so flushing frees never disturbs a command being built
         self._free_builder = flatbuffers.Builder(64)
 
-        # Reentrancy detection - tracks if we're inside a callback.
-        # Nested Java calls from callbacks would deadlock the single-stream protocol.
-        # Note: Java serializes callbacks per session via synchronized(ctx.callbackLock),
-        # so we're guaranteed only one callback is in-flight at a time per connection.
-        self._in_callback: bool = False
+        # One request/response exchange at a time. The channel carries a single
+        # exchange, so threads sharing a client take turns. Re-entrant because
+        # unpacking a response can itself make a call (hashing a JavaObject).
+        self._exchange_lock = threading.RLock()
+
+        # Threads that are running a callback. A Java call from one of them would
+        # deadlock: Java is waiting for that callback's result on the only channel.
+        # A callback that outlives its timeout keeps its entry until it returns, so
+        # it can never send on a channel it no longer owns.
+        self._callback_threads: set[int] = set()
+
+        # Why the last connect() failed, for callers that report it
+        self.connect_error: BaseException | None = None
+        self._closed = False
+
+        # What this client's server said each dotted path is: "class", "method"
+        # or "field"
+        self._reflect_cache: _LRUCache[str] = _LRUCache(_CACHE_MAX_SIZE)
 
         # Dead connection flag - set after protocol desync or timeout
         # Once dead, all operations will fail fast with DeadConnectionError
         self._dead: bool = False
+
+    @property
+    def _in_callback(self) -> bool:
+        """Whether a callback is running, on any thread."""
+        return bool(self._callback_threads)
 
     def _create_string(self, builder: flatbuffers.Builder, s: str) -> int:
         """Create a FlatBuffers string with caching of encoded bytes.
@@ -1972,7 +2182,14 @@ class GatunClient(_ValueEncoder):
         Note: We cannot preserve vtables across clears because vtable entries
         contain absolute buffer offsets that become invalid after Clear().
         """
-        builder = self._builder_large if large else self._builder_small
+        pool = self._builders
+        try:
+            builder = pool.large if large else pool.small
+        except AttributeError:
+            # Small for simple commands, large for commands with arguments or data
+            pool.small = flatbuffers.Builder(256)
+            pool.large = flatbuffers.Builder(1024)
+            builder = pool.large if large else pool.small
         builder.Clear()
         return builder
 
@@ -2037,9 +2254,11 @@ class GatunClient(_ValueEncoder):
                 self.memory_size / 1024 / 1024,
             )
 
+            self.connect_error = None
             return True
         except Exception as e:  # noqa: BLE001 - connect() reports every failure as False
             logger.error("Connection failed: %s", e)
+            self.connect_error = e
             return False
 
     def get_payload_arena(self) -> PayloadArena:
@@ -2097,19 +2316,12 @@ class GatunClient(_ValueEncoder):
         With expects_response=False the command is one-way: Java sends no reply and
         nothing is read. That is only true of CallbackResponse.
         """
-        # 0a. Check if connection is dead - fail fast
+        # 0a. Fail fast on a connection that cannot be used
+        if self._closed:
+            raise DeadConnectionError("Client is closed. Create a new client.")
         if self._dead:
             raise DeadConnectionError(
                 "Connection is dead after protocol error. Create a new client."
-            )
-
-        # 0b. Check for reentrancy - nested calls from callbacks would deadlock
-        # Exception: CallbackResponse is sent during callback handling
-        if self._in_callback and expects_response:
-            raise ReentrancyError(
-                "Cannot call Java from within a callback. "
-                "Nested calls would deadlock because the original request is still waiting. "
-                "Queue work for later or restructure code to avoid nested calls."
             )
 
         # 1. Validate command size
@@ -2117,25 +2329,43 @@ class GatunClient(_ValueEncoder):
         if len(data) > max_command_size:
             raise PayloadTooLargeError(len(data), max_command_size, "Command")
 
-        # 2. Release objects whose wrappers were garbage collected since the last
-        # request. This is a round trip of its own, so it has to finish before our
-        # own command goes into shared memory.
-        if expects_response and self._pending_frees:
-            self._flush_pending_frees()
+        if not expects_response:
+            # A CallbackResponse: part of an exchange that is already under way
+            self._write_command(data)
+            return None
 
-        self._write_command(data)
-        if expects_response:
+        # 0b. Check for reentrancy - a call from a callback would deadlock
+        self._check_reentrancy()
+
+        with self._exchange_lock:
+            # 2. Release objects whose wrappers were garbage collected since the
+            # last request. This is a round trip of its own, so it has to finish
+            # before our own command goes into shared memory.
+            if self._pending_frees:
+                self._flush_pending_frees()
+
+            self._write_command(data)
             return self._read_response()
-        return None
+
+    def _check_reentrancy(self) -> None:
+        """Refuse a Java call made from inside a callback."""
+        if threading.get_ident() in self._callback_threads or _in_callback_of(self):
+            raise ReentrancyError(
+                "Cannot call Java from within a callback. "
+                "Nested calls would deadlock because the original request is still waiting. "
+                "Queue work for later or restructure code to avoid nested calls."
+            )
 
     def _write_command(self, data: bytes) -> None:
         """Write one command to shared memory and signal Java."""
+        if self.shm is None:
+            raise DeadConnectionError("Client is not connected")
+        # No flush: both processes map the same pages, so the bytes are visible to
+        # Java as soon as they are written, and the length sent on the socket
+        # afterwards is what orders the two. flush() is an msync of the whole
+        # mapping, a system call per command that buys nothing here.
         self.shm.seek(self.command_offset)
         self.shm.write(data)
-        # Flush to ensure writes are visible to Java before signaling.
-        # On most platforms mmap writes are immediately visible, but flush
-        # provides a memory barrier that guarantees ordering.
-        self.shm.flush()
 
         # Signal Java (Send Length)
         # Verify socket is open (check None first to avoid AttributeError)
@@ -2148,6 +2378,10 @@ class GatunClient(_ValueEncoder):
         except (OSError, BrokenPipeError, ConnectionResetError) as e:
             self._mark_dead()
             raise ProtocolDesyncError(f"Socket error sending command: {e}")
+        except BaseException:
+            # Interrupted (Ctrl-C) with the length possibly half sent
+            self._mark_dead()
+            raise
 
     def _queue_free(self, object_id: int) -> None:
         """Queue a Java object for release. Called by JavaObject finalizers.
@@ -2168,35 +2402,11 @@ class GatunClient(_ValueEncoder):
         frees = self._pending_frees
         builder = self._free_builder
         while frees:
-            ids: list[int] = []
-            try:
-                while len(ids) < _FREE_CHUNK_SIZE:
-                    ids.append(frees.popleft())
-            except IndexError:
-                pass  # queue drained
+            ids = _take_free_chunk(frees)
             if not ids:
                 break
 
-            builder.Clear()
-            arg_offsets = []
-            for object_id in ids:
-                IntVal.Start(builder)
-                IntVal.AddV(builder, object_id)
-                val_off = IntVal.End(builder)
-                Argument.Start(builder)
-                Argument.AddValType(builder, Value.Value.IntVal)
-                Argument.AddVal(builder, val_off)
-                arg_offsets.append(Argument.End(builder))
-            Cmd.CommandStartArgsVector(builder, len(arg_offsets))
-            for offset in reversed(arg_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            args_vec = builder.EndVector()
-            Cmd.CommandStart(builder)
-            Cmd.CommandAddAction(builder, Act.Action.FreeObject)
-            Cmd.CommandAddArgs(builder, args_vec)
-            builder.Finish(Cmd.CommandEnd(builder))
-
-            self._write_command(builder.Output())
+            self._write_command(_build_free_command(builder, ids))
             try:
                 self._read_response()
             except JavaException as e:
@@ -2269,6 +2479,11 @@ class GatunClient(_ValueEncoder):
                 # Socket closed or error - mark dead and convert to ProtocolDesyncError
                 self._mark_dead()
                 raise ProtocolDesyncError(f"Socket error reading response: {e}")
+            except BaseException:
+                # Ctrl-C, SystemExit or anything else while waiting: the response
+                # is still on its way, and the next call would read it as its own
+                self._mark_dead()
+                raise
             sz = struct.unpack("<I", sz_data)[0]
 
             # 2. Validate response size before reading from SHM
@@ -2316,6 +2531,11 @@ class GatunClient(_ValueEncoder):
                     # Socket error while sending callback response
                     self._mark_dead()
                     raise ProtocolDesyncError(f"Socket error during callback: {e}")
+                except BaseException:
+                    # Interrupted before the callback's result went out; Java is
+                    # still waiting for it
+                    self._mark_dead()
+                    raise
                 # After handling callback, continue reading for the actual response
                 continue
 
@@ -2328,6 +2548,11 @@ class GatunClient(_ValueEncoder):
                     else "java.lang.RuntimeException"
                 )
                 self._raise_java_exception(error_type, error_msg)
+
+            # A batch's sub-responses are unpacked by BatchContext
+            batch = resp.Batch()
+            if batch is not None:
+                return batch
 
             # 4. Check for Arrow responses
             arrow_stream = resp.ArrowStream()
@@ -2348,22 +2573,13 @@ class GatunClient(_ValueEncoder):
     def _handle_callback(self, resp):
         """Handle a callback invocation request from Java.
 
-        Sets _in_callback flag to detect and prevent reentrant calls, which would
-        deadlock. The flag is always cleared in finally to ensure cleanup even if
-        the callback raises an exception.
+        The thread that runs the callback is recorded for as long as it runs, so
+        that a Java call made from it is refused instead of deadlocking.
 
         If callback_timeout is set, the callback is executed in a separate thread
         with a timeout to prevent hung callbacks from deadlocking the protocol.
         """
-        import threading
-
         callback_id = resp.CallbackId()
-
-        # Unpack callback arguments
-        args = []
-        for i in range(resp.CallbackArgsLength()):
-            arg = resp.CallbackArgs(i)
-            args.append(self._unpack_value(arg.ValType(), arg.Val()))
 
         # Look up the callback function
         callback_fn = self._callbacks.get(callback_id)
@@ -2374,13 +2590,29 @@ class GatunClient(_ValueEncoder):
             )
             return
 
-        # Execute the callback with reentrancy guard
-        self._in_callback = True
+        def run() -> Any:
+            # Everything from unpacking the arguments on counts as "inside the
+            # callback": unpacking a map keyed by Java objects hashes them, which
+            # is a Java call, and Java is already waiting on this callback.
+            ident = threading.get_ident()
+            self._callback_threads.add(ident)
+            scope, token = _enter_callback(self)
+            try:
+                args = [
+                    self._unpack_value(arg.ValType(), arg.Val())
+                    for arg in (
+                        resp.CallbackArgs(i) for i in range(resp.CallbackArgsLength())
+                    )
+                ]
+                return callback_fn(*args)
+            finally:
+                _exit_callback(scope, token)
+                self._callback_threads.discard(ident)
+
         try:
-            if self.callback_timeout is None or self.callback_timeout <= 0:
+            if self.callback_timeout is None:
                 # No timeout - execute directly (not recommended but supported)
-                result = callback_fn(*args)
-                self._send_callback_response(callback_id, result, False, None)
+                result = run()
             else:
                 # Execute with timeout using a thread
                 result_holder: dict[str, Any] = {
@@ -2391,8 +2623,11 @@ class GatunClient(_ValueEncoder):
 
                 def run_callback() -> None:
                     try:
-                        result_holder["result"] = callback_fn(*args)
-                    except Exception as e:  # noqa: BLE001 - reported to Java below
+                        result_holder["result"] = run()
+                    except BaseException as e:  # noqa: BLE001 - reported to Java below
+                        # BaseException too: a callback that calls sys.exit() or is
+                        # interrupted has not returned a result, and reporting
+                        # None as its result would be a lie
                         result_holder["error"] = e
                     finally:
                         result_holder["done"] = True
@@ -2411,12 +2646,10 @@ class GatunClient(_ValueEncoder):
                         f"CallbackTimeoutError: Callback execution exceeded {self.callback_timeout}s timeout",
                     )
                     return
-                elif result_holder["error"] is not None:
-                    raise cast(Exception, result_holder["error"])
-                else:
-                    self._send_callback_response(
-                        callback_id, result_holder["result"], False, None
-                    )
+                if result_holder["error"] is not None:
+                    raise cast(BaseException, result_holder["error"])
+                result = result_holder["result"]
+            self._send_callback_response(callback_id, result, False, None)
         except ReentrancyError:
             # Propagate reentrancy error with clear message
             self._send_callback_response(
@@ -2427,8 +2660,13 @@ class GatunClient(_ValueEncoder):
             )
         except Exception as e:  # noqa: BLE001 - any callback failure is forwarded to Java
             self._send_callback_response(callback_id, None, True, str(e))
-        finally:
-            self._in_callback = False
+        except BaseException as e:
+            # Ctrl-C or sys.exit() inside the callback. Java gets an answer so it
+            # stops waiting, and the exception carries on in this thread.
+            self._send_callback_response(
+                callback_id, None, True, f"{type(e).__name__}: {e}"
+            )
+            raise
 
     def _unpack_arrow_batch(self, arrow_batch) -> ArrowTableView:
         """Unpack an ArrowBatchDescriptor from Java into an ArrowTableView.
@@ -2445,7 +2683,6 @@ class GatunClient(_ValueEncoder):
         Returns:
             ArrowTableView wrapping the reconstructed table with epoch validation
         """
-        import ctypes
 
         from gatun.arena import _validate_supported_schema, deserialize_schema
 
@@ -2479,10 +2716,14 @@ class GatunClient(_ValueEncoder):
             _validate_supported_schema(schema)
             self._arrow_schema_cache[schema_hash] = schema
 
-        # Get base address of payload zone in shared memory
+        # The buffers are slices of a memoryview of the mapping. Each one holds a
+        # buffer export, so the mapping cannot be released while a table built on
+        # them is alive: close() then leaves it mapped until the table is
+        # collected. A buffer made from a raw address would be left pointing at
+        # unmapped memory, and reading the table would crash the process.
         assert self.shm is not None, "Not connected"
-        base_address = ctypes.addressof(ctypes.c_char.from_buffer(self.shm))
-        payload_base = base_address + self.payload_offset
+        payload = memoryview(self.shm)[self.payload_offset : self.response_offset]
+        payload_size = len(payload)
 
         # Build PyArrow buffers from buffer descriptors
         buffers: list[pa.Buffer | None] = []
@@ -2495,10 +2736,13 @@ class GatunClient(_ValueEncoder):
                 # Zero-length buffer (e.g., no validity bitmap when no nulls)
                 buffers.append(None)
             else:
-                # Create zero-copy buffer backed by shared memory
-                buf_address = payload_base + offset
-                buf = pa.foreign_buffer(buf_address, length, base=self.shm)
-                buffers.append(buf)
+                if offset < 0 or length < 0 or offset + length > payload_size:
+                    raise ProtocolDesyncError(
+                        f"Arrow buffer {i} lies outside the payload zone "
+                        f"(offset {offset}, length {length})"
+                    )
+                # Zero-copy buffer backed by shared memory
+                buffers.append(pa.py_buffer(payload[offset : offset + length]))
 
         # Build field nodes as (length, null_count) tuples
         field_nodes = []
@@ -2566,7 +2810,18 @@ class GatunClient(_ValueEncoder):
 
         # Send it (don't wait for response - Java is waiting for this)
         # Java doesn't send a response for CallbackResponse, so expects_response=False
-        self._send_raw(builder.Output(), expects_response=False)
+        data = builder.Output()
+        if len(data) > self.payload_offset and not is_error:
+            # Java is waiting; it has to hear something that fits
+            self._send_callback_response(
+                callback_id,
+                None,
+                True,
+                f"Callback result is too large to return: {len(data):,} bytes "
+                f"exceeds the {self.payload_offset:,} byte command zone",
+            )
+            return
+        self._send_raw(data, expects_response=False)
 
     def create_object(self, class_name, *args):
         builder = self._get_builder(large=True)
@@ -2808,6 +3063,17 @@ class GatunClient(_ValueEncoder):
         builder.Finish(cmd)
 
         return cast(str, self._send_raw(builder.Output()))
+
+    def _reflect_cached(self, full_name: str) -> str:
+        """reflect(), remembering the answer.
+
+        "none" is not remembered: it can mean a class that is not loadable yet.
+        """
+        cached = self._reflect_cache.get(full_name)
+        if cached is None:
+            cached = self.reflect(full_name)
+            _remember_reflection(self._reflect_cache, full_name, cached)
+        return cached
 
     def is_instance_of(self, obj, class_name: str) -> bool:
         """Check if a Java object is an instance of a class.
@@ -3188,12 +3454,14 @@ class GatunClient(_ValueEncoder):
         if self._dead or self.sock is None or self.sock.fileno() == -1:
             return
         self._pending_frees.append(object_id)
-        if not self._in_callback:
+        if threading.get_ident() not in self._callback_threads:
             try:
-                self._flush_pending_frees()
+                with self._exchange_lock:
+                    self._flush_pending_frees()
             except OSError:
                 pass
 
+    @_holding_channel
     def send_arrow_table(self, table):
         """Send an Arrow table to Java via shared memory.
 
@@ -3253,33 +3521,31 @@ class GatunClient(_ValueEncoder):
         if total_rows == 0:
             return [self.send_arrow_table(table)]
 
-        # If batch_size not specified, try to estimate optimal size
         if batch_size is None:
-            # Estimate bytes per row by sampling first 100 rows
-            sample_size = min(100, total_rows)
-            sample = table.slice(0, sample_size)
-            sink = pa.BufferOutputStream()
-            with pa.ipc.new_stream(sink, sample.schema) as writer:
-                writer.write_table(sample)
-            sample_bytes = len(sink.getvalue())
-
-            # Estimate bytes per row (subtract ~200 bytes for schema overhead)
-            schema_overhead = 200
-            bytes_per_row = max(1, (sample_bytes - schema_overhead) / sample_size)
-
-            # Target 80% of max payload to leave margin
-            target_size = int(max_payload_size * 0.8)
-            batch_size = max(1, int((target_size - schema_overhead) / bytes_per_row))
+            # Sized from the whole table, not its first rows: rows differ in size,
+            # and a sample of small ones gives batches too large to send
+            bytes_per_row = max(1.0, table.nbytes / total_rows)
+            batch_size = max(1, int(max_payload_size * 0.8 / bytes_per_row))
 
         responses = []
-        for start in range(0, total_rows, batch_size):
-            end = min(start + batch_size, total_rows)
-            batch = table.slice(start, end - start)
-            response = self.send_arrow_table(batch)
-            responses.append(response)
+        start = 0
+        while start < total_rows:
+            count = min(batch_size, total_rows - start)
+            while True:
+                try:
+                    responses.append(self.send_arrow_table(table.slice(start, count)))
+                    break
+                except PayloadTooLargeError:
+                    # These rows are larger than the average. Nothing was sent
+                    # (the size is checked first), so send fewer of them.
+                    if count == 1:
+                        raise
+                    count //= 2
+            start += count
 
         return responses
 
+    @_holding_channel
     def send_arrow_buffers(
         self,
         table: pa.Table | pa.RecordBatch,
@@ -3315,9 +3581,7 @@ class GatunClient(_ValueEncoder):
                                       (e.g., dictionary encoding).
 
         Example:
-            from gatun.arena import PayloadArena
-
-            arena = PayloadArena(Path("~/gatun_payload.shm"), 64 * 1024 * 1024)
+            arena = client.get_payload_arena()
             schema_cache = {}
 
             # Send multiple tables, reusing the arena
@@ -3333,6 +3597,15 @@ class GatunClient(_ValueEncoder):
             estimate_arrow_size,
             serialize_schema,
         )
+
+        if getattr(arena, "_mmap", None) is not self.shm:
+            # Java reads the buffers out of this client's shared memory, at the
+            # offsets the arena hands out. Offsets into any other arena would be
+            # read as whatever happens to be at those places.
+            raise ValueError(
+                "send_arrow_buffers needs the arena from client.get_payload_arena(); "
+                "this arena is not part of the client's shared memory"
+            )
 
         if isinstance(table, pa.RecordBatch):
             # Wrapping a batch in a Table shares its buffers; nothing is copied
@@ -3427,6 +3700,7 @@ class GatunClient(_ValueEncoder):
         self._arrow_loaded_end = loaded_end
         return response
 
+    @_holding_channel
     def reset_payload_arena(self):
         """Signal Java to reset its view of the payload arena.
 
@@ -3437,8 +3711,8 @@ class GatunClient(_ValueEncoder):
         get_arrow_data() calls become invalid. Accessing them will raise
         StaleArenaError. Copy the data you need before resetting.
         """
-        # Increment epoch to invalidate any outstanding ArrowTableView objects
-        self._arena_epoch += 1
+        # Outstanding ArrowTableViews are invalid from here on, whatever happens
+        self._payload_generation += 1
 
         builder = self._get_builder()
 
@@ -3448,7 +3722,10 @@ class GatunClient(_ValueEncoder):
         builder.Finish(cmd)
 
         response = self._send_raw(builder.Output())
-        # Only once Java has let go of the batch is its memory free to reuse
+        # Java has advanced its epoch and let go of the batch. Advancing ours
+        # before knowing that would leave the two apart after a failed reset, and
+        # every later send would be refused as stale.
+        self._arena_epoch += 1
         self._arrow_loaded_end = 0
         return response
 
@@ -3462,6 +3739,7 @@ class GatunClient(_ValueEncoder):
         if end > (self.response_offset - self.payload_offset) // 2:
             self._payload_generation += 1
 
+    @_holding_channel
     def get_arrow_data(self) -> ArrowTableView:
         """Retrieve Arrow data from Java via zero-copy transfer.
 
@@ -3512,6 +3790,7 @@ class GatunClient(_ValueEncoder):
         view._payload_generation = self._payload_generation
         return view
 
+    @_holding_channel
     def arrow_to_java(self, table: pa.Table | pa.RecordBatch) -> JavaObject:
         """Copy an Arrow table into the JVM and return a handle to it.
 
@@ -3548,6 +3827,7 @@ class GatunClient(_ValueEncoder):
         command = _finish_arrow_to_object(self._get_builder(), offset, stream.size)
         return cast(JavaObject, self._send_raw(command))
 
+    @_holding_channel
     def arrow_from_java(self, table: JavaObject | int) -> pa.Table:
         """Copy an Arrow table held by a Java object into Python.
 
@@ -3583,46 +3863,47 @@ class GatunClient(_ValueEncoder):
         self._note_payload_write(offset + length)
         return _read_arrow_stream(self, (offset, length))
 
-    def _get_request_id(self) -> int:
-        """Get the next request ID for cancellation support."""
-        request_id = self._next_request_id
-        self._next_request_id += 1
-        return request_id
+    def cancel(self) -> bool:
+        """Interrupt the request this client is running. Call it from another thread.
 
-    def cancel(self, request_id: int) -> bool:
-        """Cancel a running request by its ID.
+        The request's thread is interrupted on the server. Java code that is
+        blocked in an interruptible call (sleeping, waiting, most I/O, a Spark
+        job) stops there; code that polls ``GatunServer.checkCancelled()`` or
+        ``Thread.interrupted()`` stops at its next check; code that does neither
+        runs to completion. A cancelled request raises CancelledException in the
+        thread that made it.
 
-        This sends a cancellation signal to the Java server. The server will
-        attempt to interrupt the running operation, which will raise a
-        CancelledException on the next response.
-
-        Note: Cancellation is cooperative - the operation must check for
-        cancellation to actually stop. Long-running Java operations that
-        don't check Thread.interrupted() may not respond to cancellation.
-
-        Args:
-            request_id: The ID of the request to cancel (returned by operations
-                       when using request IDs).
+        The signal travels on a short-lived connection of its own, because the
+        client's channel is occupied by the request being cancelled.
 
         Returns:
-            True if the cancel request was acknowledged by the server.
+            True if a request was running and was signalled; False if there was
+            nothing to cancel.
 
         Example:
-            # In async context or with threading:
-            request_id = client._get_request_id()
-            # ... start operation with request_id in another thread ...
-            client.cancel(request_id)  # Cancel it
+            worker = threading.Thread(target=lambda: client.jvm.my.Job.run())
+            worker.start()
+            client.cancel()
         """
-        builder = self._get_builder()
-
-        Cmd.CommandStart(builder)
-        Cmd.CommandAddAction(builder, Act.Action.Cancel)
-        Cmd.CommandAddRequestId(builder, request_id)
-        cmd = Cmd.CommandEnd(builder)
-        builder.Finish(cmd)
-
-        result = self._send_raw(builder.Output())
-        return result is True
+        if self._dead or self._closed or self.memory_path is None:
+            return False
+        control = GatunClient(
+            self.socket_path,
+            socket_timeout=self.handshake_timeout,
+            handshake_timeout=self.handshake_timeout,
+        )
+        try:
+            if not control.connect():
+                return False
+            builder = flatbuffers.Builder(256)
+            session = builder.CreateString(self.memory_path)
+            Cmd.CommandStart(builder)
+            Cmd.CommandAddAction(builder, Act.Action.Cancel)
+            Cmd.CommandAddTargetName(builder, session)
+            builder.Finish(Cmd.CommandEnd(builder))
+            return control._send_raw(builder.Output()) is True
+        finally:
+            control.close()
 
     def batch(self, stop_on_error: bool = False) -> BatchContext:
         """Create a batch context for executing multiple commands in one round-trip.
@@ -3662,6 +3943,7 @@ class GatunClient(_ValueEncoder):
         return BatchContext(self, stop_on_error)
 
     def close(self):
+        self._closed = True
         try:
             # The socket goes first and on its own: it is what ends the session on
             # the server, and a failure to release the mapping must not keep it open.
@@ -3680,8 +3962,11 @@ class GatunClient(_ValueEncoder):
 
     def __enter__(self):
         # Only connect if not already connected
-        if self.shm is None:
-            self.connect()
+        if self.shm is None and not self.connect():
+            raise RuntimeError(
+                f"Failed to connect to Gatun server at {self.socket_path}: "
+                f"{self.connect_error}"
+            ) from self.connect_error
         return self
 
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
@@ -3714,6 +3999,10 @@ class BatchResult:
         """
         if not self._batch._executed:
             raise RuntimeError("Must call batch.execute() before getting results")
+        if self._batch._error is not None:
+            raise RuntimeError(
+                f"The batch failed as a whole: {self._batch._error}"
+            ) from self._batch._error
         result = self._batch._results[self._index]
         if isinstance(result, Exception):
             raise result
@@ -3728,6 +4017,8 @@ class BatchResult:
         """
         if not self._batch._executed:
             raise RuntimeError("Must call batch.execute() before checking errors")
+        if self._batch._error is not None:
+            return True
         return isinstance(self._batch._results[self._index], Exception)
 
 
@@ -3752,6 +4043,8 @@ class BatchContext:
         self._targets: list[JavaObject] = []
         self._results: list = []
         self._executed = False
+        # Set when the batch was sent and no results came back
+        self._error: BaseException | None = None
 
     def __enter__(self) -> Self:
         return self
@@ -3854,10 +4147,15 @@ class BatchContext:
         """
         if self._executed:
             return self._results
-        self._executed = True
 
         if not self._command_data:
+            self._executed = True
             return []
+
+        # A batch is a request like any other: not allowed while Java is waiting
+        # for a callback's result. Checked before building, which uses the
+        # client's shared builder.
+        self._client._check_reentrancy()
 
         # Build the batch command
         builder = self._client._get_builder(large=True)
@@ -3913,90 +4211,28 @@ class BatchContext:
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        # Send and get response
-        # We need to handle the batch response specially
+        # Nothing has been sent up to here, so a failure above (an argument that
+        # cannot be encoded, say) leaves the batch as it was. From here on it
+        # counts as executed whatever happens: Java may have run some of it.
         data = builder.Output()
-
-        # Check if connection is dead - fail fast
-        if self._client._dead:
-            raise DeadConnectionError(
-                "Connection is dead after protocol error. Create a new client."
+        if len(data) > self._client.payload_offset:
+            raise PayloadTooLargeError(
+                len(data), self._client.payload_offset, "Command"
             )
 
-        # Validate command size
-        max_command_size = self._client.payload_offset
-        if len(data) > max_command_size:
-            raise PayloadTooLargeError(len(data), max_command_size, "Command")
-
-        # A batch is a request like any other: not allowed while Java is waiting
-        # for a callback's result
-        if self._client._in_callback:
-            raise ReentrancyError("Cannot execute a batch from within a callback.")
-
-        # Release objects whose wrappers were garbage collected since the last request
-        if self._client._pending_frees:
-            self._client._flush_pending_frees()
-
-        # Write to shared memory
-        self._client.shm.seek(self._client.command_offset)
-        self._client.shm.write(data)
-        self._client.shm.flush()
-
-        # Signal Java
-        if not self._client.sock or self._client.sock.fileno() == -1:
-            self._client._mark_dead()
-            raise DeadConnectionError("Socket already closed")
-
+        self._executed = True
         try:
-            self._client.sock.sendall(struct.pack("<I", len(data)))
-        except (OSError, BrokenPipeError, ConnectionResetError) as e:
-            self._client._mark_dead()
-            raise ProtocolDesyncError(f"Socket error sending batch command: {e}")
-
-        # Read response with timeout to prevent indefinite hang
-        try:
-            sz_data = _recv_exactly(
-                self._client.sock, 4, timeout=self._client.socket_timeout
-            )
-        except SocketTimeoutError:
-            self._client._mark_dead()
+            # The ordinary exchange: it serves callbacks that the batched calls
+            # trigger, and marks the connection dead if it is interrupted
+            batch_resp = self._client._send_raw(data)
+        except BaseException as e:
+            self._error = e
             raise
-        except (RuntimeError, OSError, BrokenPipeError, ConnectionResetError) as e:
-            self._client._mark_dead()
-            raise ProtocolDesyncError(f"Socket error reading batch response: {e}")
-
-        sz = struct.unpack("<I", sz_data)[0]
-
-        # Validate response size
-        max_response_size = self._client.memory_size - self._client.response_offset
-        if sz == 0 or sz > RESPONSE_ZONE_SIZE or sz > max_response_size:
-            self._client._mark_dead()
-            raise ProtocolDesyncError(
-                f"Invalid batch response size: {sz}", response_size=sz
-            )
-
-        self._client.shm.seek(self._client.response_offset)
-        resp_buf = self._client.shm.read(sz)
-        self._targets.clear()
-
-        # Parse response
-        resp = Response.Response.GetRootAsResponse(resp_buf, 0)
-
-        if resp.IsError():
-            # Top-level error (shouldn't happen for batch, but handle it)
-            error_msg = resp.ErrorMsg().decode("utf-8")
-            error_type_bytes = resp.ErrorType()
-            error_type = (
-                error_type_bytes.decode("utf-8")
-                if error_type_bytes
-                else "java.lang.RuntimeException"
-            )
-            self._client._raise_java_exception(error_type, error_msg)
-
-        # Unpack BatchResponse
-        batch_resp = resp.Batch()
-        if batch_resp is None:
-            raise RuntimeError("Expected BatchResponse but got None")
+        finally:
+            self._targets.clear()
+        if not isinstance(batch_resp, BatchResponse.BatchResponse):
+            self._error = RuntimeError("Expected BatchResponse but got something else")
+            raise self._error
 
         _ = batch_resp.ErrorIndex()  # Available for debugging
         response_count = batch_resp.ResponsesLength()
@@ -4042,8 +4278,7 @@ class BatchContext:
 
         if error_type == "java.lang.InterruptedException":
             match = re.search(r"Request (\d+) was cancelled", error_msg)
-            request_id = int(match.group(1)) if match else 0
-            return CancelledException(request_id)
+            return CancelledException(int(match.group(1)) if match else None)
 
         # Get exception class
         exc_class = _JAVA_EXCEPTION_MAP.get(error_type, JavaException)

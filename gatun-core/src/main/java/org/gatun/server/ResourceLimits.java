@@ -15,6 +15,7 @@ package org.gatun.server;
  *   <li>gatun.limits.max_nesting_depth - Max nesting depth for collections (default: 100)
  *   <li>gatun.limits.max_batch_size - Max commands in a batch (default: 10,000)
  *   <li>gatun.limits.max_method_calls - Max calls in invoke_methods (default: 10,000)
+ *   <li>gatun.limits.max_sessions - Sessions served at once (default: 0 = unlimited)
  *   <li>gatun.limits.session_idle_timeout_ms - Session idle timeout (default: 0 = disabled)
  *   <li>gatun.limits.max_arrow_bytes - Max Arrow buffer bytes per session (default: 1GB)
  * </ul>
@@ -56,6 +57,9 @@ public final class ResourceLimits {
       Integer.getInteger("gatun.limits.max_create_objects", 10_000);
 
   // ========== SESSION LIMITS ==========
+
+  /** Sessions the server serves at once; further connections are refused (0 = unlimited). */
+  public static final int MAX_SESSIONS = Integer.getInteger("gatun.limits.max_sessions", 0);
 
   /** Session idle timeout in milliseconds (0 = disabled). */
   public static final long SESSION_IDLE_TIMEOUT_MS =
