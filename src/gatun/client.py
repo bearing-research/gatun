@@ -1300,6 +1300,13 @@ def _unpack_array_impl(array_val, client: Any, ref_class: Any):
             tab, _ARRAYVAL_INT_VALUES_OFFSET, length, "i", 4
         )
         return JavaArray(values, element_type="Short")
+    elif elem_type == ElementType.ElementType.Char:
+        # Char was widened to int; each element becomes a one-character string
+        length = array_val.IntValuesLength()
+        values = _unpack_flatbuffer_vector(
+            tab, _ARRAYVAL_INT_VALUES_OFFSET, length, "i", 4
+        )
+        return JavaArray(map(chr, values), element_type="Char")
     elif elem_type == ElementType.ElementType.String:
         result = JavaArray(element_type="String")
         for i in range(array_val.ObjectValuesLength()):
@@ -1319,7 +1326,411 @@ def _unpack_array_impl(array_val, client: Any, ref_class: Any):
         return result
 
 
-class GatunClient:
+class _ValueEncoder:
+    """Builds FlatBuffers values from Python arguments.
+
+    Shared by the sync and async clients. Nothing here may talk to the server:
+    the command these values belong to is still being built.
+    """
+
+    # Wrapper classes that are sent as object references
+    _object_ref_types: tuple[type, ...] = (JavaObject,)
+
+    def _create_string(self, builder: flatbuffers.Builder, s: str) -> int:
+        return cast(int, builder.CreateString(s))
+
+    def _build_argument(self, builder, value):
+        """Convert a Python value to a FlatBuffer Argument.
+
+        If value is a TypeHint wrapper, extracts the actual value and
+        includes the type hint for Java overload resolution.
+        """
+        # Extract type hint if present
+        type_hint = None
+        if isinstance(value, TypeHint):
+            type_hint = value.java_type
+            value = value.value
+
+        # Special case: char type hint with single-character string
+        if type_hint in ("char", "Character", "java.lang.Character"):
+            if isinstance(value, str) and len(value) == 1:
+                CharVal.Start(builder)
+                CharVal.AddV(builder, ord(value[0]))
+                val_type, val_off = Value.Value.CharVal, CharVal.End(builder)
+            elif isinstance(value, int):
+                CharVal.Start(builder)
+                CharVal.AddV(builder, value)
+                val_type, val_off = Value.Value.CharVal, CharVal.End(builder)
+            else:
+                raise ValueError(
+                    f"char type hint requires single-character string or int, got {type(value)}"
+                )
+        else:
+            val_type, val_off = self._build_value(builder, value)
+
+        # Build type hint string offset if present (must be before Start)
+        type_hint_off = 0
+        if type_hint:
+            type_hint_off = self._create_string(builder, type_hint)
+
+        Argument.Start(builder)
+        Argument.AddValType(builder, val_type)
+        Argument.AddVal(builder, val_off)
+        if type_hint_off:
+            Argument.AddTypeHint(builder, type_hint_off)
+        return Argument.End(builder)
+
+    def _build_value(self, builder, value):
+        """Build a Value union and return (type, offset)."""
+        if isinstance(value, str):
+            str_off = self._create_string(builder, value)
+            StringVal.Start(builder)
+            StringVal.AddV(builder, str_off)
+            return Value.Value.StringVal, StringVal.End(builder)
+        elif isinstance(value, bool):  # Must check before int (bool is subclass of int)
+            BoolVal.Start(builder)
+            BoolVal.AddV(builder, value)
+            return Value.Value.BoolVal, BoolVal.End(builder)
+        elif isinstance(value, int):
+            IntVal.Start(builder)
+            IntVal.AddV(builder, value)
+            return Value.Value.IntVal, IntVal.End(builder)
+        elif isinstance(value, float):
+            DoubleVal.Start(builder)
+            DoubleVal.AddV(builder, value)
+            return Value.Value.DoubleVal, DoubleVal.End(builder)
+        elif isinstance(value, self._object_ref_types):
+            ObjectRef.Start(builder)
+            ObjectRef.AddId(builder, value.object_id)
+            return Value.Value.ObjectRef, ObjectRef.End(builder)
+        elif isinstance(value, JavaArray):
+            # JavaArray came from Java and should go back as ArrayVal (Java array)
+            return self._build_java_array(builder, value)
+        elif isinstance(value, (list, tuple, range)):
+            # Auto-convert Python list/tuple/range to ListVal (Java ArrayList)
+            # These are treated the same as lists for Java interop
+            items = list(value) if isinstance(value, range) else value
+            item_offsets = []
+            for item in items:
+                item_offsets.append(self._build_argument(builder, item))
+            ListVal.StartItemsVector(builder, len(item_offsets))
+            for offset in reversed(item_offsets):
+                builder.PrependUOffsetTRelative(offset)
+            items_vec = builder.EndVector()
+            ListVal.Start(builder)
+            ListVal.AddItems(builder, items_vec)
+            return Value.Value.ListVal, ListVal.End(builder)
+        elif isinstance(value, dict):
+            # Auto-convert Python dict to MapVal
+            entry_offsets = []
+            for k, v in value.items():
+                key_arg = self._build_argument(builder, k)
+                val_arg = self._build_argument(builder, v)
+                MapEntry.Start(builder)
+                MapEntry.AddKey(builder, key_arg)
+                MapEntry.AddValue(builder, val_arg)
+                entry_offsets.append(MapEntry.End(builder))
+            MapVal.StartEntriesVector(builder, len(entry_offsets))
+            for offset in reversed(entry_offsets):
+                builder.PrependUOffsetTRelative(offset)
+            entries_vec = builder.EndVector()
+            MapVal.Start(builder)
+            MapVal.AddEntries(builder, entries_vec)
+            return Value.Value.MapVal, MapVal.End(builder)
+        elif isinstance(value, (pa.Array, pa.ChunkedArray)):
+            # Convert PyArrow array to ArrayVal
+            if isinstance(value, pa.ChunkedArray):
+                value = value.combine_chunks()
+            return self._build_arrow_array(builder, value)
+        elif isinstance(value, (bytes, bytearray)):
+            # Convert bytes to byte array
+            return self._build_byte_array(builder, value)
+        elif isinstance(value, array.array):
+            # Convert Python array.array to ArrayVal
+            return self._build_typed_array(builder, value)
+        elif value is None:
+            from gatun.generated.org.gatun.protocol import NullVal
+
+            NullVal.Start(builder)
+            return Value.Value.NullVal, NullVal.End(builder)
+        else:
+            temporal = _encode_temporal(value)
+            if temporal is not None:
+                kind, temporal_value = temporal
+                TemporalVal.Start(builder)
+                TemporalVal.AddKind(builder, kind)
+                TemporalVal.AddV(builder, temporal_value)
+                return Value.Value.TemporalVal, TemporalVal.End(builder)
+            else:
+                raise TypeError(f"Unsupported argument type: {type(value)}")
+
+    def _build_arrow_array(self, builder, arr: pa.Array):
+        """Build an ArrayVal from a PyArrow Array.
+
+        Uses Arrow's buffer directly for efficient serialization of primitive types.
+        """
+        # Mapping of Arrow types to (element_type, add_values_fn, itemsize, target_arrow_type)
+        # itemsize is needed for creating properly-typed FlatBuffers vectors
+        # target_arrow_type is used for casting when needed (e.g., float32 -> float64)
+        primitive_types = {
+            pa.int32(): (ElementType.ElementType.Int, ArrayVal.AddIntValues, 4, None),
+            pa.int64(): (ElementType.ElementType.Long, ArrayVal.AddLongValues, 8, None),
+            pa.float64(): (
+                ElementType.ElementType.Double,
+                ArrayVal.AddDoubleValues,
+                8,
+                None,
+            ),
+            pa.float32(): (
+                ElementType.ElementType.Float,
+                ArrayVal.AddDoubleValues,
+                8,  # After widening to float64
+                pa.float64(),  # Widen float32 to float64 for transmission
+            ),
+            # Note: bool handled specially below due to Arrow's bit-packing
+            pa.int8(): (ElementType.ElementType.Byte, ArrayVal.AddByteValues, 1, None),
+            pa.uint8(): (
+                ElementType.ElementType.Byte,
+                ArrayVal.AddByteValues,
+                1,
+                pa.int8(),
+            ),
+            pa.int16(): (
+                ElementType.ElementType.Short,
+                ArrayVal.AddIntValues,
+                4,  # After widening to int32
+                pa.int32(),  # Widen short to int for transmission
+            ),
+        }
+
+        arrow_type = arr.type
+
+        is_string = pa.types.is_string(arrow_type) or pa.types.is_large_string(
+            arrow_type
+        )
+        if arr.null_count and (
+            arrow_type == pa.bool_() or arrow_type in primitive_types
+        ):
+            raise ValueError(
+                f"Cannot convert a pyarrow {arrow_type} array containing nulls to a "
+                "Java primitive array. Fill or drop the nulls first."
+            )
+
+        # Special handling for bool arrays - Arrow uses bit-packing, Java expects byte-per-bool
+        if arrow_type == pa.bool_():
+            # Convert to byte array (1 byte per boolean)
+            packed = struct.pack(f"<{len(arr)}B", *(1 if b.as_py() else 0 for b in arr))
+            vec_off = _create_typed_vector(builder, packed, 1, len(arr))
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Bool)
+            ArrayVal.AddBoolValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+
+        if arrow_type in primitive_types:
+            elem_type, add_values_fn, itemsize, cast_type = primitive_types[arrow_type]
+            if cast_type is not None:
+                arr = arr.cast(cast_type)
+            # Data buffer (index 1; index 0 is the validity bitmap). A sliced array
+            # shares its parent's buffer, so take only this array's window.
+            start = arr.offset * itemsize
+            buf = arr.buffers()[1][start : start + len(arr) * itemsize].to_pybytes()
+            vec_off = _create_typed_vector(builder, buf, itemsize, len(arr))
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, elem_type)
+            add_values_fn(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+
+        # String array - serialize each element
+        if is_string:
+            item_offsets = [
+                self._build_argument(builder, arr[i].as_py()) for i in range(len(arr))
+            ]
+            ArrayVal.StartObjectValuesVector(builder, len(item_offsets))
+            for offset in reversed(item_offsets):
+                builder.PrependUOffsetTRelative(offset)
+            vec_off = builder.EndVector()
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.String)
+            ArrayVal.AddObjectValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+
+        # Fallback: treat as object array, serialize each element
+        item_offsets = [
+            self._build_argument(builder, arr[i].as_py()) for i in range(len(arr))
+        ]
+        ArrayVal.StartObjectValuesVector(builder, len(item_offsets))
+        for offset in reversed(item_offsets):
+            builder.PrependUOffsetTRelative(offset)
+        vec_off = builder.EndVector()
+        ArrayVal.Start(builder)
+        ArrayVal.AddElementType(builder, ElementType.ElementType.Object)
+        ArrayVal.AddObjectValues(builder, vec_off)
+        return Value.Value.ArrayVal, ArrayVal.End(builder)
+
+    def _build_byte_array(self, builder, data):
+        """Build an ArrayVal from bytes or bytearray."""
+        vec_off = builder.CreateByteVector(data)
+        ArrayVal.Start(builder)
+        ArrayVal.AddElementType(builder, ElementType.ElementType.Byte)
+        ArrayVal.AddByteValues(builder, vec_off)
+        return Value.Value.ArrayVal, ArrayVal.End(builder)
+
+    def _build_typed_array(self, builder, arr):
+        """Build an ArrayVal from Python array.array.
+
+        Uses array.tobytes() for direct byte conversion and _create_typed_vector
+        for proper FlatBuffers vector creation.
+        """
+        typecode = arr.typecode
+        n = len(arr)
+        # array.array.tobytes() gives us the raw bytes directly
+        if typecode == "i":  # int (usually 32-bit)
+            vec_off = _create_typed_vector(builder, arr.tobytes(), 4, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Int)
+            ArrayVal.AddIntValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif typecode == "l" or typecode == "q":  # long
+            vec_off = _create_typed_vector(builder, arr.tobytes(), 8, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Long)
+            ArrayVal.AddLongValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif typecode == "d":  # double
+            vec_off = _create_typed_vector(builder, arr.tobytes(), 8, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Double)
+            ArrayVal.AddDoubleValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif typecode == "f":  # float -> widen to double
+            # Need to widen float32 to float64
+            widened = struct.pack(f"<{n}d", *arr)
+            vec_off = _create_typed_vector(builder, widened, 8, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Float)
+            ArrayVal.AddDoubleValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif typecode == "b" or typecode == "B":  # byte
+            vec_off = _create_typed_vector(builder, arr.tobytes(), 1, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Byte)
+            ArrayVal.AddByteValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif typecode == "h" or typecode == "H":  # short -> widen to int
+            # Need to widen int16 to int32
+            widened = struct.pack(f"<{n}i", *arr)
+            vec_off = _create_typed_vector(builder, widened, 4, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Short)
+            ArrayVal.AddIntValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        else:
+            raise TypeError(f"Unsupported array.array typecode: {typecode}")
+
+    def _build_java_array(self, builder, java_array: JavaArray):
+        """Build an ArrayVal from a JavaArray (preserving array semantics for round-trip).
+
+        Uses struct.pack for efficient serialization and _create_typed_vector
+        for proper FlatBuffers vector creation.
+        """
+        elem_type = java_array.element_type
+        items = list(java_array)
+        n = len(items)
+
+        if elem_type == "Int":
+            packed = struct.pack(f"<{n}i", *items)
+            vec_off = _create_typed_vector(builder, packed, 4, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Int)
+            ArrayVal.AddIntValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif elem_type == "Long":
+            packed = struct.pack(f"<{n}q", *items)
+            vec_off = _create_typed_vector(builder, packed, 8, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Long)
+            ArrayVal.AddLongValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif elem_type == "Double":
+            packed = struct.pack(f"<{n}d", *items)
+            vec_off = _create_typed_vector(builder, packed, 8, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Double)
+            ArrayVal.AddDoubleValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif elem_type == "Float":
+            # Widen float to double for transmission
+            packed = struct.pack(f"<{n}d", *items)
+            vec_off = _create_typed_vector(builder, packed, 8, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Float)
+            ArrayVal.AddDoubleValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif elem_type == "Bool":
+            # Pack bools as bytes (0 or 1)
+            packed = struct.pack(f"<{n}B", *(1 if b else 0 for b in items))
+            vec_off = _create_typed_vector(builder, packed, 1, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Bool)
+            ArrayVal.AddBoolValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif elem_type == "Byte":
+            vec_off = _create_typed_vector(builder, bytes(items), 1, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Byte)
+            ArrayVal.AddByteValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif elem_type == "Short":
+            # Widen short to int for transmission
+            packed = struct.pack(f"<{n}i", *items)
+            vec_off = _create_typed_vector(builder, packed, 4, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Short)
+            ArrayVal.AddIntValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif elem_type == "Char":
+            # Widen char to int for transmission
+            codes = [ord(c) if isinstance(c, str) else c for c in items]
+            if any(not 0 <= code <= 0xFFFF for code in codes):
+                raise ValueError(
+                    "Char array elements must be single UTF-16 code units "
+                    "(characters up to U+FFFF)"
+                )
+            packed = struct.pack(f"<{n}i", *codes)
+            vec_off = _create_typed_vector(builder, packed, 4, n)
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Char)
+            ArrayVal.AddIntValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        elif elem_type == "String":
+            # String array - need to build each as Argument
+            item_offsets = []
+            for item in items:
+                item_offsets.append(self._build_argument(builder, item))
+            ArrayVal.StartObjectValuesVector(builder, len(item_offsets))
+            for offset in reversed(item_offsets):
+                builder.PrependUOffsetTRelative(offset)
+            vec_off = builder.EndVector()
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.String)
+            ArrayVal.AddObjectValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+        else:
+            # Object array - need to build each as Argument
+            item_offsets = []
+            for item in items:
+                item_offsets.append(self._build_argument(builder, item))
+            ArrayVal.StartObjectValuesVector(builder, len(item_offsets))
+            for offset in reversed(item_offsets):
+                builder.PrependUOffsetTRelative(offset)
+            vec_off = builder.EndVector()
+            ArrayVal.Start(builder)
+            ArrayVal.AddElementType(builder, ElementType.ElementType.Object)
+            ArrayVal.AddObjectValues(builder, vec_off)
+            return Value.Value.ArrayVal, ArrayVal.End(builder)
+
+
+class GatunClient(_ValueEncoder):
     def __init__(
         self,
         socket_path=None,
@@ -1704,10 +2115,6 @@ class GatunClient:
     def _unpack_value(self, val_type: int, val_table: Any) -> Any:
         """Unpack a FlatBuffer Value union to a Python object."""
         return _unpack_value_impl(val_type, val_table, self, JavaObject)
-
-    def _unpack_array(self, array_val):
-        """Unpack an ArrayVal FlatBuffer to a JavaArray (preserves array semantics)."""
-        return _unpack_array_impl(array_val, self, JavaObject)
 
     def _read_response(self, timeout: float | None = None, _use_default: bool = True):
         """Read and parse a response from the server.
@@ -2642,382 +3049,6 @@ class GatunClient:
         builder.Finish(cmd)
 
         self._send_raw(builder.Output())
-
-    def _build_argument(self, builder, value):
-        """Convert a Python value to a FlatBuffer Argument.
-
-        If value is a TypeHint wrapper, extracts the actual value and
-        includes the type hint for Java overload resolution.
-        """
-        # Extract type hint if present
-        type_hint = None
-        if isinstance(value, TypeHint):
-            type_hint = value.java_type
-            value = value.value
-
-        # Special case: char type hint with single-character string
-        if type_hint in ("char", "Character", "java.lang.Character"):
-            if isinstance(value, str) and len(value) == 1:
-                CharVal.Start(builder)
-                CharVal.AddV(builder, ord(value[0]))
-                val_type, val_off = Value.Value.CharVal, CharVal.End(builder)
-            elif isinstance(value, int):
-                CharVal.Start(builder)
-                CharVal.AddV(builder, value)
-                val_type, val_off = Value.Value.CharVal, CharVal.End(builder)
-            else:
-                raise ValueError(
-                    f"char type hint requires single-character string or int, got {type(value)}"
-                )
-        else:
-            val_type, val_off = self._build_value(builder, value)
-
-        # Build type hint string offset if present (must be before Start)
-        type_hint_off = 0
-        if type_hint:
-            type_hint_off = self._create_string(builder, type_hint)
-
-        Argument.Start(builder)
-        Argument.AddValType(builder, val_type)
-        Argument.AddVal(builder, val_off)
-        if type_hint_off:
-            Argument.AddTypeHint(builder, type_hint_off)
-        return Argument.End(builder)
-
-    def _build_value(self, builder, value):
-        """Build a Value union and return (type, offset)."""
-        if isinstance(value, str):
-            str_off = self._create_string(builder, value)
-            StringVal.Start(builder)
-            StringVal.AddV(builder, str_off)
-            return Value.Value.StringVal, StringVal.End(builder)
-        elif isinstance(value, bool):  # Must check before int (bool is subclass of int)
-            BoolVal.Start(builder)
-            BoolVal.AddV(builder, value)
-            return Value.Value.BoolVal, BoolVal.End(builder)
-        elif isinstance(value, int):
-            IntVal.Start(builder)
-            IntVal.AddV(builder, value)
-            return Value.Value.IntVal, IntVal.End(builder)
-        elif isinstance(value, float):
-            DoubleVal.Start(builder)
-            DoubleVal.AddV(builder, value)
-            return Value.Value.DoubleVal, DoubleVal.End(builder)
-        elif isinstance(value, JavaObject):
-            ObjectRef.Start(builder)
-            ObjectRef.AddId(builder, value.object_id)
-            return Value.Value.ObjectRef, ObjectRef.End(builder)
-        elif isinstance(value, JavaArray):
-            # JavaArray came from Java and should go back as ArrayVal (Java array)
-            return self._build_java_array(builder, value)
-        elif isinstance(value, (list, tuple, range)):
-            # Auto-convert Python list/tuple/range to ListVal (Java ArrayList)
-            # These are treated the same as lists for Java interop
-            items = list(value) if isinstance(value, range) else value
-            item_offsets = []
-            for item in items:
-                item_offsets.append(self._build_argument(builder, item))
-            ListVal.StartItemsVector(builder, len(item_offsets))
-            for offset in reversed(item_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            items_vec = builder.EndVector()
-            ListVal.Start(builder)
-            ListVal.AddItems(builder, items_vec)
-            return Value.Value.ListVal, ListVal.End(builder)
-        elif isinstance(value, dict):
-            # Auto-convert Python dict to MapVal
-            entry_offsets = []
-            for k, v in value.items():
-                key_arg = self._build_argument(builder, k)
-                val_arg = self._build_argument(builder, v)
-                MapEntry.Start(builder)
-                MapEntry.AddKey(builder, key_arg)
-                MapEntry.AddValue(builder, val_arg)
-                entry_offsets.append(MapEntry.End(builder))
-            MapVal.StartEntriesVector(builder, len(entry_offsets))
-            for offset in reversed(entry_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            entries_vec = builder.EndVector()
-            MapVal.Start(builder)
-            MapVal.AddEntries(builder, entries_vec)
-            return Value.Value.MapVal, MapVal.End(builder)
-        elif isinstance(value, (pa.Array, pa.ChunkedArray)):
-            # Convert PyArrow array to ArrayVal
-            if isinstance(value, pa.ChunkedArray):
-                value = value.combine_chunks()
-            return self._build_arrow_array(builder, value)
-        elif isinstance(value, (bytes, bytearray)):
-            # Convert bytes to byte array
-            return self._build_byte_array(builder, value)
-        elif isinstance(value, array.array):
-            # Convert Python array.array to ArrayVal
-            return self._build_typed_array(builder, value)
-        elif value is None:
-            from gatun.generated.org.gatun.protocol import NullVal
-
-            NullVal.Start(builder)
-            return Value.Value.NullVal, NullVal.End(builder)
-        else:
-            temporal = _encode_temporal(value)
-            if temporal is not None:
-                kind, temporal_value = temporal
-                TemporalVal.Start(builder)
-                TemporalVal.AddKind(builder, kind)
-                TemporalVal.AddV(builder, temporal_value)
-                return Value.Value.TemporalVal, TemporalVal.End(builder)
-            else:
-                raise TypeError(f"Unsupported argument type: {type(value)}")
-
-    def _build_arrow_array(self, builder, arr: pa.Array):
-        """Build an ArrayVal from a PyArrow Array.
-
-        Uses Arrow's buffer directly for efficient serialization of primitive types.
-        """
-        # Mapping of Arrow types to (element_type, add_values_fn, itemsize, target_arrow_type)
-        # itemsize is needed for creating properly-typed FlatBuffers vectors
-        # target_arrow_type is used for casting when needed (e.g., float32 -> float64)
-        primitive_types = {
-            pa.int32(): (ElementType.ElementType.Int, ArrayVal.AddIntValues, 4, None),
-            pa.int64(): (ElementType.ElementType.Long, ArrayVal.AddLongValues, 8, None),
-            pa.float64(): (
-                ElementType.ElementType.Double,
-                ArrayVal.AddDoubleValues,
-                8,
-                None,
-            ),
-            pa.float32(): (
-                ElementType.ElementType.Float,
-                ArrayVal.AddDoubleValues,
-                8,  # After widening to float64
-                pa.float64(),  # Widen float32 to float64 for transmission
-            ),
-            # Note: bool handled specially below due to Arrow's bit-packing
-            pa.int8(): (ElementType.ElementType.Byte, ArrayVal.AddByteValues, 1, None),
-            pa.uint8(): (
-                ElementType.ElementType.Byte,
-                ArrayVal.AddByteValues,
-                1,
-                pa.int8(),
-            ),
-            pa.int16(): (
-                ElementType.ElementType.Short,
-                ArrayVal.AddIntValues,
-                4,  # After widening to int32
-                pa.int32(),  # Widen short to int for transmission
-            ),
-        }
-
-        arrow_type = arr.type
-
-        is_string = pa.types.is_string(arrow_type) or pa.types.is_large_string(
-            arrow_type
-        )
-        if arr.null_count and (
-            arrow_type == pa.bool_() or arrow_type in primitive_types
-        ):
-            raise ValueError(
-                f"Cannot convert a pyarrow {arrow_type} array containing nulls to a "
-                "Java primitive array. Fill or drop the nulls first."
-            )
-
-        # Special handling for bool arrays - Arrow uses bit-packing, Java expects byte-per-bool
-        if arrow_type == pa.bool_():
-            # Convert to byte array (1 byte per boolean)
-            packed = struct.pack(f"<{len(arr)}B", *(1 if b.as_py() else 0 for b in arr))
-            vec_off = _create_typed_vector(builder, packed, 1, len(arr))
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Bool)
-            ArrayVal.AddBoolValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-
-        if arrow_type in primitive_types:
-            elem_type, add_values_fn, itemsize, cast_type = primitive_types[arrow_type]
-            if cast_type is not None:
-                arr = arr.cast(cast_type)
-            # Data buffer (index 1; index 0 is the validity bitmap). A sliced array
-            # shares its parent's buffer, so take only this array's window.
-            start = arr.offset * itemsize
-            buf = arr.buffers()[1][start : start + len(arr) * itemsize].to_pybytes()
-            vec_off = _create_typed_vector(builder, buf, itemsize, len(arr))
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, elem_type)
-            add_values_fn(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-
-        # String array - serialize each element
-        if is_string:
-            item_offsets = [
-                self._build_argument(builder, arr[i].as_py()) for i in range(len(arr))
-            ]
-            ArrayVal.StartObjectValuesVector(builder, len(item_offsets))
-            for offset in reversed(item_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            vec_off = builder.EndVector()
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.String)
-            ArrayVal.AddObjectValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-
-        # Fallback: treat as object array, serialize each element
-        item_offsets = [
-            self._build_argument(builder, arr[i].as_py()) for i in range(len(arr))
-        ]
-        ArrayVal.StartObjectValuesVector(builder, len(item_offsets))
-        for offset in reversed(item_offsets):
-            builder.PrependUOffsetTRelative(offset)
-        vec_off = builder.EndVector()
-        ArrayVal.Start(builder)
-        ArrayVal.AddElementType(builder, ElementType.ElementType.Object)
-        ArrayVal.AddObjectValues(builder, vec_off)
-        return Value.Value.ArrayVal, ArrayVal.End(builder)
-
-    def _build_byte_array(self, builder, data):
-        """Build an ArrayVal from bytes or bytearray."""
-        vec_off = builder.CreateByteVector(data)
-        ArrayVal.Start(builder)
-        ArrayVal.AddElementType(builder, ElementType.ElementType.Byte)
-        ArrayVal.AddByteValues(builder, vec_off)
-        return Value.Value.ArrayVal, ArrayVal.End(builder)
-
-    def _build_typed_array(self, builder, arr):
-        """Build an ArrayVal from Python array.array.
-
-        Uses array.tobytes() for direct byte conversion and _create_typed_vector
-        for proper FlatBuffers vector creation.
-        """
-        typecode = arr.typecode
-        n = len(arr)
-        # array.array.tobytes() gives us the raw bytes directly
-        if typecode == "i":  # int (usually 32-bit)
-            vec_off = _create_typed_vector(builder, arr.tobytes(), 4, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Int)
-            ArrayVal.AddIntValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif typecode == "l" or typecode == "q":  # long
-            vec_off = _create_typed_vector(builder, arr.tobytes(), 8, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Long)
-            ArrayVal.AddLongValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif typecode == "d":  # double
-            vec_off = _create_typed_vector(builder, arr.tobytes(), 8, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Double)
-            ArrayVal.AddDoubleValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif typecode == "f":  # float -> widen to double
-            # Need to widen float32 to float64
-            widened = struct.pack(f"<{n}d", *arr)
-            vec_off = _create_typed_vector(builder, widened, 8, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Float)
-            ArrayVal.AddDoubleValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif typecode == "b" or typecode == "B":  # byte
-            vec_off = _create_typed_vector(builder, arr.tobytes(), 1, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Byte)
-            ArrayVal.AddByteValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif typecode == "h" or typecode == "H":  # short -> widen to int
-            # Need to widen int16 to int32
-            widened = struct.pack(f"<{n}i", *arr)
-            vec_off = _create_typed_vector(builder, widened, 4, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Short)
-            ArrayVal.AddIntValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        else:
-            raise TypeError(f"Unsupported array.array typecode: {typecode}")
-
-    def _build_java_array(self, builder, java_array: JavaArray):
-        """Build an ArrayVal from a JavaArray (preserving array semantics for round-trip).
-
-        Uses struct.pack for efficient serialization and _create_typed_vector
-        for proper FlatBuffers vector creation.
-        """
-        elem_type = java_array.element_type
-        items = list(java_array)
-        n = len(items)
-
-        if elem_type == "Int":
-            packed = struct.pack(f"<{n}i", *items)
-            vec_off = _create_typed_vector(builder, packed, 4, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Int)
-            ArrayVal.AddIntValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif elem_type == "Long":
-            packed = struct.pack(f"<{n}q", *items)
-            vec_off = _create_typed_vector(builder, packed, 8, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Long)
-            ArrayVal.AddLongValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif elem_type == "Double":
-            packed = struct.pack(f"<{n}d", *items)
-            vec_off = _create_typed_vector(builder, packed, 8, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Double)
-            ArrayVal.AddDoubleValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif elem_type == "Float":
-            # Widen float to double for transmission
-            packed = struct.pack(f"<{n}d", *items)
-            vec_off = _create_typed_vector(builder, packed, 8, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Float)
-            ArrayVal.AddDoubleValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif elem_type == "Bool":
-            # Pack bools as bytes (0 or 1)
-            packed = struct.pack(f"<{n}B", *(1 if b else 0 for b in items))
-            vec_off = _create_typed_vector(builder, packed, 1, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Bool)
-            ArrayVal.AddBoolValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif elem_type == "Byte":
-            vec_off = _create_typed_vector(builder, bytes(items), 1, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Byte)
-            ArrayVal.AddByteValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif elem_type == "Short":
-            # Widen short to int for transmission
-            packed = struct.pack(f"<{n}i", *items)
-            vec_off = _create_typed_vector(builder, packed, 4, n)
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Short)
-            ArrayVal.AddIntValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        elif elem_type == "String":
-            # String array - need to build each as Argument
-            item_offsets = []
-            for item in items:
-                item_offsets.append(self._build_argument(builder, item))
-            ArrayVal.StartObjectValuesVector(builder, len(item_offsets))
-            for offset in reversed(item_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            vec_off = builder.EndVector()
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.String)
-            ArrayVal.AddObjectValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
-        else:
-            # Object array - need to build each as Argument
-            item_offsets = []
-            for item in items:
-                item_offsets.append(self._build_argument(builder, item))
-            ArrayVal.StartObjectValuesVector(builder, len(item_offsets))
-            for offset in reversed(item_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            vec_off = builder.EndVector()
-            ArrayVal.Start(builder)
-            ArrayVal.AddElementType(builder, ElementType.ElementType.Object)
-            ArrayVal.AddObjectValues(builder, vec_off)
-            return Value.Value.ArrayVal, ArrayVal.End(builder)
 
     def free_object(self, object_id):
         """Release a Java object.

@@ -113,6 +113,9 @@ public class GatunServer {
   // Session counter for unique per-client SHM paths
   private final AtomicLong sessionCounter = new AtomicLong(0);
 
+  // SHM files of the sessions that are still open, so that shutdown can remove them
+  private final Set<Path> activeShmPaths = ConcurrentHashMap.newKeySet();
+
   // --- CALLBACK REGISTRY ---
   // Maps callback ID -> CallbackInfo (interface name + proxy object + session context)
   // Note: callback IDs are allocated from objectIdCounter to ensure uniqueness
@@ -247,14 +250,14 @@ public class GatunServer {
         .addShutdownHook(
             new Thread(() -> {
               LOG.info("Shutting down...");
+              // Remove the files first: the JVM may exit before the session threads get to
+              // their own cleanup, and closing the allocator can throw.
+              deleteQuietly(socketPath);
+              for (Path shmPath : activeShmPaths) {
+                deleteQuietly(shmPath);
+              }
               threadPool.shutdownNow();
               allocator.close();
-              try {
-                Files.deleteIfExists(socketPath);
-                // Note: Per-session SHM files are cleaned up when each session ends
-              } catch (IOException e) {
-                // Ignore cleanup errors on shutdown
-              }
             }));
 
     // --- START SOCKET SERVER ---
@@ -271,6 +274,14 @@ public class GatunServer {
     }
   }
 
+  private static void deleteQuietly(Path path) {
+    try {
+      Files.deleteIfExists(path);
+    } catch (IOException e) {
+      // Nothing useful to do about a cleanup failure during shutdown
+    }
+  }
+
   private void handleClient(SocketChannel client, long sessionId) {
     Set<Long> sessionObjectIds = new HashSet<>();
     Set<Long> sessionCallbackIds = new HashSet<>();
@@ -280,6 +291,7 @@ public class GatunServer {
 
     // Create per-session shared memory file
     Path sessionShmPath = Path.of(socketPath.toString() + "." + sessionId + ".shm");
+    activeShmPaths.add(sessionShmPath);
 
     try (client;
         RandomAccessFile raf = new RandomAccessFile(sessionShmPath.toFile(), "rw");
@@ -411,6 +423,9 @@ public class GatunServer {
         String errorType = null;
         String errorMessage = null;
         boolean requestSuccess = true;
+        // Object IDs handed out while packing the result: [packedFromId, packedToId)
+        long packedFromId = 0;
+        long packedToId = 0;
 
         try {
           // Check if this request was already cancelled
@@ -1023,6 +1038,8 @@ public class GatunServer {
 
             // Execute each sub-command, collect response offsets
             int[] subResponseOffsets = new int[commandCount];
+            // Object IDs handed out while packing sub-result i: [2 * i] up to [2 * i + 1]
+            long[] subPackedIds = new long[2 * commandCount];
             int errorIndex = -1;
             int executedCount = 0;
 
@@ -1033,10 +1050,9 @@ public class GatunServer {
                 // Execute sub-command and get result
                 Object subResult =
                     executeCommand(subCmd, sessionObjectIds, sessionCallbackIds, sharedMem, quota);
-                int registeredBefore = sessionObjectIds.size();
-                subResponseOffsets[i] =
-                    packSuccessWithSession(builder, subResult, sessionObjectIds);
-                quota.countRegisteredObjects(sessionObjectIds.size() - registeredBefore);
+                subPackedIds[2 * i] = objectIdCounter.get();
+                subResponseOffsets[i] = packResult(builder, subResult, sessionObjectIds, quota);
+                subPackedIds[2 * i + 1] = objectIdCounter.get();
                 executedCount++;
               } catch (Throwable subT) {
                 // Pack error for this sub-command
@@ -1068,6 +1084,11 @@ public class GatunServer {
 
             // Validate response size fits in zone
             if (resSize > RESPONSE_ZONE_SIZE) {
+              // The client never sees the IDs in this response, so it cannot free them
+              for (int i = 0; i < commandCount; i++) {
+                discardObjects(
+                    subPackedIds[2 * i], subPackedIds[2 * i + 1], sessionObjectIds, quota);
+              }
               builder = new FlatBufferBuilder(256);
               String errorMsg =
                   String.format(
@@ -1103,11 +1124,10 @@ public class GatunServer {
             result = true;
           }
 
-          // 3. Pack Success. Objects nested in the result (elements of a returned list, say)
-          // are registered while packing; tie them to this session so they can be freed.
-          int registeredBefore = sessionObjectIds.size();
-          responseOffset = packSuccessWithSession(builder, result, sessionObjectIds);
-          quota.countRegisteredObjects(sessionObjectIds.size() - registeredBefore);
+          // 3. Pack Success
+          packedFromId = objectIdCounter.get();
+          responseOffset = packResult(builder, result, sessionObjectIds, quota);
+          packedToId = objectIdCounter.get();
 
         } catch (Throwable t) {
           // Unwrap InvocationTargetException to get the real cause
@@ -1141,7 +1161,9 @@ public class GatunServer {
 
         // Validate response size fits in zone
         if (resSize > RESPONSE_ZONE_SIZE) {
-          // Response too large - send error instead
+          // Response too large - send error instead. The client never sees the IDs in the
+          // response it was meant to get, so it cannot free them.
+          discardObjects(packedFromId, packedToId, sessionObjectIds, quota);
           builder = new FlatBufferBuilder(256);
           String errorMsg =
               String.format(
@@ -1191,6 +1213,7 @@ public class GatunServer {
       } catch (IOException e) {
         LOG.warning("Failed to delete session SHM file: " + sessionShmPath);
       }
+      activeShmPaths.remove(sessionShmPath);
     }
   }
 
@@ -1242,6 +1265,41 @@ public class GatunServer {
     if (sessionObjectIds.remove(objectId)) {
       objectRegistry.remove(objectId);
       quota.releaseObject();
+    }
+  }
+
+  /**
+   * Free the session's objects with IDs in [fromId, toId). IDs come from one counter shared by all
+   * sessions, so the range can hold other sessions' IDs; those are not in this session's set and
+   * are left alone.
+   */
+  private void discardObjects(
+      long fromId, long toId, Set<Long> sessionObjectIds, SessionQuota quota) {
+    for (long id = fromId; id < toId; id++) {
+      freeObject(id, sessionObjectIds, quota);
+    }
+  }
+
+  /**
+   * Pack a result for the session. Objects nested in the result (the elements of a returned list,
+   * say) are registered while packing; they are counted against the quota here because the client
+   * frees them like any other object. If packing fails, the client never learns their IDs, so they
+   * are dropped again.
+   */
+  private int packResult(
+      FlatBufferBuilder builder, Object result, Set<Long> sessionObjectIds, SessionQuota quota) {
+    long firstId = objectIdCounter.get();
+    int registeredBefore = sessionObjectIds.size();
+    boolean packed = false;
+    try {
+      int offset = packSuccessWithSession(builder, result, sessionObjectIds);
+      packed = true;
+      return offset;
+    } finally {
+      quota.countRegisteredObjects(sessionObjectIds.size() - registeredBefore);
+      if (!packed) {
+        discardObjects(firstId, objectIdCounter.get(), sessionObjectIds, quota);
+      }
     }
   }
 
@@ -1866,6 +1924,14 @@ public class GatunServer {
         arr[i] = (short) av.intValues(i);
       }
       return arr;
+    } else if (elemType == ElementType.Char) {
+      // Char was widened to int, narrow back
+      int len = av.intValuesLength();
+      char[] arr = new char[len];
+      for (int i = 0; i < len; i++) {
+        arr[i] = (char) av.intValues(i);
+      }
+      return arr;
     } else if (elemType == ElementType.String) {
       // String array stored as object_values
       int len = av.objectValuesLength();
@@ -2062,19 +2128,21 @@ public class GatunServer {
       ArrayVal.addElementType(builder, ElementType.Short);
       ArrayVal.addIntValues(builder, vecOffset);
       return ArrayVal.endArrayVal(builder);
+    } else if (componentType == char.class) {
+      char[] arr = (char[]) array;
+      // Widen char[] to int[]
+      int[] widened = new int[arr.length];
+      for (int i = 0; i < arr.length; i++) {
+        widened[i] = arr[i];
+      }
+      int vecOffset = ArrayVal.createIntValuesVector(builder, widened);
+      ArrayVal.startArrayVal(builder);
+      ArrayVal.addElementType(builder, ElementType.Char);
+      ArrayVal.addIntValues(builder, vecOffset);
+      return ArrayVal.endArrayVal(builder);
     } else {
       // Object array (String[], Object[], etc.)
-      Object[] arr;
-      if (componentType == char.class) {
-        // char[] has no primitive encoding on the wire; send it as an array of chars
-        char[] chars = (char[]) array;
-        arr = new Object[chars.length];
-        for (int i = 0; i < chars.length; i++) {
-          arr[i] = chars[i];
-        }
-      } else {
-        arr = (Object[]) array;
-      }
+      Object[] arr = (Object[]) array;
       int[] argOffsets = new int[arr.length];
       for (int i = 0; i < arr.length; i++) {
         int[] packed = packValue(builder, arr[i], sessionObjectIds);

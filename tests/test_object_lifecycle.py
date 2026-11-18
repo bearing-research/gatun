@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from gatun import JavaException, connect
+from gatun import JavaException, PayloadTooLargeError, connect
 
 
 class TestWrapperRelease:
@@ -129,6 +129,20 @@ class TestWrapperRelease:
             with pytest.raises(JavaException, match="not found"):
                 client.invoke_method(object_id, "toString")
         assert sb.toString() == "x"
+
+    def test_objects_in_a_response_that_is_too_large_are_released(self):
+        """The client never sees the IDs in a response that did not fit, so the
+        server must not keep the objects, or count them against the session."""
+        client = connect(extra_jvm_flags=["-Dgatun.limits.max_objects=50"])
+        try:
+            sb = client.create_object("java.lang.StringBuilder", "x")
+            with pytest.raises(PayloadTooLargeError):
+                client.jvm.java.util.Collections.nCopies(5000, sb)
+
+            held = [client.create_object("java.util.ArrayList") for _ in range(40)]
+            assert len(held) == 40
+        finally:
+            client.close()
 
     def test_wrappers_dropped_on_another_thread(self, client):
         """Wrappers released by another thread do not corrupt requests in flight."""

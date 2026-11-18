@@ -43,7 +43,8 @@ enum ElementType : byte {
   String = 5,
   Object = 6,  // For Object[] or typed arrays of objects
   Byte = 7,
-  Short = 8
+  Short = 8,
+  Char = 9
 }
 
 // Support all return types
@@ -106,7 +107,7 @@ table MapVal {
 table ArrayVal {
   element_type: ElementType;
   // Primitive arrays - only one is populated based on element_type
-  int_values: [int];       // For int[] and short[] (widened)
+  int_values: [int];       // For int[], short[] and char[] (widened)
   long_values: [long];     // For long[]
   double_values: [double]; // For double[] and float[] (widened)
   bool_values: [bool];     // For boolean[]

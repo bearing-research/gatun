@@ -458,6 +458,26 @@ class TestAsyncReturnValues:
 
         assert await sb.charAt(1) == "i"
 
+    async def test_returned_values_can_be_passed_back(self, async_client):
+        """Whatever the shared decoder returns, the client can send again."""
+        jvm = async_client.jvm
+        hm = await jvm.java.util.HashMap()
+        await hm.put("a", 1)
+        as_dict = await jvm.java.util.Collections.unmodifiableMap(hm)
+        other = await jvm.java.util.TreeMap()
+        await other.putAll(as_dict)
+        assert await other.toString() == "{a=1}"
+
+        int_array_class = await jvm.java.lang.Class.forName("[I")
+        ints = await jvm.java.lang.reflect.Array.newInstance(
+            await int_array_class.getComponentType(), 2
+        )
+        assert await jvm.java.util.Arrays.toString(ints) == "[0, 0]"
+
+        data = await jvm.java.util.Arrays.copyOf(b"hi", 3)
+        assert data == b"hi\x00"
+        assert await jvm.java.util.Arrays.toString(data) == "[104, 105, 0]"
+
 
 class TestAsyncObjectLifecycle:
     """Test async object lifecycle methods."""

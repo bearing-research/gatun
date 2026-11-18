@@ -1,6 +1,9 @@
 """Tests for connect() and aconnect() convenience functions."""
 
+import gc
+import glob
 import os
+import weakref
 
 import pytest
 
@@ -108,6 +111,30 @@ class TestServerLifetime:
         client = connect()
         client.close()
         client.close()
+
+    def test_close_leaves_no_shared_memory_files(self):
+        """The server is stopped right after the socket closes, before the
+        session thread gets to delete its own shared memory file."""
+        for _ in range(4):
+            client = connect()
+            socket_path = client.socket_path
+            assert client.ping() is True
+            assert glob.glob(f"{glob.escape(socket_path)}.*.shm")
+
+            client.close()
+
+            assert glob.glob(f"{glob.escape(socket_path)}*") == []
+
+    def test_stopped_session_is_not_kept_for_exit(self):
+        """stop() drops the session's atexit entry, so a process that opens and
+        closes many clients does not accumulate stopped sessions."""
+        client = connect()
+        session = weakref.ref(client._server_session)
+
+        client.close()
+        gc.collect()
+
+        assert session() is None
 
     async def test_async_close_stops_the_server(self):
         client = await aconnect()

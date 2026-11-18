@@ -37,7 +37,7 @@ The protocol is implemented several times over, so a wire-level change usually t
 - `GatunServer.handleClient` — top-level dispatch (an `if/else if` chain on `cmd.action()`)
 - `GatunServer.executeCommand` — a second, separate dispatch used only for sub-commands inside `Action.Batch`; an action missing here works standalone but fails in `client.batch()`
 - `src/gatun/client.py` — sync client, plus `BatchContext` if the action should be batchable
-- `src/gatun/async_client.py` — has its own copies of `_build_value` / `_read_response` rather than sharing the sync ones (value decoding is shared: `_unpack_value_impl` in `client.py`), and implements only a subset of the sync API (no `batch`, `cancel`, `reflect`, static-field access, or `send_arrow_buffers` / `get_arrow_data`)
+- `src/gatun/async_client.py` — shares value encoding and decoding with the sync client (the `_ValueEncoder` mixin and `_unpack_value_impl` in `client.py`) but has its own `_read_response`, and implements only a subset of the sync API (no `batch`, `cancel`, `reflect`, static-field access, or `send_arrow_buffers` / `get_arrow_data`)
 - `PROTOCOL_VERSION` in both `GatunServer.java` and `client.py` for breaking changes
 
 Java-side responsibilities are split: `GatunServer` (dispatch, object/callback registries, allowlist, value packing), `MethodResolver` (overload scoring, varargs), `ReflectionCache` (class/method/field/handle caches), `ArrowMemoryHandler` (Arrow IPC + buffer-descriptor transfer, epoch checks), `ResourceLimits` + `SessionQuota` (per-session limits), `observability/` (logging, metrics, JFR).
@@ -560,7 +560,7 @@ print(Array.get(java_array, 0))  # "modified"
 - `list` -> Java `List` (ArrayList)
 - `dict` -> Java `Map` (HashMap)
 - `bytes` -> Java `byte[]`
-- `JavaArray` -> Java primitive arrays (`int[]`, `double[]`, etc.)
+- `JavaArray` -> Java primitive arrays (`int[]`, `double[]`, etc.); `char[]` is `element_type="Char"` with one-character strings as elements
 - `pyarrow.Array` -> Java arrays (int32->int[], int64->long[], float64->double[], bool->boolean[], string->String[])
 - `array.array` -> Java arrays (typecode 'i'->int[], 'q'->long[], 'd'->double[])
 - `datetime.datetime` / `date` / `time` -> `java.sql.Timestamp` / `Date` / `Time` (arguments only; returned values stay `JavaObject`s). Naive datetimes are local time.

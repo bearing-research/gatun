@@ -33,9 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `client.close()` stops the server that `connect()` / `aconnect()` launched for it instead of leaving the JVM running until interpreter exit
 - `socket_timeout=None`, `callback_timeout=None` and `handshake_timeout=None` disable the timeout, as documented; they were silently replaced by the defaults
 - Sliced pyarrow arrays passed as arguments send their own values rather than the parent buffer from element 0, and primitive pyarrow arrays containing nulls raise `ValueError` instead of sending garbage
-- `send_arrow_buffers()` accepts a `RecordBatch`
-- The async client can decode returned maps and primitive arrays (it now shares the sync client's decoder)
-- Methods returning `char[]` no longer fail with `ClassCastException`
+- `send_arrow_buffers()` and `estimate_arrow_size()` accept a `RecordBatch`
+- A batch or slice of a larger table is sized and copied by its own rows; the first batch of `table.to_batches()` used to copy the whole table's buffers
+- The async client can decode returned maps and primitive arrays, and accepts the same argument types as the sync client (`dict`, `bytes`, arrays, `TypeHint`); the two now share one encoder and one decoder
+- `char[]` is supported as an argument and a return value (`JavaArray` with `element_type="Char"`); returning one used to fail with `ClassCastException`
+- Stopping the server removes its per-session shared memory files instead of leaving them in the temp directory
+- Objects in a response that turns out too large to send are released rather than kept until the client disconnects
 - `GatunAdapter(classpath=...)` passes the classpath on
 
 ## [0.2.1] - 2026-01-17
