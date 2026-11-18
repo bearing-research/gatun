@@ -3,9 +3,9 @@ import pytest
 
 from gatun import (
     PayloadArena,
+    PayloadTooLargeError,
     StaleArenaError,
     UnsupportedArrowTypeError,
-    PayloadTooLargeError,
     estimate_arrow_size,
 )
 
@@ -993,10 +993,9 @@ def test_scoped_arena_context_exception_cleanup(client):
     class TestException(Exception):
         pass
 
-    with pytest.raises(TestException):
-        with client.arrow_context() as ctx:
-            ctx.send(table)
-            raise TestException("Test error")
+    with pytest.raises(TestException), client.arrow_context() as ctx:
+        ctx.send(table)
+        raise TestException("Test error")
 
     # After exception, context should be properly cleaned up
     # A new context should work

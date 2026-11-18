@@ -379,7 +379,7 @@ class BridgeContractTests:
         """Close releases resources."""
         # Create a fresh bridge for this test
         # (don't close the shared fixture)
-        pass  # Skip - would need separate bridge instance
+        # Skip - would need separate bridge instance
 
     def test_object_usable_after_creation(self, bridge: BridgeAdapter):
         """Objects remain usable across multiple operations."""

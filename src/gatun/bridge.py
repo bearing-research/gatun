@@ -4,7 +4,8 @@ This module defines the minimal contract between PySpark and a JVM backend.
 Both Py4J and Gatun can implement this protocol.
 
 Usage in PySpark:
-    from gatun.bridge import BridgeAdapter, GatunAdapter
+    from gatun.bridge import BridgeAdapter
+    from gatun.bridge_adapters import GatunAdapter
 
     # Create adapter
     bridge = GatunAdapter()
@@ -176,7 +177,7 @@ class BridgeAdapter(ABC):
 
     @property
     @abstractmethod
-    def jvm(self) -> "JVMView":
+    def jvm(self) -> JVMView:
         """Get JVM view for navigating classes.
 
         Allows: bridge.jvm.java.util.ArrayList()
@@ -208,7 +209,7 @@ class JVMView(ABC):
     """
 
     @abstractmethod
-    def __getattr__(self, name: str) -> "JVMView | JVMRef | Any":
+    def __getattr__(self, name: str) -> JVMView | JVMRef | Any:
         """Navigate to package, class, or access static member."""
         ...
 
@@ -234,49 +235,33 @@ class JavaException(Exception):
 class JavaSecurityException(JavaException):
     """java.lang.SecurityException"""
 
-    pass
-
 
 class JavaIllegalArgumentException(JavaException):
     """java.lang.IllegalArgumentException"""
-
-    pass
 
 
 class JavaNoSuchMethodException(JavaException):
     """java.lang.NoSuchMethodException"""
 
-    pass
-
 
 class JavaNoSuchFieldException(JavaException):
     """java.lang.NoSuchFieldException"""
-
-    pass
 
 
 class JavaClassNotFoundException(JavaException):
     """java.lang.ClassNotFoundException"""
 
-    pass
-
 
 class JavaNullPointerException(JavaException):
     """java.lang.NullPointerException"""
-
-    pass
 
 
 class JavaIndexOutOfBoundsException(JavaException):
     """java.lang.IndexOutOfBoundsException"""
 
-    pass
-
 
 class JavaNumberFormatException(JavaException):
     """java.lang.NumberFormatException"""
-
-    pass
 
 
 # Mapping from Java exception class names to Python exception classes

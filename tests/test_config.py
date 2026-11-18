@@ -8,12 +8,11 @@ import os
 import tempfile
 from pathlib import Path
 
-
 from gatun.config import (
     GatunConfig,
     find_pyproject_toml,
-    load_config,
     get_config,
+    load_config,
     reset_config,
 )
 

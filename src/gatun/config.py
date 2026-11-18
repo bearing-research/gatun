@@ -16,10 +16,9 @@ Configuration precedence (highest to lowest):
 """
 
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import tomllib
 
 
 @dataclass

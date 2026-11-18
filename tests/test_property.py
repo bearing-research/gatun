@@ -15,19 +15,20 @@ import time
 from pathlib import Path
 
 import pytest
-from hypothesis import given, strategies as st, settings, assume, HealthCheck
+from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import strategies as st
 
+from gatun.client import GatunClient, JavaException
 from gatun.launcher import launch_gateway
-from gatun.client import GatunClient
 
 logger = logging.getLogger("gatun.tests.property")
 
 
 # Common settings for property tests
 # Each Hypothesis example gets a fresh client via make_client
-HYPOTHESIS_SETTINGS = dict(
-    suppress_health_check=[HealthCheck.function_scoped_fixture],
-)
+HYPOTHESIS_SETTINGS = {
+    "suppress_health_check": [HealthCheck.function_scoped_fixture],
+}
 
 
 # --- Property Test Gateway ---
@@ -94,7 +95,7 @@ def make_client(property_gateway):
             try:
                 if current_client[0].sock:
                     current_client[0].sock.close()
-            except Exception:
+            except OSError:
                 pass
 
         c = _create_property_client(socket_str)
@@ -108,7 +109,7 @@ def make_client(property_gateway):
         try:
             if current_client[0].sock:
                 current_client[0].sock.close()
-        except Exception:
+        except OSError:
             pass
 
 
@@ -223,7 +224,7 @@ class TestObjectLifecycleInvariants:
         """Operations on invalid object IDs should raise clean errors."""
         client = make_client()
         # Invoking method on non-existent ID should fail gracefully
-        with pytest.raises(Exception):
+        with pytest.raises(JavaException):
             client.invoke_method(invalid_id, "size")
 
 
@@ -235,7 +236,7 @@ class TestSecurityInvariants:
     def test_non_allowlisted_classes_rejected(self, make_client, class_name):
         """Non-allowlisted classes should be rejected."""
         client = make_client()
-        from gatun.client import JavaSecurityException, JavaClassNotFoundException
+        from gatun.client import JavaClassNotFoundException, JavaSecurityException
 
         with pytest.raises((JavaSecurityException, JavaClassNotFoundException)):
             client.create_object(class_name)
@@ -245,7 +246,7 @@ class TestSecurityInvariants:
     def test_static_methods_on_invalid_classes_rejected(self, make_client, class_name):
         """Static method calls on non-allowlisted classes should be rejected."""
         client = make_client()
-        from gatun.client import JavaSecurityException, JavaClassNotFoundException
+        from gatun.client import JavaClassNotFoundException, JavaSecurityException
 
         with pytest.raises((JavaSecurityException, JavaClassNotFoundException)):
             client.invoke_static_method(class_name, "someMethod")

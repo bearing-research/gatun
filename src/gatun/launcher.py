@@ -28,7 +28,7 @@ def _cleanup_all_sessions():
     for session in list(_active_sessions):
         try:
             session.stop()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - runs from signal/atexit; one failure must not block the rest
             pass
 
 
@@ -82,8 +82,7 @@ DEFAULT_JVM_FLAGS = [
 def _drain_pipe(pipe, storage: list):
     """Drain a pipe to prevent buffer fill-up. Runs in background thread."""
     try:
-        for line in pipe:
-            storage.append(line)
+        storage.extend(pipe)
     except (ValueError, OSError):
         pass  # Pipe closed
 

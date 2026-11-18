@@ -1,15 +1,15 @@
+import logging
 import platform
 import re
-import subprocess
 import shutil
-import logging
+import subprocess
 from pathlib import Path
 
 # Import the standard backend to wrap it
-from setuptools.build_meta import *  # noqa: F403
-from setuptools.build_meta import build_wheel as _orig_build_wheel
-from setuptools.build_meta import build_sdist as _orig_build_sdist
+from setuptools.build_meta import *
 from setuptools.build_meta import build_editable as _orig_build_editable
+from setuptools.build_meta import build_sdist as _orig_build_sdist
+from setuptools.build_meta import build_wheel as _orig_build_wheel
 
 # --- Logging ---
 logging.basicConfig(
@@ -167,8 +167,7 @@ def _get_newest_mtime(directory):
     for path in directory.rglob("*"):
         if path.is_file():
             mtime = path.stat().st_mtime
-            if mtime > newest:
-                newest = mtime
+            newest = max(newest, mtime)
     return newest
 
 

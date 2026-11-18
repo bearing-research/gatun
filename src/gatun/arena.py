@@ -34,13 +34,13 @@ import ctypes
 import io
 import mmap
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Self
 
 import pyarrow as pa
 
 if TYPE_CHECKING:
-    from gatun.client import GatunClient
     from gatun.async_client import AsyncGatunClient
+    from gatun.client import GatunClient
 
 
 class BufferInfo(NamedTuple):
@@ -68,7 +68,7 @@ class PayloadArena:
 
     # Instance attributes with optional types for from_mmap factory
     path: Path | None
-    _file: "io.BufferedRandom | None"
+    _file: io.BufferedRandom | None
     _mmap: mmap.mmap | None
     _base_offset: int
 
@@ -87,7 +87,8 @@ class PayloadArena:
         self._base_offset = 0  # No offset for direct file access
 
         # Open and map the shared memory file
-        self._file = open(self.path, "r+b")
+        # Held open for the life of the mapping; released in close()
+        self._file = open(self.path, "r+b")  # noqa: SIM115
         self._mmap = mmap.mmap(self._file.fileno(), size)
 
         # Get the base address for foreign_buffer
@@ -116,7 +117,7 @@ class PayloadArena:
     @classmethod
     def from_mmap(
         cls, mmap_obj: mmap.mmap, base_offset: int, size: int
-    ) -> "PayloadArena":
+    ) -> PayloadArena:
         """Create a PayloadArena from an existing mmap.
 
         This is used to create an arena view into a slice of an existing
@@ -271,8 +272,6 @@ _UNSUPPORTED_TYPES = (pa.DictionaryType,)
 class UnsupportedArrowTypeError(TypeError):
     """Raised when an Arrow schema contains unsupported types."""
 
-    pass
-
 
 def _validate_supported_schema(schema: pa.Schema) -> None:
     """Validate that schema contains only supported types.
@@ -312,11 +311,9 @@ def _check_type_recursive(
             _check_type_recursive(field.type, unsupported, field_path)
     elif isinstance(schema_or_type, _UNSUPPORTED_TYPES):
         unsupported.append(f"{path}: {schema_or_type}")
-    elif isinstance(schema_or_type, pa.ListType):
-        _check_type_recursive(schema_or_type.value_type, unsupported, f"{path}[]")
-    elif isinstance(schema_or_type, pa.LargeListType):
-        _check_type_recursive(schema_or_type.value_type, unsupported, f"{path}[]")
-    elif isinstance(schema_or_type, pa.FixedSizeListType):
+    elif isinstance(
+        schema_or_type, (pa.ListType, pa.LargeListType, pa.FixedSizeListType)
+    ):
         _check_type_recursive(schema_or_type.value_type, unsupported, f"{path}[]")
     elif isinstance(schema_or_type, pa.StructType):
         for i in range(schema_or_type.num_fields):
@@ -626,7 +623,7 @@ class ScopedArenaContext:
         schema_cache: Schema cache shared across all sends in this context
     """
 
-    def __init__(self, client: "GatunClient"):
+    def __init__(self, client: GatunClient):
         """Initialize the scoped arena context.
 
         Args:
@@ -637,7 +634,7 @@ class ScopedArenaContext:
         self._schema_cache: dict[int, bool] = {}
         self._entered = False
 
-    def __enter__(self) -> "ScopedArenaContext":
+    def __enter__(self) -> Self:
         """Enter the context and acquire the arena."""
         if self._entered:
             raise RuntimeError("ScopedArenaContext is not reentrant")
@@ -737,7 +734,7 @@ class AsyncScopedArenaContext:
         client: The AsyncGatunClient instance
     """
 
-    def __init__(self, client: "AsyncGatunClient"):
+    def __init__(self, client: AsyncGatunClient):
         """Initialize the async scoped arena context.
 
         Args:
@@ -746,7 +743,7 @@ class AsyncScopedArenaContext:
         self._client = client
         self._entered = False
 
-    async def __aenter__(self) -> "AsyncScopedArenaContext":
+    async def __aenter__(self) -> Self:
         """Enter the context."""
         if self._entered:
             raise RuntimeError("AsyncScopedArenaContext is not reentrant")

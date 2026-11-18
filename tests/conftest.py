@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from gatun.launcher import launch_gateway
 from gatun.client import GatunClient
+from gatun.launcher import launch_gateway
 
 # --- Logging Setup ---
 # Pytest captures this automatically. Run with -o log_cli=true to see it live.
@@ -80,7 +80,7 @@ def client(java_gateway):
     try:
         if c.sock:
             c.sock.close()
-    except Exception:
+    except OSError:
         pass
 
 
@@ -109,7 +109,7 @@ def make_client(java_gateway):
             try:
                 if current_client[0].sock:
                     current_client[0].sock.close()
-            except Exception:
+            except OSError:
                 pass
 
         c = _create_client(socket_str)
@@ -123,5 +123,5 @@ def make_client(java_gateway):
         try:
             if current_client[0].sock:
                 current_client[0].sock.close()
-        except Exception:
+        except OSError:
             pass

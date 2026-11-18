@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Benchmark Arrow data transfer performance.
 
 This script compares different Arrow data transfer methods in Gatun:

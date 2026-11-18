@@ -5,7 +5,7 @@ These tests verify that metrics are being tracked correctly by the server.
 
 import pytest
 
-from gatun import connect
+from gatun import JavaException, connect
 
 
 class TestGetMetrics:
@@ -99,7 +99,7 @@ class TestMetricsTracking:
             for _ in range(3):
                 try:
                     client.invoke_method(999999, "nonexistent")
-                except Exception:
+                except JavaException:
                     pass
 
             metrics = client.get_metrics()

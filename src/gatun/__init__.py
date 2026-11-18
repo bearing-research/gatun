@@ -1,124 +1,117 @@
-from typing import Optional
-
-from gatun.client import (
-    GatunClient,
-    JavaObject,
-    JavaArray,
-    JVMView,
-    JavaClass,
-    java_import,
-    PROTOCOL_VERSION,
-    PayloadTooLargeError,
-    JavaException,
-    JavaSecurityException,
-    JavaIllegalArgumentException,
-    JavaNoSuchMethodException,
-    JavaNoSuchFieldException,
-    JavaClassNotFoundException,
-    JavaNullPointerException,
-    JavaIndexOutOfBoundsException,
-    JavaNumberFormatException,
-    JavaRuntimeException,
-    CancelledException,
-    ReentrancyError,
-    CallbackTimeoutError,
-    ProtocolDesyncError,
-    SocketTimeoutError,
-    DeadConnectionError,
-    StaleArenaError,
-    ArrowTableView,
-    BatchContext,
-    BatchResult,
-    TypeHint,
+from gatun.arena import (
+    AsyncScopedArenaContext,
+    PayloadArena,
+    ScopedArenaContext,
+    UnsupportedArrowTypeError,
+    estimate_arrow_size,
 )
 from gatun.async_client import (
     AsyncGatunClient,
+    AsyncJavaClass,
     AsyncJavaObject,
     AsyncJVMView,
-    AsyncJavaClass,
     run_sync,
 )
-from gatun.config import GatunConfig, get_config, load_config, reset_config
-from gatun.launcher import launch_gateway, GatunSession
-from gatun.arena import (
-    PayloadArena,
-    UnsupportedArrowTypeError,
-    ScopedArenaContext,
-    AsyncScopedArenaContext,
-    estimate_arrow_size,
+from gatun.client import (
+    PROTOCOL_VERSION,
+    ArrowTableView,
+    BatchContext,
+    BatchResult,
+    CallbackTimeoutError,
+    CancelledException,
+    DeadConnectionError,
+    GatunClient,
+    JavaArray,
+    JavaClass,
+    JavaClassNotFoundException,
+    JavaException,
+    JavaIllegalArgumentException,
+    JavaIndexOutOfBoundsException,
+    JavaNoSuchFieldException,
+    JavaNoSuchMethodException,
+    JavaNullPointerException,
+    JavaNumberFormatException,
+    JavaObject,
+    JavaRuntimeException,
+    JavaSecurityException,
+    JVMView,
+    PayloadTooLargeError,
+    ProtocolDesyncError,
+    ReentrancyError,
+    SocketTimeoutError,
+    StaleArenaError,
+    TypeHint,
+    java_import,
 )
+from gatun.config import GatunConfig, get_config, load_config, reset_config
+from gatun.launcher import GatunSession, launch_gateway
 
 __all__ = [
-    # Sync client
-    "GatunClient",
-    "JavaObject",
-    "JavaArray",
-    "JVMView",
-    "JavaClass",
-    "java_import",
-    "BatchContext",
-    "BatchResult",
-    "TypeHint",
-    # Async client
+    "PROTOCOL_VERSION",
+    "ArrowTableView",
     "AsyncGatunClient",
-    "AsyncJavaObject",
     "AsyncJVMView",
     "AsyncJavaClass",
-    "run_sync",
-    # Utilities
-    "launch_gateway",
-    "GatunSession",
-    "connect",
-    "aconnect",
-    "PROTOCOL_VERSION",
-    "PayloadTooLargeError",
-    # Exceptions
-    "JavaException",
-    "JavaSecurityException",
-    "JavaIllegalArgumentException",
-    "JavaNoSuchMethodException",
-    "JavaNoSuchFieldException",
-    "JavaClassNotFoundException",
-    "JavaNullPointerException",
-    "JavaIndexOutOfBoundsException",
-    "JavaNumberFormatException",
-    "JavaRuntimeException",
-    "CancelledException",
-    "ReentrancyError",
+    "AsyncJavaObject",
+    "AsyncScopedArenaContext",
+    "BatchContext",
+    "BatchResult",
     "CallbackTimeoutError",
-    "ProtocolDesyncError",
-    "SocketTimeoutError",
+    "CancelledException",
     "DeadConnectionError",
-    # Config
+    "GatunClient",
     "GatunConfig",
+    "GatunSession",
+    "JVMView",
+    "JavaArray",
+    "JavaClass",
+    "JavaClassNotFoundException",
+    "JavaException",
+    "JavaIllegalArgumentException",
+    "JavaIndexOutOfBoundsException",
+    "JavaNoSuchFieldException",
+    "JavaNoSuchMethodException",
+    "JavaNullPointerException",
+    "JavaNumberFormatException",
+    "JavaObject",
+    "JavaRuntimeException",
+    "JavaSecurityException",
+    "PayloadArena",
+    "PayloadTooLargeError",
+    "ProtocolDesyncError",
+    "ReentrancyError",
+    "ScopedArenaContext",
+    "SocketTimeoutError",
+    "StaleArenaError",
+    "TypeHint",
+    "UnsupportedArrowTypeError",
+    "aconnect",
+    "connect",
+    "estimate_arrow_size",
     "get_config",
+    "java_import",
+    "launch_gateway",
     "load_config",
     "reset_config",
-    # Arrow zero-copy
-    "PayloadArena",
-    "UnsupportedArrowTypeError",
-    "StaleArenaError",
-    "ArrowTableView",
-    "ScopedArenaContext",
-    "AsyncScopedArenaContext",
-    "estimate_arrow_size",
+    "run_sync",
 ]
 
 
 def connect(
-    memory: Optional[str] = None,
-    socket_path: Optional[str] = None,
-    classpath: Optional[list[str]] = None,
+    memory: str | None = None,
+    socket_path: str | None = None,
+    classpath: list[str] | None = None,
     trace: bool = False,
-    log_level: Optional[str] = None,
+    log_level: str | None = None,
     debug: bool = False,
-    extra_jvm_flags: Optional[list[str]] = None,
+    extra_jvm_flags: list[str] | None = None,
 ):
     """Convenience: Launches server and returns connected client.
 
     Args:
         memory: Memory size (e.g., "512MB", "1GB"). Defaults to config value.
-        socket_path: Path to Unix socket. Defaults to config value or ~/gatun.sock.
+        socket_path: Path to Unix socket. Defaults to config value, or a unique
+                     path under /tmp so concurrent sessions do not collide.
         classpath: Additional JAR files or directories to add to the classpath.
                    Use this to load external libraries (e.g., Spark JARs).
         trace: Enable trace mode for verbose method resolution logging.
@@ -166,19 +159,20 @@ def connect(
 
 
 async def aconnect(
-    memory: Optional[str] = None,
-    socket_path: Optional[str] = None,
-    classpath: Optional[list[str]] = None,
+    memory: str | None = None,
+    socket_path: str | None = None,
+    classpath: list[str] | None = None,
     trace: bool = False,
-    log_level: Optional[str] = None,
+    log_level: str | None = None,
     debug: bool = False,
-    extra_jvm_flags: Optional[list[str]] = None,
+    extra_jvm_flags: list[str] | None = None,
 ) -> AsyncGatunClient:
     """Async convenience: Launches server and returns connected async client.
 
     Args:
         memory: Memory size (e.g., "512MB", "1GB"). Defaults to config value.
-        socket_path: Path to Unix socket. Defaults to config value or ~/gatun.sock.
+        socket_path: Path to Unix socket. Defaults to config value, or a unique
+                     path under /tmp so concurrent sessions do not collide.
         classpath: Additional JAR files or directories to add to the classpath.
                    Use this to load external libraries (e.g., Spark JARs).
         trace: Enable trace mode for verbose method resolution logging.

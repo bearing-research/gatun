@@ -6,17 +6,17 @@ These tests cover the BridgeAdapter protocol and GatunAdapter implementation.
 import pytest
 
 from gatun.bridge import (
-    JavaException,
-    JavaSecurityException,
-    JavaIllegalArgumentException,
-    JavaNoSuchMethodException,
-    JavaNoSuchFieldException,
-    JavaClassNotFoundException,
-    JavaNullPointerException,
-    JavaIndexOutOfBoundsException,
-    JavaNumberFormatException,
-    JVMRef,
     JAVA_EXCEPTION_MAP,
+    JavaClassNotFoundException,
+    JavaException,
+    JavaIllegalArgumentException,
+    JavaIndexOutOfBoundsException,
+    JavaNoSuchFieldException,
+    JavaNoSuchMethodException,
+    JavaNullPointerException,
+    JavaNumberFormatException,
+    JavaSecurityException,
+    JVMRef,
 )
 from gatun.bridge_adapters import GatunAdapter
 

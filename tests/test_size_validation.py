@@ -1,7 +1,8 @@
 """Tests for size validation of shared memory zones."""
 
 import pytest
-from gatun import PayloadTooLargeError, JavaException, JavaRuntimeException
+
+from gatun import JavaException, JavaRuntimeException, PayloadTooLargeError
 from gatun.client import COMMAND_ZONE_SIZE, RESPONSE_ZONE_SIZE
 
 
@@ -93,7 +94,7 @@ def test_large_list_response(client):
     try:
         arr.subList(0, 2000)
         # If we got here, response was within limits
-        pass  # This is OK
+        # This is OK
     except (PayloadTooLargeError, JavaException, RuntimeError) as e:
         # Either response too large OR socket closed is acceptable
         err_str = str(e).lower()

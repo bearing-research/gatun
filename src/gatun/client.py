@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import array
-from collections import OrderedDict
 import ctypes
 import logging
 import mmap
@@ -9,8 +8,10 @@ import os
 import socket
 import struct
 import time
-from typing import TYPE_CHECKING, Any, Callable, cast
 import weakref
+from collections import OrderedDict
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import flatbuffers
 import pyarrow as pa
@@ -18,33 +19,33 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from gatun.arena import PayloadArena, ScopedArenaContext
 
-from gatun.generated.org.gatun.protocol import Command as Cmd
 from gatun.generated.org.gatun.protocol import Action as Act
 from gatun.generated.org.gatun.protocol import (
-    Response,
-    Value,
-    StringVal,
-    IntVal,
-    DoubleVal,
-    BoolVal,
-    CharVal,
-    ObjectRef,
     Argument,
-    ListVal,
-    MapVal,
-    MapEntry,
     ArrayVal,
-    ElementType,
     ArrowBatchDescriptor,
-    BufferDescriptor,
-    FieldNode,
     BatchCommand,
-    GetFieldsRequest,
-    InvokeMethodsRequest,
-    MethodCall,
+    BoolVal,
+    BufferDescriptor,
+    CharVal,
     CreateObjectsRequest,
+    DoubleVal,
+    ElementType,
+    FieldNode,
+    GetFieldsRequest,
+    IntVal,
+    InvokeMethodsRequest,
+    ListVal,
+    MapEntry,
+    MapVal,
+    MethodCall,
+    ObjectRef,
     ObjectSpec,
+    Response,
+    StringVal,
+    Value,
 )
+from gatun.generated.org.gatun.protocol import Command as Cmd
 
 logger = logging.getLogger(__name__)
 
@@ -179,55 +180,37 @@ class JavaException(Exception):
 class JavaSecurityException(JavaException):
     """Raised when a security violation occurs (e.g., accessing blocked class)."""
 
-    pass
-
 
 class JavaIllegalArgumentException(JavaException):
     """Raised when an illegal argument is passed to a Java method."""
-
-    pass
 
 
 class JavaNoSuchMethodException(JavaException):
     """Raised when a method cannot be found."""
 
-    pass
-
 
 class JavaNoSuchFieldException(JavaException):
     """Raised when a field cannot be found."""
-
-    pass
 
 
 class JavaClassNotFoundException(JavaException):
     """Raised when a class cannot be found."""
 
-    pass
-
 
 class JavaNullPointerException(JavaException):
     """Raised when null is dereferenced in Java."""
-
-    pass
 
 
 class JavaIndexOutOfBoundsException(JavaException):
     """Raised when an index is out of bounds."""
 
-    pass
-
 
 class JavaNumberFormatException(JavaException):
     """Raised when a string cannot be parsed as a number."""
 
-    pass
-
 
 class JavaRuntimeException(JavaException):
     """Raised for generic Java runtime exceptions."""
-
-    pass
 
 
 class CancelledException(Exception):
@@ -253,8 +236,6 @@ class ReentrancyError(Exception):
     - Restructure code to avoid nested calls
     """
 
-    pass
-
 
 class CallbackTimeoutError(Exception):
     """Raised when a callback execution exceeds the timeout.
@@ -263,8 +244,6 @@ class CallbackTimeoutError(Exception):
     times out, an error response is sent to Java so the original request can
     complete (with an error) rather than hanging indefinitely.
     """
-
-    pass
 
 
 class ProtocolDesyncError(Exception):
@@ -290,8 +269,6 @@ class DeadConnectionError(Exception):
     as dead and cannot be used. Create a new client to continue.
     """
 
-    pass
-
 
 class TypeHint:
     """Wrapper to provide an explicit Java type hint for overload resolution.
@@ -311,7 +288,7 @@ class TypeHint:
         client.invoke_method(obj, "method", TypeHint(my_list, "scala.collection.Seq"))
     """
 
-    __slots__ = ("value", "java_type")
+    __slots__ = ("java_type", "value")
 
     def __init__(self, value, java_type: str):
         """Create a type-hinted value.
@@ -393,8 +370,6 @@ def _raise_java_exception_impl(error_type: str, error_msg: str) -> None:
 class SocketTimeoutError(Exception):
     """Raised when a socket read times out."""
 
-    pass
-
 
 def _recv_exactly(sock, n, timeout: float | None = None):
     """Receive exactly n bytes from socket, handling partial reads.
@@ -419,7 +394,7 @@ def _recv_exactly(sock, n, timeout: float | None = None):
                 if not chunk:
                     raise RuntimeError("Socket closed unexpectedly")
                 data.extend(chunk)
-            except socket.timeout:
+            except TimeoutError:
                 raise SocketTimeoutError(
                     f"Timeout after receiving {len(data)}/{n} bytes"
                 )
@@ -445,7 +420,7 @@ def _recv_exactly(sock, n, timeout: float | None = None):
                 if not chunk:
                     raise RuntimeError("Socket closed unexpectedly")
                 data.extend(chunk)
-            except socket.timeout:
+            except TimeoutError:
                 raise SocketTimeoutError(
                     f"Timeout after receiving {len(data)}/{n} bytes"
                 )
@@ -492,7 +467,7 @@ class ArrowTableView:
     or call table.to_pandas() / table.to_pydict() before resetting the arena.
     """
 
-    def __init__(self, table: pa.Table, epoch: int, client: "GatunClient"):
+    def __init__(self, table: pa.Table, epoch: int, client: GatunClient):
         self._table = table
         self._epoch = epoch
         self._client = client
@@ -627,17 +602,18 @@ def _get_own_buffer_count(arrow_type: pa.DataType) -> int:
         return 2  # validity + packed bits
     elif pa.types.is_primitive(arrow_type):
         return 2  # validity + data
-    elif pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
-        return 3  # validity + offsets + data
-    elif pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type):
+    elif (
+        pa.types.is_string(arrow_type)
+        or pa.types.is_large_string(arrow_type)
+        or pa.types.is_binary(arrow_type)
+        or pa.types.is_large_binary(arrow_type)
+    ):
         return 3  # validity + offsets + data
     elif pa.types.is_fixed_size_binary(arrow_type):
         return 2  # validity + data
     elif pa.types.is_list(arrow_type) or pa.types.is_large_list(arrow_type):
         return 2  # validity + offsets (child buffers handled via recursion)
-    elif pa.types.is_fixed_size_list(arrow_type):
-        return 1  # validity only (child buffers handled via recursion)
-    elif pa.types.is_struct(arrow_type):
+    elif pa.types.is_fixed_size_list(arrow_type) or pa.types.is_struct(arrow_type):
         return 1  # validity only (child buffers handled via recursion)
     elif pa.types.is_map(arrow_type):
         return 2  # validity + offsets (child buffers handled via recursion)
@@ -777,7 +753,7 @@ class JavaObject:
     def __str__(self):
         try:
             return self.client.invoke_method(self.object_id, "toString")
-        except Exception:
+        except Exception:  # noqa: BLE001 - __str__ must not raise, whatever the transport does
             return f"<Dead JavaObject id={self.object_id}>"
 
     def __eq__(self, other):
@@ -790,14 +766,14 @@ class JavaObject:
         # Otherwise, call Java's equals() method
         try:
             return self.client.invoke_method(self.object_id, "equals", other)
-        except Exception:
+        except Exception:  # noqa: BLE001 - __eq__ must not raise; unreachable means unequal
             return False
 
     def __hash__(self):
         """Return Java's hashCode() for this object."""
         try:
             return self.client.invoke_method(self.object_id, "hashCode")
-        except Exception:
+        except Exception:  # noqa: BLE001 - __hash__ must not raise; fall back to the id
             # Fallback to object_id if we can't get hashCode
             return hash(self.object_id)
 
@@ -813,13 +789,13 @@ class JavaObject:
             return self.client.invoke_static_method(
                 "java.lang.reflect.Array", "getLength", self
             )
-        except Exception:
+        except JavaException:
             pass
 
         # Try collection size()
         try:
             return self.client.invoke_method(self.object_id, "size")
-        except Exception:
+        except JavaException:
             pass
 
         # Object doesn't support length
@@ -849,7 +825,7 @@ class JavaObject:
                 yield self.client.invoke_static_method(
                     "java.lang.reflect.Array", "get", self, i
                 )
-        except Exception:
+        except JavaException:
             # Fall back to Iterable.iterator()
             iterator = self.client.invoke_method(self.object_id, "iterator")
             while self.client.invoke_method(iterator.object_id, "hasNext"):
@@ -866,7 +842,7 @@ class JavaObject:
             return self.client.invoke_static_method(
                 "java.lang.reflect.Array", "get", self, index
             )
-        except Exception:
+        except JavaException:
             # Fall back to list.get(index)
             return self.client.invoke_method(self.object_id, "get", index)
 
@@ -881,12 +857,12 @@ class JavaObject:
             self.client.invoke_static_method(
                 "java.lang.reflect.Array", "set", self, index, value
             )
-        except Exception:
+        except JavaException:
             # Fall back to list.set(index, value)
             self.client.invoke_method(self.object_id, "set", index, value)
 
 
-def java_import(jvm_view: "JVMView", import_path: str) -> None:
+def java_import(jvm_view: JVMView, import_path: str) -> None:
     """Import Java classes into the JVM view's namespace.
 
     This is a convenience function similar to Py4J's java_import.
@@ -1337,7 +1313,8 @@ class GatunClient:
 
             # 3. Map Memory (session-specific SHM file created by server)
             assert self.memory_path is not None, "Memory path not set"
-            self.shm_file = open(self.memory_path, "r+b")
+            # Held open for the life of the mapping; released in close()
+            self.shm_file = open(self.memory_path, "r+b")  # noqa: SIM115
             self.shm = mmap.mmap(self.shm_file.fileno(), self.memory_size)
             logger.info(
                 "Connected to %s (shared memory: %s, %.2f MB)",
@@ -1347,11 +1324,11 @@ class GatunClient:
             )
 
             return True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - connect() reports every failure as False
             logger.error("Connection failed: %s", e)
             return False
 
-    def get_payload_arena(self) -> "PayloadArena":
+    def get_payload_arena(self) -> PayloadArena:
         """Get a PayloadArena view into the client's shared memory.
 
         The returned arena writes to the payload zone of the client's shared
@@ -1376,7 +1353,7 @@ class GatunClient:
         assert self.shm is not None, "Not connected"
         return PayloadArena.from_mmap(self.shm, self.payload_offset, payload_size)
 
-    def arrow_context(self) -> "ScopedArenaContext":
+    def arrow_context(self) -> ScopedArenaContext:
         """Get a context manager for scoped Arrow transfers.
 
         Provides automatic arena lifecycle management with reset between sends
@@ -1488,7 +1465,7 @@ class GatunClient:
                     pass  # May fail if already disconnected
                 self.sock.close()
                 self.sock = None
-        except Exception:
+        except OSError:
             pass
 
     def _drain_pending_responses(self, timeout: float = 5.0, max_drain: int = 100):
@@ -1881,7 +1858,7 @@ class GatunClient:
                 def run_callback() -> None:
                     try:
                         result_holder["result"] = callback_fn(*args)
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001 - reported to Java below
                         result_holder["error"] = e
                     finally:
                         result_holder["done"] = True
@@ -1914,7 +1891,7 @@ class GatunClient:
                 True,
                 "ReentrancyError: Cannot call Java from within a callback",
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - any callback failure is forwarded to Java
             self._send_callback_response(callback_id, None, True, str(e))
         finally:
             self._in_callback = False
@@ -1934,9 +1911,9 @@ class GatunClient:
         Returns:
             ArrowTableView wrapping the reconstructed table with epoch validation
         """
-        from gatun.arena import deserialize_schema, _validate_supported_schema
-
         import ctypes
+
+        from gatun.arena import _validate_supported_schema, deserialize_schema
 
         schema_hash = arrow_batch.SchemaHash()
         descriptor_epoch = arrow_batch.ArenaEpoch()
@@ -2531,7 +2508,7 @@ class GatunClient:
 
         return cast(list[Any], self._send_raw(builder.Output()))
 
-    def create_objects(self, specs: list[tuple[str, tuple]]) -> list["JavaObject"]:
+    def create_objects(self, specs: list[tuple[str, tuple]]) -> list[JavaObject]:
         """Create multiple Java objects in a single round-trip.
 
         This is more efficient than calling create_object() multiple times when
@@ -2602,7 +2579,7 @@ class GatunClient:
 
     def register_callback(
         self, callback_fn: Callable[..., Any], interface_name: str
-    ) -> "JavaObject":
+    ) -> JavaObject:
         """Register a Python callable as a Java interface implementation.
 
         This creates a Java dynamic proxy that implements the specified interface.
@@ -2784,9 +2761,9 @@ class GatunClient:
             return Value.Value.NullVal, NullVal.End(builder)
         else:
             # Check for datetime types (import here to avoid circular imports)
+            import calendar
             import datetime
             import time as time_module
-            import calendar
 
             if isinstance(value, datetime.datetime):
                 # Convert datetime to java.sql.Timestamp
@@ -3201,7 +3178,7 @@ class GatunClient:
     def send_arrow_buffers(
         self,
         table: pa.Table,
-        arena: "PayloadArena",
+        arena: PayloadArena,
         schema_cache: dict[int, bool] | None = None,
     ):
         """Send an Arrow table via true zero-copy buffer transfer.
@@ -3246,10 +3223,10 @@ class GatunClient:
             arena.close()
         """
         from gatun.arena import (
-            copy_arrow_table_to_arena,
             compute_schema_hash,
-            serialize_schema,
+            copy_arrow_table_to_arena,
             estimate_arrow_size,
+            serialize_schema,
         )
 
         # 0. Pre-check available space to provide informative error
@@ -3441,7 +3418,7 @@ class GatunClient:
         result = self._send_raw(builder.Output())
         return result is True
 
-    def batch(self, stop_on_error: bool = False) -> "BatchContext":
+    def batch(self, stop_on_error: bool = False) -> BatchContext:
         """Create a batch context for executing multiple commands in one round-trip.
 
         Batching amortizes the per-call overhead (~100-150μs) across multiple
@@ -3489,7 +3466,9 @@ class GatunClient:
             if self.sock:
                 self.sock.close()
                 self.sock = None
-        except Exception:
+        except (OSError, ValueError, BufferError):
+            # Best-effort teardown; mmap.close() raises BufferError while Arrow
+            # buffers exported from the mapping are still alive.
             pass
 
     def __enter__(self):
@@ -3512,7 +3491,7 @@ class BatchResult:
 
     __slots__ = ("_batch", "_index")
 
-    def __init__(self, batch: "BatchContext", index: int):
+    def __init__(self, batch: BatchContext, index: int):
         self._batch = batch
         self._index = index
 
@@ -3563,7 +3542,7 @@ class BatchContext:
         self._results: list = []
         self._executed = False
 
-    def __enter__(self) -> "BatchContext":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -3585,7 +3564,7 @@ class BatchContext:
         self._command_data.append((Act.Action.CreateObject, 0, class_name, args))
         return BatchResult(self, idx)
 
-    def call(self, obj: "JavaObject", method_name: str, *args) -> BatchResult:
+    def call(self, obj: JavaObject, method_name: str, *args) -> BatchResult:
         """Queue an instance method call.
 
         Args:
@@ -3618,7 +3597,7 @@ class BatchContext:
         self._command_data.append((Act.Action.InvokeStaticMethod, 0, full_name, args))
         return BatchResult(self, idx)
 
-    def get_field(self, obj: "JavaObject", field_name: str) -> BatchResult:
+    def get_field(self, obj: JavaObject, field_name: str) -> BatchResult:
         """Queue a field get operation.
 
         Args:
@@ -3632,7 +3611,7 @@ class BatchContext:
         self._command_data.append((Act.Action.GetField, obj.object_id, field_name, ()))
         return BatchResult(self, idx)
 
-    def set_field(self, obj: "JavaObject", field_name: str, value) -> BatchResult:
+    def set_field(self, obj: JavaObject, field_name: str, value) -> BatchResult:
         """Queue a field set operation.
 
         Args:

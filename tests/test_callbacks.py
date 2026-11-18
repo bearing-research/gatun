@@ -109,7 +109,6 @@ class TestCallbackWithCollections:
 
         def collect(item):
             collected.append(item)
-            return None
 
         consumer = client.register_callback(collect, "java.util.function.Consumer")
 
@@ -249,7 +248,6 @@ class TestCallbackMultipleInvocations:
 
         def tracking_consumer(value):
             seen_values.append(value)
-            return None
 
         consumer = client.register_callback(
             tracking_consumer, "java.util.function.Consumer"
@@ -282,7 +280,6 @@ class TestCallbackConcurrency:
 
         def consume(item):
             consumer_calls[0] += 1
-            return None
 
         comparator = client.register_callback(compare, "java.util.Comparator")
         consumer = client.register_callback(consume, "java.util.function.Consumer")

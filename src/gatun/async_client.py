@@ -20,12 +20,14 @@ Example using run_sync with existing sync client:
 
 import asyncio
 import ctypes
+import inspect
 import mmap
 import os
 import struct
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import flatbuffers
 import pyarrow as pa
@@ -34,34 +36,32 @@ if TYPE_CHECKING:
     from gatun.arena import AsyncScopedArenaContext
 
 from gatun.client import (
-    CallbackTimeoutError,
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
     HANDSHAKE_TIMEOUT,
+    PROTOCOL_VERSION,
+    RESPONSE_ZONE_SIZE,
+    CallbackTimeoutError,
     JavaObject,
     PayloadTooLargeError,
     ProtocolDesyncError,
-    PROTOCOL_VERSION,
-    RESPONSE_ZONE_SIZE,
     SocketTimeoutError,
     _raise_java_exception_impl,
 )
-from gatun.generated.org.gatun.protocol import Command as Cmd
 from gatun.generated.org.gatun.protocol import Action as Act
+from gatun.generated.org.gatun.protocol import Command as Cmd
 from gatun.generated.org.gatun.protocol import (
-    Response,
-    Value,
+    CreateObjectsRequest,
     GetFieldsRequest,
     InvokeMethodsRequest,
     MethodCall,
-    CreateObjectsRequest,
     ObjectSpec,
+    Response,
+    Value,
 )
 
 # Default thread pool for run_sync
-_default_executor: Optional[ThreadPoolExecutor] = None
-
-T = TypeVar("T")
+_default_executor: ThreadPoolExecutor | None = None
 
 
 def get_default_executor() -> ThreadPoolExecutor:
@@ -74,10 +74,10 @@ def get_default_executor() -> ThreadPoolExecutor:
     return _default_executor
 
 
-async def run_sync(
+async def run_sync[T](
     func: Callable[..., T],
     *args,
-    executor: Optional[ThreadPoolExecutor] = None,
+    executor: ThreadPoolExecutor | None = None,
     **kwargs,
 ) -> T:
     """Run a synchronous function in a thread pool executor.
@@ -218,7 +218,7 @@ class AsyncGatunClient:
 
     def __init__(
         self,
-        socket_path: Optional[str] = None,
+        socket_path: str | None = None,
         callback_timeout: float | None = None,
         socket_timeout: float | None = None,
         handshake_timeout: float | None = None,
@@ -260,8 +260,8 @@ class AsyncGatunClient:
             handshake_timeout if handshake_timeout is not None else HANDSHAKE_TIMEOUT
         )
 
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
         self._lock = asyncio.Lock()
 
         self.shm_file: Any = None  # BufferedRandom when connected
@@ -272,7 +272,7 @@ class AsyncGatunClient:
         self.payload_offset = 65536  # 64KB - must match GatunServer.PAYLOAD_OFFSET
         self.response_offset = 0
 
-        self._jvm: Optional[AsyncJVMView] = None
+        self._jvm: AsyncJVMView | None = None
         self._callbacks: dict[int, Callable[..., Any]] = {}
 
         # Reentrancy detection - tracks if we're inside a callback
@@ -304,7 +304,7 @@ class AsyncGatunClient:
             return await self._reader.readexactly(n)
         try:
             return await asyncio.wait_for(self._reader.readexactly(n), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise SocketTimeoutError(f"Socket read timed out after {timeout}s")
 
     async def connect(self) -> bool:
@@ -336,12 +336,14 @@ class AsyncGatunClient:
 
             self.response_offset = self.memory_size - 65536  # 64KB response zone
 
-            # Map shared memory (still sync - mmap doesn't have async API)
-            self.shm_file = open(self.memory_path, "r+b")
+            # Map shared memory (still sync - mmap doesn't have async API). Opening a
+            # local file is effectively instant, and the handle is held for the life
+            # of the mapping and released in close().
+            self.shm_file = open(self.memory_path, "r+b")  # noqa: ASYNC230, SIM115
             self.shm = mmap.mmap(self.shm_file.fileno(), self.memory_size)
 
             return True
-        except Exception:
+        except Exception:  # noqa: BLE001 - connect() reports every failure as False
             return False
 
     async def _send_raw(
@@ -461,14 +463,14 @@ class AsyncGatunClient:
         # Execute the callback with reentrancy guard and timeout
         self._in_callback = True
         try:
-            if asyncio.iscoroutinefunction(callback_fn):
+            if inspect.iscoroutinefunction(callback_fn):
                 # Async callback - use wait_for for timeout
                 if self.callback_timeout is not None:
                     try:
                         result = await asyncio.wait_for(
                             callback_fn(*args), timeout=self.callback_timeout
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         raise CallbackTimeoutError(
                             f"Callback execution timed out after {self.callback_timeout}s"
                         )
@@ -483,7 +485,7 @@ class AsyncGatunClient:
                             loop.run_in_executor(None, callback_fn, *args),
                             timeout=self.callback_timeout,
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         raise CallbackTimeoutError(
                             f"Callback execution timed out after {self.callback_timeout}s"
                         )
@@ -501,13 +503,13 @@ class AsyncGatunClient:
         except CallbackTimeoutError as e:
             # Propagate timeout error
             await self._send_callback_response(callback_id, None, True, str(e))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - any callback failure is forwarded to Java
             await self._send_callback_response(callback_id, None, True, str(e))
         finally:
             self._in_callback = False
 
     async def _send_callback_response(
-        self, callback_id: int, result, is_error: bool, error_msg: Optional[str]
+        self, callback_id: int, result, is_error: bool, error_msg: str | None
     ):
         """Send the result of a callback execution back to Java."""
 
@@ -557,15 +559,15 @@ class AsyncGatunClient:
     def _unpack_value(self, val_type: int, val_table: Any) -> Any:
         """Unpack a FlatBuffer Value union to a Python object."""
         from gatun.generated.org.gatun.protocol import (
-            StringVal,
-            IntVal,
-            DoubleVal,
+            ArrayVal,
             BoolVal,
-            ObjectRef,
+            DoubleVal,
+            ElementType,
+            IntVal,
             ListVal,
             MapVal,
-            ArrayVal,
-            ElementType,
+            ObjectRef,
+            StringVal,
         )
 
         if val_type == Value.Value.NullVal:
@@ -617,9 +619,10 @@ class AsyncGatunClient:
                 return list(arr_obj.IntValuesAsNumpy())
             elif elem_type == ElementType.ElementType.Long:
                 return list(arr_obj.LongValuesAsNumpy())
-            elif elem_type == ElementType.ElementType.Double:
-                return list(arr_obj.DoubleValuesAsNumpy())
-            elif elem_type == ElementType.ElementType.Float:
+            elif (
+                elem_type == ElementType.ElementType.Double
+                or elem_type == ElementType.ElementType.Float
+            ):
                 return list(arr_obj.DoubleValuesAsNumpy())
             elif elem_type == ElementType.ElementType.Byte:
                 return bytes(arr_obj.ByteValuesAsNumpy())
@@ -636,13 +639,13 @@ class AsyncGatunClient:
     def _build_value(self, builder, value):
         """Build a Value union and return (type, offset)."""
         from gatun.generated.org.gatun.protocol import (
-            StringVal,
-            IntVal,
-            DoubleVal,
-            BoolVal,
-            ObjectRef,
-            ListVal,
             Argument,
+            BoolVal,
+            DoubleVal,
+            IntVal,
+            ListVal,
+            ObjectRef,
+            StringVal,
         )
 
         if isinstance(value, str):
@@ -1165,7 +1168,7 @@ class AsyncGatunClient:
 
         try:
             await self._send_raw(builder.Output())
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - freeing is best-effort; the server reclaims at session end
             pass
 
     async def send_arrow_table(self, table: pa.Table):
@@ -1243,7 +1246,9 @@ class AsyncGatunClient:
             if self.shm_file:
                 self.shm_file.close()
                 self.shm_file = None
-        except Exception:
+        except (OSError, ValueError, BufferError):
+            # Best-effort teardown; mmap.close() raises BufferError while Arrow
+            # buffers exported from the mapping are still alive.
             pass
 
     async def __aenter__(self):

@@ -2,7 +2,7 @@
 
 import pytest
 
-from gatun import java_import, JavaArray, aconnect
+from gatun import JavaArray, aconnect, java_import
 
 
 class TestQuickStart:
@@ -216,7 +216,7 @@ class TestPythonicJavaCollections:
         # Iterate
         collected = []
         for item in arr:
-            collected.append(item)
+            collected.append(item)  # noqa: PERF402 - mirrors the README's explicit loop
         assert collected == ["a", "b", "c"]
 
         # Index access

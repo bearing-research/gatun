@@ -429,7 +429,7 @@ class TestIterationPatterns:
 
         result = []
         for item in arr:
-            result.append(item)
+            result.append(item)  # noqa: PERF402 - the explicit loop is the pattern under test
 
         assert result == ["a", "b", "c"]
 
