@@ -36,6 +36,16 @@ public class SessionQuota {
   // ========== OBJECT QUOTA ==========
 
   /**
+   * Check that one more object would fit, without taking the slot. For refusing work (running a
+   * constructor) whose result could not be registered anyway.
+   *
+   * @throws ResourceLimits.ObjectLimitExceededException if the session is at its limit
+   */
+  public void checkObjectLimit() {
+    ResourceLimits.checkObjectLimit(objectCount.get());
+  }
+
+  /**
    * Try to allocate space for a new object.
    *
    * @throws ResourceLimits.ObjectLimitExceededException if limit would be exceeded

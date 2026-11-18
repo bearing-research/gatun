@@ -112,6 +112,23 @@ class TestServerLifetime:
         client.close()
         client.close()
 
+    def test_close_with_a_busy_mapping_still_closes_the_socket(self):
+        """Regression: the mapping cannot be released while a buffer export of
+        it is alive; that failure aborted close() before it reached the socket."""
+        client = connect()
+        process = client._server_session.process
+        sock = client.sock
+        shm_file = client.shm_file
+        export = memoryview(client.shm)
+
+        client.close()
+
+        assert sock.fileno() == -1
+        assert shm_file.closed
+        assert client.sock is None
+        assert process.poll() is not None
+        export.release()
+
     def test_close_leaves_no_shared_memory_files(self):
         """The server is stopped right after the socket closes, before the
         session thread gets to delete its own shared memory file."""

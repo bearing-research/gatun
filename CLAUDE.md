@@ -40,7 +40,7 @@ The protocol is implemented several times over, so a wire-level change usually t
 - `src/gatun/async_client.py` — shares value encoding and decoding with the sync client (the `_ValueEncoder` mixin and `_unpack_value_impl` in `client.py`) but has its own `_read_response`, and implements only a subset of the sync API (no `batch`, `cancel`, `reflect`, static-field access, or `send_arrow_buffers` / `get_arrow_data`)
 - `PROTOCOL_VERSION` in both `GatunServer.java` and `client.py` for breaking changes
 
-Java-side responsibilities are split: `GatunServer` (dispatch, object/callback registries, allowlist, value packing), `MethodResolver` (overload scoring, varargs), `ReflectionCache` (class/method/field/handle caches), `ArrowMemoryHandler` (Arrow IPC + buffer-descriptor transfer, epoch checks), `ResourceLimits` + `SessionQuota` (per-session limits), `observability/` (logging, metrics, JFR).
+Java-side responsibilities are split: `GatunServer` (dispatch, object/callback registries, allowlist, value packing), `MethodResolver` (overload scoring, varargs), `ReflectionCache` (class/method/field/handle caches), `ArrowMemoryHandler` (Arrow IPC + buffer-descriptor transfer, epoch checks; one instance per session, since the loaded batch points into that session's shared memory), `ResourceLimits` + `SessionQuota` (per-session limits), `observability/` (logging, metrics, JFR).
 
 On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which asks the server (`Action.Reflect`) whether a dotted path is a class, method, or field and caches the answer in a process-global LRU. An `ALL_UPPERCASE` attribute on a capitalized parent is fetched eagerly as a static field.
 
