@@ -1326,6 +1326,24 @@ def _unpack_array_impl(array_val, client: Any, ref_class: Any):
         return result
 
 
+def _close_shared_memory(client: Any) -> None:
+    """Release a client's mapping of the shared memory file, best effort.
+
+    mmap.close() raises BufferError while something still holds a buffer export
+    of the mapping (a memoryview, for example); the mapping then lives until
+    that is released. The file handle is closed either way.
+    """
+    shm, client.shm = client.shm, None
+    shm_file, client.shm_file = client.shm_file, None
+    for resource in (shm, shm_file):
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except (OSError, ValueError, BufferError):
+            pass
+
+
 class _ValueEncoder:
     """Builds FlatBuffers values from Python arguments.
 
@@ -3245,8 +3263,6 @@ class GatunClient(_ValueEncoder):
         if include_schema:
             schema_bytes = serialize_schema(table.schema)
             schema_bytes_vec = builder.CreateByteVector(schema_bytes)
-            if schema_cache is not None:
-                schema_cache[schema_hash] = True
 
         # Build buffer descriptors
         buffer_offsets = []
@@ -3297,7 +3313,13 @@ class GatunClient(_ValueEncoder):
         builder.Finish(cmd)
 
         # 4. Send via standard path
-        return self._send_raw(builder.Output())
+        response = self._send_raw(builder.Output())
+
+        # Only now does the server have the schema: a rejected send must not leave
+        # the cache claiming it does, or every later send would omit it.
+        if include_schema and schema_cache is not None:
+            schema_cache[schema_hash] = True
+        return response
 
     def reset_payload_arena(self):
         """Signal Java to reset its view of the payload arena.
@@ -3447,19 +3469,15 @@ class GatunClient(_ValueEncoder):
 
     def close(self):
         try:
-            if self.shm:
-                self.shm.close()
-                self.shm = None
-            if self.shm_file:
-                self.shm_file.close()
-                self.shm_file = None
-            if self.sock:
-                self.sock.close()
-                self.sock = None
-        except (OSError, ValueError, BufferError):
-            # Best-effort teardown; mmap.close() raises BufferError while Arrow
-            # buffers exported from the mapping are still alive.
-            pass
+            # The socket goes first and on its own: it is what ends the session on
+            # the server, and a failure to release the mapping must not keep it open.
+            sock, self.sock = self.sock, None
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            _close_shared_memory(self)
         finally:
             # A server started for this client by connect() goes away with it
             session, self._server_session = self._server_session, None

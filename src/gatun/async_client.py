@@ -46,6 +46,7 @@ from gatun.client import (
     PayloadTooLargeError,
     ProtocolDesyncError,
     SocketTimeoutError,
+    _close_shared_memory,
     _raise_java_exception_impl,
     _unpack_value_impl,
     _ValueEncoder,
@@ -1092,21 +1093,15 @@ class AsyncGatunClient(_ValueEncoder):
     async def close(self):
         """Close the connection."""
         try:
-            if self._writer:
-                self._writer.close()
-                await self._writer.wait_closed()
-                self._writer = None
-                self._reader = None
-            if self.shm:
-                self.shm.close()
-                self.shm = None
-            if self.shm_file:
-                self.shm_file.close()
-                self.shm_file = None
-        except (OSError, ValueError, BufferError):
-            # Best-effort teardown; mmap.close() raises BufferError while Arrow
-            # buffers exported from the mapping are still alive.
-            pass
+            writer, self._writer = self._writer, None
+            self._reader = None
+            if writer is not None:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+            _close_shared_memory(self)
         finally:
             # A server started for this client by aconnect() goes away with it
             session, self._server_session = self._server_session, None

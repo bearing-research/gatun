@@ -17,7 +17,6 @@ public class SessionObserver {
   private final long startTimeNanos;
 
   private long requestCount = 0;
-  private int objectCount = 0;
   private RequestContext currentRequest = null;
   private GatunEvents.RequestEvent currentJfrEvent = null;
 
@@ -82,23 +81,6 @@ public class SessionObserver {
     currentRequest = null;
   }
 
-  /** Called when an object is added to registry. */
-  public void onObjectCreated(long objectId, String objectType, int registrySize) {
-    objectCount++;
-    Metrics.getInstance().updateObjectCount(1);
-
-    StructuredLogger.logObjectRegistry(sessionId, objectId, "add", objectType, registrySize);
-    GatunEvents.emitObjectRegistry(sessionId, objectId, "add", objectType, registrySize);
-  }
-
-  /** Called when an object is removed from registry. */
-  public void onObjectFreed(long objectId, int registrySize) {
-    Metrics.getInstance().updateObjectCount(-1);
-
-    StructuredLogger.logObjectRegistry(sessionId, objectId, "remove", null, registrySize);
-    GatunEvents.emitObjectRegistry(sessionId, objectId, "remove", null, registrySize);
-  }
-
   /** Called when Arrow data is transferred. */
   public void onArrowTransfer(String direction, long rowCount, long bytesCopied, boolean zeroCopy) {
     Metrics.getInstance().recordArrowTransfer(rowCount, bytesCopied);
@@ -115,11 +97,16 @@ public class SessionObserver {
     GatunEvents.emitSession(sessionId, "start", 0, 0);
   }
 
-  /** Called when session ends. */
-  public void onSessionEnd() {
+  /**
+   * Called when session ends.
+   *
+   * @param objectsCreated objects registered for the session over its lifetime
+   */
+  public void onSessionEnd(long objectsCreated) {
     long durationMillis = (System.nanoTime() - startTimeNanos) / 1_000_000;
     Metrics.getInstance().updateSessionCount(-1);
 
+    int objectCount = (int) Math.min(objectsCreated, Integer.MAX_VALUE);
     StructuredLogger.logSessionEnd(sessionId, objectCount, requestCount, durationMillis);
     GatunEvents.emitSession(sessionId, "end", objectCount, requestCount);
   }
@@ -132,10 +119,5 @@ public class SessionObserver {
   /** Get the number of requests processed. */
   public long getRequestCount() {
     return requestCount;
-  }
-
-  /** Get the number of objects created (may differ from current registry due to frees). */
-  public int getObjectCount() {
-    return objectCount;
   }
 }

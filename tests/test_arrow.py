@@ -2,6 +2,7 @@ import pyarrow as pa
 import pytest
 
 from gatun import (
+    JavaException,
     PayloadArena,
     PayloadTooLargeError,
     StaleArenaError,
@@ -1274,3 +1275,188 @@ def test_send_arrow_buffers_accepts_record_batch(client):
             del received
     finally:
         arena.close()
+
+
+class TestArrowSessionState:
+    """Arrow state belongs to one session: the loaded batch points into that
+    session's shared memory."""
+
+    def test_other_sessions_cannot_read_a_sent_table(self, client, make_client):
+        """Regression: one handler was shared by every session, so any client
+        could fetch the table another client had sent."""
+        arena = client.get_payload_arena()
+        client.send_arrow_buffers(pa.table({"x": [1, 2, 3]}), arena, {})
+
+        other = make_client()
+        with pytest.raises(JavaException, match="No Arrow data available"):
+            other.get_arrow_data()
+
+        received = client.get_arrow_data()
+        assert received.column("x").to_pylist() == [1, 2, 3]
+        del received
+        arena.close()
+
+    def test_reset_in_one_session_leaves_the_others_alone(self, client, make_client):
+        """Regression: resetting the arena bumped an epoch shared by all
+        sessions, so every other client's next send was rejected as stale."""
+        other = make_client()
+        other_arena = other.get_payload_arena()
+        other.send_arrow_buffers(pa.table({"x": [1]}), other_arena, {})
+
+        arena = client.get_payload_arena()
+        for _ in range(3):
+            arena.reset()
+            client.reset_payload_arena()
+
+        other.send_arrow_buffers(pa.table({"x": [7, 8]}), other_arena, {})
+        received = other.get_arrow_data()
+        assert received.column("x").to_pylist() == [7, 8]
+        del received
+        arena.close()
+        other_arena.close()
+
+    def test_table_survives_another_session_closing(self, client, make_client):
+        other = make_client()
+        other_arena = other.get_payload_arena()
+        other.send_arrow_buffers(pa.table({"x": [1]}), other_arena, {})
+        other_arena.close()
+        other.close()
+
+        arena = client.get_payload_arena()
+        client.send_arrow_buffers(pa.table({"x": [4, 5]}), arena, {})
+        received = client.get_arrow_data()
+        assert received.column("x").to_pylist() == [4, 5]
+        del received
+        arena.close()
+
+
+class TestArrowDescriptorValidation:
+    """The server checks what the client tells it about the buffers."""
+
+    @pytest.mark.parametrize(
+        ("offset", "length"),
+        [
+            (1 << 40, 24),  # far outside the mapping
+            (0, 1 << 40),  # longer than the zone
+            # The fields are unsigned on the wire; Java reads these two as negative
+            ((1 << 64) - 64, 24),
+            (64, (1 << 64) - 1),
+            ((1 << 63) - 8, 1 << 62),  # offset + length overflows a signed long
+        ],
+        ids=["offset", "length", "negative-offset", "negative-length", "overflow"],
+    )
+    def test_buffers_outside_the_payload_zone_are_rejected(
+        self, client, monkeypatch, offset, length
+    ):
+        """Regression: offsets and lengths were used as given, so the server
+        would read memory outside the shared mapping."""
+        import gatun.arena
+
+        real_copy = gatun.arena.copy_arrow_table_to_arena
+
+        def forged_copy(table, arena):
+            buffer_infos, field_nodes = real_copy(table, arena)
+            buffer_infos[-1] = buffer_infos[-1]._replace(offset=offset, length=length)
+            return buffer_infos, field_nodes
+
+        monkeypatch.setattr(gatun.arena, "copy_arrow_table_to_arena", forged_copy)
+        arena = client.get_payload_arena()
+        try:
+            with pytest.raises(JavaException, match="outside the payload zone"):
+                client.send_arrow_buffers(pa.table({"x": [1, 2, 3]}), arena, {})
+            assert client.ping() is True
+        finally:
+            arena.close()
+
+    def test_missing_schema_is_an_error(self, client):
+        """Regression: a batch whose schema the server did not have was
+        answered with "Received N rows" although nothing had been loaded."""
+        from gatun.arena import compute_schema_hash
+
+        table = pa.table({"never_seen_before": [1, 2, 3]})
+        claims_server_has_it = {compute_schema_hash(table.schema): True}
+        arena = client.get_payload_arena()
+        try:
+            with pytest.raises(JavaException, match="No Arrow schema available"):
+                client.send_arrow_buffers(table, arena, claims_server_has_it)
+        finally:
+            arena.close()
+
+    def test_data_too_large_to_return_is_refused_up_front(self, client):
+        """Data sent to Java can use the whole zone, but only half is reserved
+        for the way back. Writing until it overflowed overwrote the source."""
+        arena = client.get_payload_arena()
+        rows = int(arena.bytes_available() * 0.3) // 8
+        table = pa.table(
+            {
+                "x": pa.array(range(rows), type=pa.int64()),
+                "y": pa.array(range(rows, 2 * rows), type=pa.int64()),
+            }
+        )
+        try:
+            client.send_arrow_buffers(table, arena, {})
+            with pytest.raises(PayloadTooLargeError) as exc_info:
+                client.get_arrow_data()
+            assert exc_info.value.payload_size > exc_info.value.max_size > 0
+            assert client.ping() is True
+        finally:
+            arena.close()
+
+    def test_data_sent_past_the_first_half_cannot_be_returned(self, client):
+        """Two sends without a reset leave the second batch in the half of the
+        zone that returned data is written to."""
+        arena = client.get_payload_arena()
+        rows = int(arena.bytes_available() * 0.3) // 8
+        table = pa.table({"x": pa.array(range(rows), type=pa.int64())})
+        try:
+            client.send_arrow_buffers(table, arena, {})
+            client.send_arrow_buffers(table, arena, {})
+            with pytest.raises(JavaException, match="Reset the arena"):
+                client.get_arrow_data()
+
+            arena.reset()
+            client.reset_payload_arena()
+            client.send_arrow_buffers(table, arena, {})
+            received = client.get_arrow_data()
+            assert received.num_rows == rows
+            del received
+        finally:
+            arena.close()
+
+    def test_rejected_send_does_not_mark_the_schema_as_sent(self, client, monkeypatch):
+        """Regression: the schema cache was updated before the server accepted
+        the batch, so after one rejected send every later one omitted the schema."""
+        import gatun.arena
+
+        real_copy = gatun.arena.copy_arrow_table_to_arena
+
+        def forged_copy(table, arena):
+            buffer_infos, field_nodes = real_copy(table, arena)
+            buffer_infos[-1] = buffer_infos[-1]._replace(offset=1 << 40)
+            return buffer_infos, field_nodes
+
+        table = pa.table({"schema_cache_probe": [1, 2, 3]})
+        schema_cache: dict = {}
+        arena = client.get_payload_arena()
+        try:
+            monkeypatch.setattr(gatun.arena, "copy_arrow_table_to_arena", forged_copy)
+            with pytest.raises(JavaException, match="outside the payload zone"):
+                client.send_arrow_buffers(table, arena, schema_cache)
+            assert schema_cache == {}
+
+            monkeypatch.setattr(gatun.arena, "copy_arrow_table_to_arena", real_copy)
+            arena.reset()
+            client.reset_payload_arena()
+            client.send_arrow_buffers(table, arena, schema_cache)
+            assert len(schema_cache) == 1
+        finally:
+            arena.close()
+
+
+def test_send_arrow_table_counts_every_chunk(client):
+    """Regression: only the first record batch of the stream was read, so a
+    table with several chunks was reported with the rows of its first chunk."""
+    table = pa.concat_tables([pa.table({"x": [1, 2, 3]}), pa.table({"x": [4, 5]})])
+    assert table.column("x").num_chunks == 2
+
+    assert client.send_arrow_table(table) == "Received 5 rows"

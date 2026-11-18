@@ -44,18 +44,25 @@ def java_gateway():
         socket_path.unlink()
 
 
-def _create_client(socket_path: str) -> GatunClient:
-    """Helper to create and connect a client with retry logic."""
-    c = GatunClient(socket_path)
-    connected = False
-    for _ in range(10):
-        connected = c.connect()
-        if connected:
-            break
-        time.sleep(0.1)
+def _create_client(session) -> GatunClient:
+    """Connect a client to the session's server, retrying a few times.
 
-    if not connected:
-        raise RuntimeError(f"Client failed to connect to Gateway at {socket_path}")
+    Each attempt uses a new client: a failed connect() leaves its socket
+    connected or closed, so retrying on the same client can never succeed.
+    """
+    socket_path = str(session.socket_path)
+    for _ in range(10):
+        c = GatunClient(socket_path)
+        if c.connect():
+            break
+        c.close()
+        time.sleep(0.1)
+    else:
+        server_output = "".join(session._stderr_lines[-40:])
+        raise RuntimeError(
+            f"Client failed to connect to Gateway at {socket_path}. "
+            f"Server output:\n{server_output}"
+        )
 
     # Verify Handshake (Sanity Check)
     # We don't enforce exact size - just verify connection worked
@@ -70,18 +77,14 @@ def client(java_gateway):
     """
     Provides a connected GatunClient for each test function.
     """
-    socket_str = str(java_gateway.socket_path)
-    logger.debug(f"Connecting client to {socket_str}")
+    logger.debug(f"Connecting client to {java_gateway.socket_path}")
 
-    c = _create_client(socket_str)
+    c = _create_client(java_gateway)
     yield c
 
-    # Cleanup
-    try:
-        if c.sock:
-            c.sock.close()
-    except OSError:
-        pass
+    # Releases the shared memory mapping too, not just the socket: an unlinked
+    # file keeps its disk blocks for as long as a mapping of it is alive.
+    c.close()
 
 
 @pytest.fixture(scope="function")
@@ -100,19 +103,14 @@ def make_client(java_gateway):
             # client is automatically closed when the next make_client() is called
             # or when the test function ends
     """
-    socket_str = str(java_gateway.socket_path)
     current_client = [None]  # Use list to allow mutation in closure
 
     def _make():
         # Close the previous client before creating a new one
         if current_client[0] is not None:
-            try:
-                if current_client[0].sock:
-                    current_client[0].sock.close()
-            except OSError:
-                pass
+            current_client[0].close()
 
-        c = _create_client(socket_str)
+        c = _create_client(java_gateway)
         current_client[0] = c
         return c
 
@@ -120,8 +118,4 @@ def make_client(java_gateway):
 
     # Cleanup the last client
     if current_client[0] is not None:
-        try:
-            if current_client[0].sock:
-                current_client[0].sock.close()
-        except OSError:
-            pass
+        current_client[0].close()

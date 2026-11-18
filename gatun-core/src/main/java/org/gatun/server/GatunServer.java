@@ -30,8 +30,10 @@ import java.util.logging.Logger;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.gatun.PayloadTooLargeException;
 import org.gatun.protocol.*; // Import all generated classes
 import org.gatun.server.MethodResolver.MethodWithArgs;
+import org.gatun.server.observability.GatunEvents;
 import org.gatun.server.observability.Metrics;
 import org.gatun.server.observability.SessionObserver;
 import org.gatun.server.observability.StructuredLogger;
@@ -177,7 +179,6 @@ public class GatunServer {
       ThreadLocal.withInitial(CallbackRef::new);
 
   private final BufferAllocator allocator = new RootAllocator();
-  private final ArrowMemoryHandler arrowHandler = new ArrowMemoryHandler(allocator);
 
   // Delegate to ReflectionCache for all caching operations
   private static java.lang.reflect.Constructor<?> getNoArgConstructor(Class<?> clazz)
@@ -293,16 +294,22 @@ public class GatunServer {
     Path sessionShmPath = Path.of(socketPath.toString() + "." + sessionId + ".shm");
     activeShmPaths.add(sessionShmPath);
 
+    // The Arrow handler is declared last so that it is closed first: the batch it holds points
+    // into the mapping that the arena unmaps.
     try (client;
         RandomAccessFile raf = new RandomAccessFile(sessionShmPath.toFile(), "rw");
-        Arena arena = Arena.ofConfined()) {
+        Arena arena = Arena.ofConfined();
+        ArrowMemoryHandler arrowHandler = new ArrowMemoryHandler(allocator)) {
 
-      // Create and map the session's shared memory
+      // Create and map the session's shared memory. Extending an empty file yields pages that
+      // read as zero without writing them, so a session costs only the pages it touches;
+      // writing zeros over the whole mapping made every connection pay for its full size.
+      // Truncating first discards a stale file left by an earlier server on this socket path.
+      raf.setLength(0);
       raf.setLength(this.memorySize);
       FileChannel channel = raf.getChannel();
       MemorySegment sharedMem =
           channel.map(FileChannel.MapMode.READ_WRITE, 0, this.memorySize, arena);
-      sharedMem.fill((byte) 0);
 
       LOG.fine("Session " + sessionId + " SHM mapped at: " + sessionShmPath);
 
@@ -426,6 +433,12 @@ public class GatunServer {
         // Object IDs handed out while packing the result: [packedFromId, packedToId)
         long packedFromId = 0;
         long packedToId = 0;
+        // Batch only: IDs handed out while packing sub-result i are [2 * i] up to [2 * i + 1]
+        long[] subPackedIds = null;
+        // Results of a vectorized action, which registers objects as it goes
+        java.util.List<Object> vectorResults = null;
+        // Set by the actions that build their own response instead of returning a result
+        boolean responsePacked = false;
 
         try {
           // Check if this request was already cancelled
@@ -439,8 +452,8 @@ public class GatunServer {
               throw new SecurityException("Class not allowed: " + className);
             }
 
-            // Check object limit before creating
-            quota.allocateObject();
+            // Refuse before running the constructor; the slot is taken once it succeeds
+            quota.checkObjectLimit();
 
             Class<?> clazz = getClass(className);
 
@@ -467,8 +480,9 @@ public class GatunServer {
               instance = ctorResult.cached.newInstance(ctorResult.args);
             }
 
+            quota.allocateObject();
             long newId = objectIdCounter.getAndIncrement();
-            objectRegistry.put(newId, instance);
+            putObject(newId, instance);
             sessionObjectIds.add(newId);
             result = new ObjectRefT(newId);
             LOG.fine("Created object ID " + newId + " of type " + className);
@@ -524,7 +538,7 @@ public class GatunServer {
             if (result != null && !MethodResolver.isAutoConvertible(result)) {
               quota.allocateObject();
               long newId = objectIdCounter.getAndIncrement();
-              objectRegistry.put(newId, result);
+              putObject(newId, result);
               sessionObjectIds.add(newId);
               result = new ObjectRefT(newId);
             }
@@ -567,7 +581,7 @@ public class GatunServer {
                 && (cmd.returnObjectRef() || !MethodResolver.isAutoConvertible(result))) {
               quota.allocateObject();
               long newId = objectIdCounter.getAndIncrement();
-              objectRegistry.put(newId, result);
+              putObject(newId, result);
               sessionObjectIds.add(newId);
               result = new ObjectRefT(newId);
             }
@@ -593,7 +607,7 @@ public class GatunServer {
             if (result != null && !MethodResolver.isAutoConvertible(result)) {
               quota.allocateObject();
               long newId = objectIdCounter.getAndIncrement();
-              objectRegistry.put(newId, result);
+              putObject(newId, result);
               sessionObjectIds.add(newId);
               result = new ObjectRefT(newId);
             }
@@ -628,8 +642,10 @@ public class GatunServer {
             LOG.fine("Processing Arrow batch...");
             long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
             MemorySegment payloadSlice = sharedMem.asSlice(PAYLOAD_OFFSET, payloadSize);
-            int rows = arrowHandler.processArrowIpcBatch(payloadSlice);
-            result = "Received " + rows + " rows";
+            ArrowMemoryHandler.Received received = arrowHandler.processArrowIpcBatch(payloadSlice);
+            observer.onArrowTransfer(
+                "python_to_java", received.numRows(), received.totalBytes(), false);
+            result = "Received " + received.numRows() + " rows";
           }
           // --- ZERO-COPY ARROW BUFFERS ---
           else if (cmd.action() == Action.SendArrowBuffers) {
@@ -639,20 +655,24 @@ public class GatunServer {
                   "SendArrowBuffers requires arrow_batch descriptor");
             }
 
-            // Calculate total bytes being transferred for quota tracking
-            long totalBytes = 0;
-            for (int i = 0; i < batchDesc.buffersLength(); i++) {
-              totalBytes += batchDesc.buffers(i).length();
-            }
-            // Check and track Arrow buffer allocation
-            quota.allocateArrowBytes(totalBytes);
-
             // For now, payload shm is the same as control shm (payloadSlice)
             // TODO: Support separate payload shm file
             long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
             MemorySegment payloadSlice = sharedMem.asSlice(PAYLOAD_OFFSET, payloadSize);
-            long numRows = arrowHandler.processArrowBuffers(batchDesc, payloadSlice);
-            result = "Received " + numRows + " rows via zero-copy buffers";
+
+            // Loading wraps the buffers in place, so it is cheap to do before the quota check;
+            // charging only once the batch is accepted keeps rejected sends from using up quota.
+            ArrowMemoryHandler.Received received =
+                arrowHandler.processArrowBuffers(batchDesc, payloadSlice);
+            try {
+              quota.allocateArrowBytes(received.totalBytes());
+            } catch (RuntimeException e) {
+              arrowHandler.close(); // over quota: do not keep the batch
+              throw e;
+            }
+            observer.onArrowTransfer(
+                "python_to_java", received.numRows(), received.totalBytes(), true);
+            result = "Received " + received.numRows() + " rows via zero-copy buffers";
           }
           // --- RESET PAYLOAD ARENA ---
           else if (cmd.action() == Action.ResetPayloadArena) {
@@ -673,27 +693,18 @@ public class GatunServer {
             MemorySegment payloadSlice = sharedMem.asSlice(PAYLOAD_OFFSET, payloadSize);
             ArrowMemoryHandler.ArrowWriteResult writeResult =
                 arrowHandler.writeArrowBuffers(currentRoot, payloadSlice, null);
-            // Pack and send Arrow response (handled specially below)
             responseOffset = packArrowResponse(builder, writeResult);
-            // Skip normal packSuccess
-            builder.finish(responseOffset);
-            ByteBuffer resBuf = builder.dataBuffer();
-            int resSize = resBuf.remaining();
-            MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
-            responseSlice.copyFrom(MemorySegment.ofBuffer(resBuf));
-            lengthBuf.putInt(resSize);
-            lengthBuf.flip();
-            client.write(lengthBuf);
-            lengthBuf.clear();
-            continue; // Skip normal response handling
+            responsePacked = true;
+            observer.onArrowTransfer(
+                "java_to_python", writeResult.numRows, writeResult.totalBytesWritten, false);
           }
           // --- CALLBACK BLOCK ---
           else if (cmd.action() == Action.RegisterCallback) {
             // Register a Python callback and create a Java proxy
             String interfaceName = cmd.targetName();
 
-            // Check object limit before creating
-            quota.allocateObject();
+            // Refuse before creating the proxy; the slot is taken once that succeeds
+            quota.checkObjectLimit();
 
             // Use the same ID for both callback and object registry
             // This way Python can use the object_id as the callback_id
@@ -702,6 +713,7 @@ public class GatunServer {
             // Create a dynamic proxy that will invoke Python when called
             // Use session context (captured at start of handleClient) for cross-thread callbacks
             Object proxy = createCallbackProxy(callbackId, interfaceName, ctx);
+            quota.allocateObject();
 
             // Store in callback registry with session context
             CallbackInfo info = new CallbackInfo(callbackId, interfaceName, proxy, ctx);
@@ -709,7 +721,7 @@ public class GatunServer {
             sessionCallbackIds.add(callbackId);
 
             // Also register proxy in object registry with the SAME ID
-            objectRegistry.put(callbackId, proxy);
+            putObject(callbackId, proxy);
             sessionObjectIds.add(callbackId);
 
             LOG.fine("Registered callback ID " + callbackId + " for interface " + interfaceName);
@@ -765,7 +777,7 @@ public class GatunServer {
             if (result != null && !MethodResolver.isAutoConvertible(result)) {
               quota.allocateObject();
               long newId = objectIdCounter.getAndIncrement();
-              objectRegistry.put(newId, result);
+              putObject(newId, result);
               sessionObjectIds.add(newId);
               result = new ObjectRefT(newId);
             }
@@ -882,6 +894,7 @@ public class GatunServer {
 
             int fieldCount = req.fieldNamesLength();
             java.util.ArrayList<Object> results = new java.util.ArrayList<>(fieldCount);
+            vectorResults = results;
 
             for (int i = 0; i < fieldCount; i++) {
               String fieldName = req.fieldNames(i);
@@ -901,7 +914,7 @@ public class GatunServer {
               if (fieldValue != null && !MethodResolver.isAutoConvertible(fieldValue)) {
                 quota.allocateObject();
                 long newId = objectIdCounter.getAndIncrement();
-                objectRegistry.put(newId, fieldValue);
+                putObject(newId, fieldValue);
                 sessionObjectIds.add(newId);
                 fieldValue = new ObjectRefT(newId);
               }
@@ -926,6 +939,7 @@ public class GatunServer {
             int callCount = req.methodCallsLength();
             ResourceLimits.checkMethodCallsSize(callCount);
             java.util.ArrayList<Object> results = new java.util.ArrayList<>(callCount);
+            vectorResults = results;
 
             for (int i = 0; i < callCount; i++) {
               MethodCall call = req.methodCalls(i);
@@ -967,7 +981,7 @@ public class GatunServer {
                   && (returnObjectRef || !MethodResolver.isAutoConvertible(methodResult))) {
                 quota.allocateObject();
                 long newId = objectIdCounter.getAndIncrement();
-                objectRegistry.put(newId, methodResult);
+                putObject(newId, methodResult);
                 sessionObjectIds.add(newId);
                 methodResult = new ObjectRefT(newId);
               }
@@ -986,6 +1000,7 @@ public class GatunServer {
             int objCount = req.objectsLength();
             ResourceLimits.checkCreateObjectsSize(objCount);
             java.util.ArrayList<Object> results = new java.util.ArrayList<>(objCount);
+            vectorResults = results;
 
             for (int i = 0; i < objCount; i++) {
               ObjectSpec spec = req.objects(i);
@@ -995,8 +1010,8 @@ public class GatunServer {
                 throw new SecurityException("Class not allowed: " + className);
               }
 
-              // Check object limit before creating
-              quota.allocateObject();
+              // Refuse before running the constructor; the slot is taken once it succeeds
+              quota.checkObjectLimit();
 
               Class<?> clazz = getClass(className);
               Object instance;
@@ -1018,8 +1033,9 @@ public class GatunServer {
                 instance = ctorResult.cached.newInstance(ctorResult.args);
               }
 
+              quota.allocateObject();
               long newId = objectIdCounter.getAndIncrement();
-              objectRegistry.put(newId, instance);
+              putObject(newId, instance);
               sessionObjectIds.add(newId);
               results.add(new ObjectRefT(newId));
             }
@@ -1038,8 +1054,7 @@ public class GatunServer {
 
             // Execute each sub-command, collect response offsets
             int[] subResponseOffsets = new int[commandCount];
-            // Object IDs handed out while packing sub-result i: [2 * i] up to [2 * i + 1]
-            long[] subPackedIds = new long[2 * commandCount];
+            subPackedIds = new long[2 * commandCount];
             int errorIndex = -1;
             int executedCount = 0;
 
@@ -1076,45 +1091,7 @@ public class GatunServer {
             // Build BatchResponse
             responseOffset =
                 packBatchResponse(builder, subResponseOffsets, executedCount, errorIndex);
-
-            // Skip normal packSuccess - we've already built the response
-            builder.finish(responseOffset);
-            ByteBuffer resBuf = builder.dataBuffer();
-            int resSize = resBuf.remaining();
-
-            // Validate response size fits in zone
-            if (resSize > RESPONSE_ZONE_SIZE) {
-              // The client never sees the IDs in this response, so it cannot free them
-              for (int i = 0; i < commandCount; i++) {
-                discardObjects(
-                    subPackedIds[2 * i], subPackedIds[2 * i + 1], sessionObjectIds, quota);
-              }
-              builder = new FlatBufferBuilder(256);
-              String errorMsg =
-                  String.format(
-                      "Response too large: %d bytes exceeds %d byte limit",
-                      resSize, RESPONSE_ZONE_SIZE);
-              responseOffset = packError(builder, errorMsg, "org.gatun.PayloadTooLargeException");
-              builder.finish(responseOffset);
-              resBuf = builder.dataBuffer();
-              resSize = resBuf.remaining();
-            }
-
-            MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
-            responseSlice.copyFrom(MemorySegment.ofBuffer(resBuf));
-
-            // Signal Python
-            lengthBuf.putInt(resSize);
-            lengthBuf.flip();
-            client.write(lengthBuf);
-            lengthBuf.clear();
-
-            // Clean up and continue to next command
-            if (requestId != 0) {
-              cancelledRequests.get().remove(requestId);
-            }
-            currentRequestId.remove();
-            continue; // Skip the normal response logic below
+            responsePacked = true;
 
           } else if (cmd.action() == Action.GetMetrics) {
             // Return server metrics as a string report
@@ -1124,10 +1101,12 @@ public class GatunServer {
             result = true;
           }
 
-          // 3. Pack Success
-          packedFromId = objectIdCounter.get();
-          responseOffset = packResult(builder, result, sessionObjectIds, quota);
-          packedToId = objectIdCounter.get();
+          // 3. Pack Success, unless the action built its own response
+          if (!responsePacked) {
+            packedFromId = objectIdCounter.get();
+            responseOffset = packResult(builder, result, sessionObjectIds, quota);
+            packedToId = objectIdCounter.get();
+          }
 
         } catch (Throwable t) {
           // Unwrap InvocationTargetException to get the real cause
@@ -1149,10 +1128,9 @@ public class GatunServer {
           errorType = cause.getClass().getName();
           requestSuccess = false;
           responseOffset = packError(builder, errorMessage, errorType);
+          // The client gets the error, not the results gathered before it
+          discardResultRefs(vectorResults, sessionObjectIds, quota);
         }
-
-        // Record request completion in observer
-        observer.onRequestEnd(requestSuccess, errorType, errorMessage);
 
         // 4. Write Response to Zone C
         builder.finish(responseOffset);
@@ -1164,16 +1142,27 @@ public class GatunServer {
           // Response too large - send error instead. The client never sees the IDs in the
           // response it was meant to get, so it cannot free them.
           discardObjects(packedFromId, packedToId, sessionObjectIds, quota);
+          if (subPackedIds != null) {
+            for (int i = 0; i < subPackedIds.length; i += 2) {
+              discardObjects(subPackedIds[i], subPackedIds[i + 1], sessionObjectIds, quota);
+            }
+          }
+          if (requestSuccess) {
+            discardResultRefs(vectorResults, sessionObjectIds, quota);
+          }
           builder = new FlatBufferBuilder(256);
-          String errorMsg =
-              String.format(
-                  "Response too large: %d bytes exceeds %d byte limit",
-                  resSize, RESPONSE_ZONE_SIZE);
-          responseOffset = packError(builder, errorMsg, "org.gatun.PayloadTooLargeException");
+          errorMessage =
+              new PayloadTooLargeException("Response", resSize, RESPONSE_ZONE_SIZE).getMessage();
+          errorType = PayloadTooLargeException.class.getName();
+          requestSuccess = false;
+          responseOffset = packError(builder, errorMessage, errorType);
           builder.finish(responseOffset);
           resBuf = builder.dataBuffer();
           resSize = resBuf.remaining();
         }
+
+        // Record request completion in observer
+        observer.onRequestEnd(requestSuccess, errorType, errorMessage);
 
         MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
         responseSlice.copyFrom(MemorySegment.ofBuffer(resBuf));
@@ -1192,15 +1181,19 @@ public class GatunServer {
       }
     } catch (IOException e) {
       LOG.fine("Client session " + sessionId + " ended: " + e.getMessage());
+    } catch (RuntimeException | Error e) {
+      // Nothing waits on this task's result, so an unexpected failure (during session setup,
+      // say) would otherwise close the connection without a trace
+      LOG.log(Level.WARNING, "Client session " + sessionId + " failed", e);
     } finally {
       // Notify observer of session end
-      observer.onSessionEnd();
+      observer.onSessionEnd(quota.getTotalObjectsCreated());
 
       // Log quota summary
       LOG.fine(quota.getSummary());
 
       // Cleanup orphans: remove session objects and callbacks from global registries
-      for (Long id : sessionObjectIds) objectRegistry.remove(id);
+      for (Long id : sessionObjectIds) removeObject(id);
       for (Long id : sessionCallbackIds) callbackRegistry.remove(id);
       // Clear thread-locals
       cancelledRequests.get().clear();
@@ -1263,8 +1256,47 @@ public class GatunServer {
 
   private void freeObject(long objectId, Set<Long> sessionObjectIds, SessionQuota quota) {
     if (sessionObjectIds.remove(objectId)) {
-      objectRegistry.remove(objectId);
+      removeObject(objectId);
       quota.releaseObject();
+    }
+  }
+
+  /** Add an object to the registry. All registrations go through here so they are observed. */
+  private void putObject(long objectId, Object obj) {
+    objectRegistry.put(objectId, obj);
+    observeRegistry(objectId, "add", obj.getClass().getName(), 1);
+  }
+
+  /** Remove an object from the registry; unknown IDs are ignored. */
+  private void removeObject(long objectId) {
+    if (objectRegistry.remove(objectId) != null) {
+      observeRegistry(objectId, "remove", null, -1);
+    }
+  }
+
+  private void observeRegistry(long objectId, String operation, String objectType, int delta) {
+    Metrics.getInstance().updateObjectCount(delta);
+    // Not set on a foreign thread that invokes a callback proxy; those report session 0
+    SessionContext ctx = sessionContext.get();
+    long sessionId = ctx != null ? ctx.quota.getSessionId() : 0;
+    int registrySize = objectRegistry.size();
+    StructuredLogger.logObjectRegistry(sessionId, objectId, operation, objectType, registrySize);
+    GatunEvents.emitObjectRegistry(sessionId, objectId, operation, objectType, registrySize);
+  }
+
+  /**
+   * Free the objects a vectorized action registered for results the client will not receive.
+   * Results that are not object references are skipped.
+   */
+  private void discardResultRefs(
+      java.util.List<Object> results, Set<Long> sessionObjectIds, SessionQuota quota) {
+    if (results == null) {
+      return;
+    }
+    for (Object item : results) {
+      if (item instanceof ObjectRefT ref) {
+        freeObject(ref.id, sessionObjectIds, quota);
+      }
     }
   }
 
@@ -1343,8 +1375,8 @@ public class GatunServer {
         throw new SecurityException("Class not allowed: " + className);
       }
 
-      // Check object limit before creating
-      quota.allocateObject();
+      // Refuse before running the constructor; the slot is taken once it succeeds
+      quota.checkObjectLimit();
 
       Class<?> clazz = getClass(className);
 
@@ -1368,8 +1400,9 @@ public class GatunServer {
         instance = ctorResult.cached.newInstance(ctorResult.args);
       }
 
+      quota.allocateObject();
       long newId = objectIdCounter.getAndIncrement();
-      objectRegistry.put(newId, instance);
+      putObject(newId, instance);
       sessionObjectIds.add(newId);
       result = new ObjectRefT(newId);
 
@@ -1419,7 +1452,7 @@ public class GatunServer {
       if (result != null && !MethodResolver.isAutoConvertible(result)) {
         quota.allocateObject();
         long newId = objectIdCounter.getAndIncrement();
-        objectRegistry.put(newId, result);
+        putObject(newId, result);
         sessionObjectIds.add(newId);
         result = new ObjectRefT(newId);
       }
@@ -1457,7 +1490,7 @@ public class GatunServer {
       if (result != null && (cmd.returnObjectRef() || !MethodResolver.isAutoConvertible(result))) {
         quota.allocateObject();
         long newId = objectIdCounter.getAndIncrement();
-        objectRegistry.put(newId, result);
+        putObject(newId, result);
         sessionObjectIds.add(newId);
         result = new ObjectRefT(newId);
       }
@@ -1482,7 +1515,7 @@ public class GatunServer {
       if (result != null && !MethodResolver.isAutoConvertible(result)) {
         quota.allocateObject();
         long newId = objectIdCounter.getAndIncrement();
-        objectRegistry.put(newId, result);
+        putObject(newId, result);
         sessionObjectIds.add(newId);
         result = new ObjectRefT(newId);
       }
@@ -1549,7 +1582,7 @@ public class GatunServer {
       if (result != null && !MethodResolver.isAutoConvertible(result)) {
         quota.allocateObject();
         long newId = objectIdCounter.getAndIncrement();
-        objectRegistry.put(newId, result);
+        putObject(newId, result);
         sessionObjectIds.add(newId);
         result = new ObjectRefT(newId);
       }
@@ -2054,7 +2087,7 @@ public class GatunServer {
     } else {
       // Unknown type - wrap as object reference
       long newId = objectIdCounter.getAndIncrement();
-      objectRegistry.put(newId, value);
+      putObject(newId, value);
       if (sessionObjectIds != null) {
         sessionObjectIds.add(newId);
       }
@@ -2217,6 +2250,27 @@ public class GatunServer {
     if (ctx == null || ctx.channel == null || ctx.sharedMem == null) {
       throw new IllegalStateException("Callback invoked with invalid session context");
     }
+
+    GatunEvents.CallbackEvent event =
+        GatunEvents.beginCallback(ctx.quota.getSessionId(), callbackId, methodName, args.length);
+    boolean success = false;
+    String errorMessage = null;
+    try {
+      Object returnValue = exchangeCallback(callbackId, methodName, args, ctx);
+      success = true;
+      return returnValue;
+    } catch (Exception e) {
+      errorMessage = e.getMessage();
+      throw e;
+    } finally {
+      Metrics.getInstance().recordCallback(success);
+      GatunEvents.endCallback(event, success, errorMessage);
+    }
+  }
+
+  /** One callback round-trip: send the request to Python, wait for its CallbackResponse. */
+  private Object exchangeCallback(
+      long callbackId, String methodName, Object[] args, SessionContext ctx) throws Exception {
 
     SocketChannel channel = ctx.channel;
     MemorySegment sharedMem = ctx.sharedMem;

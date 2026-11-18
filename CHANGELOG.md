@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protocol version is now 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together
 - The async client accepts `datetime` / `date` / `time` arguments
 - Executing a batch from inside a callback raises `ReentrancyError`, like any other call
+- Connecting no longer writes zeros over the whole shared memory file: about 7 ms instead of 260 ms at 64MB, and no longer proportional to the memory size. Disk (or tmpfs) pages are now allocated as they are first used rather than all at connect time
 
 ### Fixed
 - `pytest` no longer collects tests from an extracted Spark distribution (`testpaths`)
@@ -39,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `char[]` is supported as an argument and a return value (`JavaArray` with `element_type="Char"`); returning one used to fail with `ClassCastException`
 - Stopping the server removes its per-session shared memory files instead of leaving them in the temp directory
 - Objects in a response that turns out too large to send are released rather than kept until the client disconnects
+- Arrow state (the loaded table, the arena epoch, the schema cache) is kept per session; it was shared by every client of a server, so one client could read another's table and one client's arena reset invalidated the others'
+- The server checks that the Arrow buffers a client describes lie inside the payload zone before reading them
+- A batch sent without its schema, to a session that does not have it, is an error; it used to be reported as received
+- `get_arrow_data()` refuses up front, with `PayloadTooLargeError`, when the data does not fit in the half of the payload zone reserved for it, instead of overwriting part of the table it was copying
+- `send_arrow_table()` reports the rows of every chunk of a table, not just the first
+- A rejected `send_arrow_buffers()` no longer marks its schema as sent (every later send then omitted it) and no longer counts against `max_arrow_bytes`
+- `get_metrics()` reports real object counts, Arrow transfers and callback invocations (these always read 0), counts `Batch` and `GetArrowData` requests, and counts a response that was too large to send as an error
+- A constructor or callback registration that fails no longer uses up one of the session's `max_objects` slots, and `create_objects()` / `invoke_methods()` / `get_fields()` release the objects they registered before failing part-way
+- `close()` closes the socket even when the shared memory mapping cannot be released yet
 - `GatunAdapter(classpath=...)` passes the classpath on
 
 ## [0.2.1] - 2026-01-17

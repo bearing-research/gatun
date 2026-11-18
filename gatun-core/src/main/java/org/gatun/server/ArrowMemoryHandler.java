@@ -28,6 +28,7 @@ import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.gatun.PayloadTooLargeException;
 import org.gatun.protocol.ArrowBatchDescriptor;
 import org.gatun.protocol.BufferDescriptor;
 import org.gatun.protocol.FieldNode;
@@ -42,8 +43,11 @@ import org.gatun.protocol.FieldNode;
  *   <li>Zero-copy buffer reconstruction from buffer descriptors using VectorLoader
  *   <li>Schema caching for repeated transfers
  * </ul>
+ *
+ * <p>One handler belongs to one client session: the loaded batch points into that session's shared
+ * memory, and the arena epoch and schema cache mirror that client's state.
  */
-public class ArrowMemoryHandler {
+public class ArrowMemoryHandler implements AutoCloseable {
   private static final Logger LOG = Logger.getLogger(ArrowMemoryHandler.class.getName());
 
   private final BufferAllocator allocator;
@@ -67,9 +71,64 @@ public class ArrowMemoryHandler {
   // Arena epoch for lifetime safety - incremented on each reset
   private long arenaEpoch = 0;
 
+  // End of the payload region that currentRoot's buffers occupy (0 when nothing is loaded)
+  private long loadedEnd = 0;
+
   public ArrowMemoryHandler(BufferAllocator allocator) {
     this.allocator = allocator;
   }
+
+  /** Release the loaded batch. Must run before the session's shared memory is unmapped. */
+  @Override
+  public void close() {
+    if (currentRoot != null) {
+      currentRoot.close();
+      currentRoot = null;
+    }
+    vectorLoader = null;
+    loadedEnd = 0;
+  }
+
+  /**
+   * Check that every buffer and field node of a batch descriptor is well formed and that the
+   * buffers lie inside the payload zone. The descriptor comes from the client; an offset or length
+   * outside the zone would make the server read memory that is not part of the shared mapping.
+   *
+   * @return total bytes the buffers cover
+   */
+  private static long validateDescriptor(ArrowBatchDescriptor batchDesc, long payloadSize) {
+    long numRows = batchDesc.numRows();
+    if (numRows < 0 || numRows > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("Invalid Arrow batch row count: " + numRows);
+    }
+    long totalBytes = 0;
+    for (int i = 0; i < batchDesc.buffersLength(); i++) {
+      BufferDescriptor bufDesc = batchDesc.buffers(i);
+      long offset = bufDesc.offset();
+      long length = bufDesc.length();
+      // Written so that offset + length cannot overflow
+      if (offset < 0 || length < 0 || offset > payloadSize || length > payloadSize - offset) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Arrow buffer %d is outside the payload zone: offset=%d, length=%d, zone size=%d",
+                i, offset, length, payloadSize));
+      }
+      totalBytes += length;
+    }
+    for (int i = 0; i < batchDesc.nodesLength(); i++) {
+      FieldNode node = batchDesc.nodes(i);
+      if (node.length() < 0 || node.nullCount() < 0 || node.nullCount() > node.length()) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Arrow field node %d is invalid: length=%d, null_count=%d",
+                i, node.length(), node.nullCount()));
+      }
+    }
+    return totalBytes;
+  }
+
+  /** What a transfer from Python delivered: rows received and payload bytes they occupy. */
+  public record Received(long numRows, long totalBytes) {}
 
   /** Get the current arena epoch. */
   public long getArenaEpoch() {
@@ -188,22 +247,26 @@ public class ArrowMemoryHandler {
    * Process an Arrow IPC stream from shared memory.
    *
    * @param payloadSlice Memory segment containing the Arrow IPC data
-   * @return Number of rows in the batch
+   * @return Rows in the stream, over all of its record batches, and the stream's size in bytes
    */
-  public int processArrowIpcBatch(MemorySegment payloadSlice) throws Exception {
+  public Received processArrowIpcBatch(MemorySegment payloadSlice) throws Exception {
     ByteBuffer arrowBuf = payloadSlice.asByteBuffer();
 
     try (ArrowStreamReader reader =
         new ArrowStreamReader(new GatunServer.ByteBufferInputStream(arrowBuf), allocator)) {
 
-      if (reader.loadNextBatch()) {
-        VectorSchemaRoot root = reader.getVectorSchemaRoot();
-        int rows = root.getRowCount();
-        LOG.fine("Arrow IPC batch received: " + rows + " rows");
-        return rows;
-      } else {
+      // A table with several chunks arrives as one record batch per chunk
+      long rows = 0;
+      int batches = 0;
+      while (reader.loadNextBatch()) {
+        rows += reader.getVectorSchemaRoot().getRowCount();
+        batches++;
+      }
+      if (batches == 0) {
         throw new RuntimeException("Arrow Stream Empty");
       }
+      LOG.fine("Arrow IPC stream received: " + rows + " rows in " + batches + " batches");
+      return new Received(rows, arrowBuf.position());
     }
   }
 
@@ -219,10 +282,13 @@ public class ArrowMemoryHandler {
    *
    * @param batchDesc The Arrow batch descriptor containing buffer locations
    * @param payloadShm Memory segment for the payload shared memory
-   * @return Number of rows in the batch
+   * @return Rows in the batch and the payload bytes its buffers cover
+   * @throws IllegalArgumentException if a buffer lies outside the payload zone
    * @throws IllegalStateException if epoch doesn't match (use-after-reset)
    */
-  public long processArrowBuffers(ArrowBatchDescriptor batchDesc, MemorySegment payloadShm) {
+  public Received processArrowBuffers(ArrowBatchDescriptor batchDesc, MemorySegment payloadShm) {
+    long totalBytes = validateDescriptor(batchDesc, payloadShm.byteSize());
+
     // Validate epoch to prevent use-after-reset corruption
     long descriptorEpoch = batchDesc.arenaEpoch();
     if (descriptorEpoch != arenaEpoch) {
@@ -262,14 +328,18 @@ public class ArrowMemoryHandler {
         LOG.fine(
             "Cached schema with hash: " + schemaHash + ", fields: " + schema.getFields().size());
       } catch (IOException e) {
-        LOG.warning("Failed to deserialize schema: " + e.getMessage());
-        return numRows;
+        throw new IllegalArgumentException(
+            "Failed to deserialize Arrow schema: " + e.getMessage(), e);
       }
     }
 
     if (schema == null) {
-      LOG.warning("No schema available for hash: " + schemaHash);
-      return numRows;
+      // Reporting success here would tell the client its data arrived when nothing was loaded
+      throw new IllegalStateException(
+          "No Arrow schema available for hash "
+              + schemaHash
+              + ": the batch omitted its schema, but this session has not received it. "
+              + "Send the schema again (use a fresh schema cache after reconnecting).");
     }
 
     // 2. Validate node and buffer counts against schema expectations
@@ -307,10 +377,14 @@ public class ArrowMemoryHandler {
     // VectorLoader expects the exact buffer count from TypeLayout and doesn't handle
     // null/absent buffers well. See: https://issues.apache.org/jira/browse/ARROW-8803
     List<ArrowBuf> arrowBuffers = new ArrayList<>();
+    long buffersEnd = 0;
     for (int i = 0; i < numBuffers; i++) {
       BufferDescriptor bufDesc = batchDesc.buffers(i);
       long offset = bufDesc.offset();
       long length = bufDesc.length();
+      if (length > 0) {
+        buffersEnd = Math.max(buffersEnd, offset + length);
+      }
 
       // Create ArrowBuf backed by the shared memory region
       // All buffers share the same reference manager
@@ -347,6 +421,7 @@ public class ArrowMemoryHandler {
     currentRoot = VectorSchemaRoot.create(schema, allocator);
     vectorLoader = new VectorLoader(currentRoot);
     vectorLoader.load(recordBatch);
+    loadedEnd = buffersEnd;
 
     LOG.fine(
         "Loaded VectorSchemaRoot with "
@@ -367,7 +442,7 @@ public class ArrowMemoryHandler {
       LOG.fine(verification.toString());
     }
 
-    return numRows;
+    return new Received(numRows, totalBytes);
   }
 
   /** Get the current VectorSchemaRoot (if any). */
@@ -390,11 +465,7 @@ public class ArrowMemoryHandler {
    */
   public void reset() {
     // Close current root if any - the buffers it references are about to be overwritten
-    if (currentRoot != null) {
-      currentRoot.close();
-      currentRoot = null;
-    }
-    vectorLoader = null;
+    close();
     // Increment epoch to invalidate any tables referencing old buffers
     arenaEpoch++;
     // Note: We keep the schema cache since schemas are typically stable
@@ -541,6 +612,26 @@ public class ArrowMemoryHandler {
       long startOffset = useFullZone ? 0 : payloadShm.byteSize() / 2;
       long currentOffset = startOffset;
 
+      // Check the whole write before touching the zone: a batch loaded from this zone is
+      // still being read from it, so a partial write would corrupt the data it is copying.
+      long endOffset = startOffset;
+      for (ArrowBuf buffer : recordBatch.getBuffers()) {
+        endOffset = ((endOffset + ALIGNMENT - 1) & ~(ALIGNMENT - 1)) + buffer.readableBytes();
+      }
+      if (endOffset > payloadShm.byteSize()) {
+        throw new PayloadTooLargeException(
+            "Arrow data to return", endOffset - startOffset, payloadShm.byteSize() - startOffset);
+      }
+      if (root == currentRoot && loadedEnd > startOffset) {
+        throw new IllegalStateException(
+            String.format(
+                "Arrow data cannot be returned while the batch it was loaded from extends past"
+                    + " the first half of the payload zone (it ends at offset %d; the second half,"
+                    + " from offset %d, is where returned data is written). Reset the arena before"
+                    + " sending, or connect with more memory.",
+                loadedEnd, startOffset));
+      }
+
       LOG.fine(
           String.format(
               "Writing Arrow buffers: useFullZone=%b, startOffset=%d", useFullZone, startOffset));
@@ -579,7 +670,7 @@ public class ArrowMemoryHandler {
           root.getRowCount(),
           bufferDescriptors,
           fieldNodes,
-          currentOffset,
+          currentOffset - startOffset,
           arenaEpoch);
     } finally {
       recordBatch.close();

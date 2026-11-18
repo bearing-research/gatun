@@ -54,6 +54,107 @@ class TestObjectCountLimit:
         finally:
             client.close()
 
+    def test_failed_constructors_do_not_use_up_the_limit(self):
+        """Regression: the slot was taken before the constructor ran and never
+        given back when it threw."""
+        client = connect(extra_jvm_flags=["-Dgatun.limits.max_objects=3"])
+        try:
+            for _ in range(10):
+                with pytest.raises(JavaException):
+                    client.create_object("java.util.ArrayList", -1)
+            with client.batch() as b:
+                failed = [b.create("java.util.ArrayList", -1) for _ in range(5)]
+            assert all(result.is_error for result in failed)
+            with pytest.raises(JavaException):
+                client.create_objects([("java.util.ArrayList", (-1,))] * 3)
+
+            held = [client.create_object("java.util.ArrayList") for _ in range(3)]
+            assert len(held) == 3
+            with pytest.raises(JavaException, match="Object limit exceeded"):
+                client.create_object("java.util.ArrayList")
+        finally:
+            client.close()
+
+    def test_objects_created_before_a_failure_are_released(self):
+        """Regression: a vectorized call that failed part-way kept the objects
+        it had already registered, although the client only got the error."""
+        client = connect(extra_jvm_flags=["-Dgatun.limits.max_objects=3"])
+        try:
+            for _ in range(5):
+                with pytest.raises(JavaException):
+                    client.create_objects(
+                        [
+                            ("java.util.ArrayList", ()),
+                            ("java.util.ArrayList", ()),
+                            ("java.util.ArrayList", (-1,)),
+                        ]
+                    )
+            items = client.create_object("java.util.ArrayList")
+            items.add("x")
+            for _ in range(5):
+                with pytest.raises(JavaException):
+                    client.invoke_methods(
+                        items,
+                        [("iterator", ()), ("iterator", ()), ("get", (99,))],
+                    )
+
+            held = [client.create_object("java.util.ArrayList") for _ in range(2)]
+            assert len(held) == 2
+        finally:
+            client.close()
+
+    def test_failed_callback_registration_does_not_use_up_the_limit(self):
+        client = connect(extra_jvm_flags=["-Dgatun.limits.max_objects=3"])
+        try:
+            for _ in range(5):
+                with pytest.raises(JavaException):
+                    client.register_callback(lambda: None, "java.util.NoSuchInterface")
+
+            held = [client.create_object("java.util.ArrayList") for _ in range(3)]
+            assert len(held) == 3
+        finally:
+            client.close()
+
+
+class TestArrowBytesLimit:
+    def test_rejected_sends_are_not_charged(self):
+        """Regression: the bytes were counted before the batch was accepted and
+        never given back, so retries used up the limit with nothing loaded."""
+        import pyarrow as pa
+
+        from gatun.arena import compute_schema_hash
+
+        client = connect(extra_jvm_flags=["-Dgatun.limits.max_arrow_bytes=4096"])
+        try:
+            table = pa.table({"x": pa.array(range(100), type=pa.int64())})
+            arena = client.get_payload_arena()
+            for _ in range(10):
+                arena.reset()
+                claims_server_has_it = {compute_schema_hash(table.schema): True}
+                with pytest.raises(JavaException, match="No Arrow schema available"):
+                    client.send_arrow_buffers(table, arena, claims_server_has_it)
+
+            arena.reset()
+            assert "100 rows" in client.send_arrow_buffers(table, arena, {})
+            arena.close()
+        finally:
+            client.close()
+
+    def test_batch_over_the_limit_is_not_kept(self):
+        import pyarrow as pa
+
+        client = connect(extra_jvm_flags=["-Dgatun.limits.max_arrow_bytes=4096"])
+        try:
+            arena = client.get_payload_arena()
+            big = pa.table({"x": pa.array(range(10_000), type=pa.int64())})
+            with pytest.raises(JavaException, match="[Aa]rrow"):
+                client.send_arrow_buffers(big, arena, {})
+            with pytest.raises(JavaException, match="No Arrow data available"):
+                client.get_arrow_data()
+            arena.close()
+        finally:
+            client.close()
+
 
 class TestStringLengthLimit:
     """Test that string length limits are enforced."""
