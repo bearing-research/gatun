@@ -580,7 +580,11 @@ public class GatunServer {
       }
 
       CallbackChannel channel =
-          new CallbackChannel(peer, name, notice -> handleChannelNotice(ctx, notice));
+          new CallbackChannel(
+              peer,
+              name,
+              notice -> handleChannelNotice(ctx, notice),
+              answer -> decodeChannelAnswer(ctx, answer));
       ctx.callbackChannel = channel;
       if (ctx.closed) {
         // The session ended while the client was connecting, and found no channel to close
@@ -624,6 +628,44 @@ public class GatunServer {
       freeObjects(notice, ctx.sessionObjectIds, ctx.quota);
     } finally {
       sessionContext.remove();
+    }
+  }
+
+  /** What Python answered on the callback connection, decoded by the connection's reader. */
+  private record CallbackAnswer(Object value, RuntimeException failure) {}
+
+  /**
+   * Decode a callback's answer on the callback connection's reader thread, which is to say before
+   * anything that follows it on the connection is looked at. The answer can name objects that
+   * Python releases as soon as it has sent the answer; decoded later, by the thread that waits for
+   * it, they could be gone.
+   */
+  private CallbackAnswer decodeChannelAnswer(SessionContext ctx, Command answer) {
+    sessionContext.set(ctx);
+    try {
+      return new CallbackAnswer(readCallbackResult(answer), null);
+    } catch (RuntimeException e) {
+      return new CallbackAnswer(null, e);
+    } finally {
+      sessionContext.remove();
+    }
+  }
+
+  /**
+   * Before releasing objects for a command that came on the session's own channel: wait until the
+   * callback answers the client had sent by then have been decoded. See {@link CallbackChannel}.
+   */
+  private void awaitAnswersBefore(Command free) throws InterruptedException {
+    long answersSent = free.answersSent();
+    SessionContext ctx = sessionContext.get();
+    CallbackChannel channel = ctx == null ? null : ctx.callbackChannel;
+    if (answersSent <= 0 || channel == null) {
+      return;
+    }
+    // The answers are on a local socket a thread is reading; the limit is for a client that
+    // counted one it never managed to send
+    if (!channel.awaitAnswers(answersSent, 5_000)) {
+      LOG.warning("Releasing objects without having seen callback answer " + answersSent);
     }
   }
 
@@ -853,6 +895,7 @@ public class GatunServer {
             LOG.fine("Created object ID " + newId + " of type " + className);
 
           } else if (cmd.action() == Action.FreeObject) {
+            awaitAnswersBefore(cmd);
             freeObjects(cmd, sessionObjectIds, quota);
             result = null;
           } else if (cmd.action() == Action.InvokeMethod) {
@@ -1258,69 +1301,7 @@ public class GatunServer {
             }
             result = null;
           } else if (cmd.action() == Action.Reflect) {
-            // Reflection query: target_name is the fully qualified name to check
-            // Returns a string:
-            // - "class" if it's a loadable class
-            // - "method" if the last segment is a method on the parent class
-            // - "field" if the last segment is a field on the parent class
-            // - "none" if not found
-            String fullName = cmd.targetName();
-
-            // First try: is the whole path a class?
-            try {
-              // Handle Scala objects: try both ClassName and ClassName$
-              Class<?> clazz = tryGetClass(fullName);
-              if (clazz == null) {
-                // Try Scala object naming convention (append $)
-                clazz = tryGetClass(fullName + "$");
-              }
-
-              if (clazz != null) {
-                result = "class";
-              } else {
-                // Try as class.member
-                int lastDot = fullName.lastIndexOf('.');
-                if (lastDot > 0) {
-                  String parentName = fullName.substring(0, lastDot);
-                  String memberName = fullName.substring(lastDot + 1);
-
-                  // Try to load parent as class
-                  Class<?> parentClass = tryGetClass(parentName);
-                  if (parentClass == null) {
-                    // Try Scala object
-                    parentClass = tryGetClass(parentName + "$");
-                  }
-
-                  if (parentClass != null) {
-                    // Check if memberName is a method
-                    boolean isMethod = false;
-                    for (java.lang.reflect.Method m : getCachedMethods(parentClass)) {
-                      if (m.getName().equals(memberName)) {
-                        isMethod = true;
-                        break;
-                      }
-                    }
-                    if (isMethod) {
-                      result = "method";
-                    } else {
-                      // Check if it's a field
-                      try {
-                        parentClass.getField(memberName);
-                        result = "field";
-                      } catch (NoSuchFieldException e) {
-                        result = "none";
-                      }
-                    }
-                  } else {
-                    result = "none";
-                  }
-                } else {
-                  result = "none";
-                }
-              }
-            } catch (Exception e) {
-              result = "none";
-            }
+            result = reflect(cmd.targetName());
           } else if (cmd.action() == Action.GetFields) {
             // Vectorized field reads: get multiple fields from one object
             long targetId = cmd.targetId();
@@ -1670,8 +1651,11 @@ public class GatunServer {
    * @return true if the current request was cancelled
    */
   public static boolean isCancelled() {
+    // A cancel is for the request the session's own thread is running, not for whatever a
+    // callback on another thread has that thread do for the session meanwhile
     SessionContext ctx = sessionContext.get();
-    return Thread.currentThread().isInterrupted() || (ctx != null && ctx.control.isCancelled());
+    return Thread.currentThread().isInterrupted()
+        || (ctx != null && ctx.control.isSessionThread() && ctx.control.isCancelled());
   }
 
   /**
@@ -1860,6 +1844,19 @@ public class GatunServer {
       Set<Long> sessionObjectIds,
       SessionQuota quota,
       List<Long> registered) {
+    return packResult(builder, result, sessionObjectIds, quota, registered, 0);
+  }
+
+  /**
+   * @param callId for a response on the callback connection, the call it belongs to; 0 otherwise
+   */
+  private int packResult(
+      FlatBufferBuilder builder,
+      Object result,
+      Set<Long> sessionObjectIds,
+      SessionQuota quota,
+      List<Long> registered,
+      long callId) {
     List<Long> ids = new ArrayList<>();
     // Packing can itself call Python (iterating a collection that a callback implements), and
     // that call packs its arguments on this thread
@@ -1867,7 +1864,7 @@ public class GatunServer {
     packRecorder.set(ids);
     boolean packed = false;
     try {
-      int offset = packSuccessWithSession(builder, result, sessionObjectIds);
+      int offset = packSuccessWithSession(builder, result, sessionObjectIds, callId);
       packed = true;
       return offset;
     } finally {
@@ -3109,8 +3106,28 @@ public class GatunServer {
       }
       channel.send(request);
       sent = true;
-      ByteBuffer answer = channel.await(callId);
-      return readCallbackResult(Command.getRootAsCommand(answer));
+      while (true) {
+        Object item = channel.await(callId);
+        if (item instanceof CallbackAnswer answer) {
+          if (answer.failure() != null) {
+            throw answer.failure();
+          }
+          return answer.value();
+        }
+        Command frame = (Command) item;
+        if (frame.action() != Action.NestedCommand) {
+          throw new IllegalStateException(
+              "Unexpected action "
+                  + frame.action()
+                  + " while Python callback "
+                  + methodName
+                  + " was running");
+        }
+        // The callback is calling Java. This thread is the one waiting for the callback, so
+        // it runs the call: the session's own thread may be busy with a request, possibly
+        // the very request that is waiting for this thread.
+        channel.send(runNested(frame, callId, ctx));
+      }
     } catch (IOException e) {
       // Nobody will free the arguments' objects if the request never went out, or if the
       // session is over. Otherwise Python may hold them: it frees them, or the session's end
@@ -3138,23 +3155,141 @@ public class GatunServer {
     }
   }
 
+  /**
+   * Run a command that a callback sent on the callback connection, and build its response.
+   *
+   * <p>Runs on the thread that called the callback, never the session's own, so nothing here may
+   * touch the session's shared memory: it is confined to the session's thread.
+   */
+  private ByteBuffer runNested(Command envelope, long callId, SessionContext ctx) {
+    FlatBufferBuilder builder = new FlatBufferBuilder(256);
+    List<Long> registered = new ArrayList<>();
+    int response;
+    try {
+      ByteBuffer serialized = envelope.nestedCommandAsByteBuffer();
+      if (serialized == null) {
+        throw new IllegalArgumentException("NestedCommand carries no command");
+      }
+      Object result = executeNested(Command.getRootAsCommand(serialized), ctx);
+      response = packResult(builder, result, ctx.sessionObjectIds, ctx.quota, registered, callId);
+    } catch (Throwable t) {
+      Throwable cause = unwrap(t);
+      LOG.log(Level.FINE, "Command from inside a callback failed: " + cause);
+      builder = new FlatBufferBuilder(256);
+      response = packError(builder, formatException(cause), cause.getClass().getName(), callId);
+    }
+    builder.finish(response);
+    ByteBuffer frame = builder.dataBuffer();
+    if (frame.remaining() > CallbackChannel.MAX_FRAME_SIZE) {
+      // The client never sees the IDs in the response it was meant to get
+      discardObjects(registered, ctx.sessionObjectIds, ctx.quota);
+      PayloadTooLargeException tooLarge =
+          new PayloadTooLargeException(
+              "Response", frame.remaining(), CallbackChannel.MAX_FRAME_SIZE);
+      builder = new FlatBufferBuilder(256);
+      builder.finish(
+          packError(builder, tooLarge.getMessage(), tooLarge.getClass().getName(), callId));
+      frame = builder.dataBuffer();
+    }
+    return frame;
+  }
+
+  /** The commands a callback may send on the callback connection. */
+  private Object executeNested(Command cmd, SessionContext ctx) throws Throwable {
+    switch (cmd.action()) {
+      case Action.Ping:
+        return true;
+      case Action.Reflect:
+        return reflect(cmd.targetName());
+      case Action.CreateObject:
+      case Action.FreeObject:
+      case Action.InvokeMethod:
+      case Action.InvokeStaticMethod:
+      case Action.GetField:
+      case Action.SetField:
+      case Action.IsInstanceOf:
+      case Action.GetStaticField:
+      case Action.SetStaticField:
+        // No shared memory: none of these use it, and this thread could not
+        return executeCommand(cmd, ctx.sessionObjectIds, null, null, ctx.quota);
+      default:
+        byte action = cmd.action();
+        throw new UnsupportedOperationException(
+            (action >= 0 && action < Action.names.length
+                    ? Action.names[action]
+                    : "Action " + action)
+                + " cannot be used inside a callback that Java made from another thread");
+    }
+  }
+
+  /**
+   * What a dotted name is: "class" if it loads as a class, "method" or "field" if its last segment
+   * is a member of the class named before it, "none" otherwise.
+   */
+  private String reflect(String fullName) {
+    try {
+      // A Scala object's class has a trailing $
+      Class<?> clazz = tryGetClass(fullName);
+      if (clazz == null) {
+        clazz = tryGetClass(fullName + "$");
+      }
+      if (clazz != null) {
+        return "class";
+      }
+
+      int lastDot = fullName.lastIndexOf('.');
+      if (lastDot <= 0) {
+        return "none";
+      }
+      String parentName = fullName.substring(0, lastDot);
+      String memberName = fullName.substring(lastDot + 1);
+      Class<?> parentClass = tryGetClass(parentName);
+      if (parentClass == null) {
+        parentClass = tryGetClass(parentName + "$");
+      }
+      if (parentClass == null) {
+        return "none";
+      }
+      for (java.lang.reflect.Method m : getCachedMethods(parentClass)) {
+        if (m.getName().equals(memberName)) {
+          return "method";
+        }
+      }
+      try {
+        parentClass.getField(memberName);
+        return "field";
+      } catch (NoSuchFieldException e) {
+        return "none";
+      }
+    } catch (Exception e) {
+      return "none";
+    }
+  }
+
   // --- HELPER: Pack Result into FlatBuffer ---
   private int packSuccess(FlatBufferBuilder builder, Object result) {
-    return packSuccessWithSession(builder, result, null);
+    return packSuccessWithSession(builder, result, null, 0);
   }
 
   private int packSuccessWithSession(
-      FlatBufferBuilder builder, Object result, Set<Long> sessionObjectIds) {
+      FlatBufferBuilder builder, Object result, Set<Long> sessionObjectIds, long callId) {
     int[] packed = packValue(builder, result, sessionObjectIds);
 
     Response.startResponse(builder);
     Response.addIsError(builder, false);
     Response.addReturnValType(builder, (byte) packed[0]);
     Response.addReturnVal(builder, packed[1]);
+    if (callId != 0) {
+      Response.addCallId(builder, callId);
+    }
     return Response.endResponse(builder);
   }
 
   private int packError(FlatBufferBuilder builder, String msg, String errorType) {
+    return packError(builder, msg, errorType, 0);
+  }
+
+  private int packError(FlatBufferBuilder builder, String msg, String errorType, long callId) {
     int errOff = builder.createString(msg == null ? "Unknown Error" : msg);
     int typeOff =
         builder.createString(errorType == null ? "java.lang.RuntimeException" : errorType);
@@ -3162,6 +3297,9 @@ public class GatunServer {
     Response.addIsError(builder, true);
     Response.addErrorMsg(builder, errOff);
     Response.addErrorType(builder, typeOff);
+    if (callId != 0) {
+      Response.addCallId(builder, callId);
+    }
     return Response.endResponse(builder);
   }
 

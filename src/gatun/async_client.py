@@ -37,7 +37,7 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from gatun.arena import AsyncScopedArenaContext
 
-from gatun.callback_channel import AsyncCallbackChannel
+from gatun.callback_channel import AsyncCallbackChannel, AsyncChannelCall
 from gatun.client import (
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
@@ -56,6 +56,7 @@ from gatun.client import (
     _arrow_stream_size,
     _arrow_table_to_send,
     _build_free_command,
+    _channel_call_of,
     _close_shared_memory,
     _enter_callback,
     _exit_callback,
@@ -63,6 +64,7 @@ from gatun.client import (
     _finish_arrow_to_object,
     _in_callback_of,
     _LRUCache,
+    _nested_command,
     _raise_java_exception_impl,
     _read_arrow_stream,
     _remember_reflection,
@@ -464,6 +466,15 @@ class AsyncGatunClient(_ValueEncoder):
                 "Queue work for later or restructure code to avoid nested calls."
             )
 
+        # Inside a callback that came on the callback connection, the call goes
+        # back the same way: the Java thread waiting for the callback runs it,
+        # and the client's own channel is left alone
+        call = _channel_call_of(self) if expects_response else None
+        if call is not None:
+            routed, result = await self._send_nested(call, data)
+            if routed:
+                return result
+
         async with self._lock:
             if self._dead or self._writer is None:
                 raise DeadConnectionError("Connection is closed. Create a new client.")
@@ -476,8 +487,12 @@ class AsyncGatunClient(_ValueEncoder):
                 ids = _take_free_chunk(self._pending_frees)
                 if not ids:
                     break
+                channel = self._callback_channel
+                answers_sent = channel.answers_sent if channel is not None else 0
                 try:
-                    await self._exchange(_build_free_command(self._free_builder, ids))
+                    await self._exchange(
+                        _build_free_command(self._free_builder, ids, answers_sent)
+                    )
                 except JavaException as e:
                     logger.debug("FreeObject for %d objects failed: %s", len(ids), e)
 
@@ -486,6 +501,35 @@ class AsyncGatunClient(_ValueEncoder):
             response = await self._exchange(data, wait_for_response)
             if wait_for_response:
                 return finish(response) if finish is not None else response
+
+    async def _send_nested(
+        self, call: AsyncChannelCall, data: bytes
+    ) -> tuple[bool, Any]:
+        """Send a command on the callback connection, as part of `call`.
+
+        Returns (False, None) if Java is no longer waiting for the callback,
+        in which case nothing was sent and the command belongs on the client's
+        own channel.
+        """
+        frame = _nested_command(call.call_id, data)
+        # A callback that runs for hours would otherwise hold on to every
+        # object it dropped until it returns
+        if self._pending_frees:
+            await self._release_on_channel(call.channel)
+        try:
+            reply = await call.request(frame, self.socket_timeout)
+        except TimeoutError as e:
+            raise SocketTimeoutError(
+                f"A Java call made inside a callback got no answer: {e}"
+            ) from None
+        except OSError as e:
+            raise DeadConnectionError(
+                f"The callback connection closed while a callback was calling Java: {e}"
+            ) from None
+        if reply is None:
+            return False, None
+        resp = Response.Response.GetRootAsResponse(reply, 0)
+        return True, self._parse_response(resp)
 
     async def _exchange(self, data: bytes, wait_for_response: bool = True):
         """One command and its response. The caller holds the lock."""
@@ -518,10 +562,14 @@ class AsyncGatunClient(_ValueEncoder):
             asyncio.IncompleteReadError: If socket closes unexpectedly
             ProtocolDesyncError: If the response size is invalid
         """
+        # What the last in-band callback answered with; see the sync client's
+        # _read_response
+        answered_with: list[Any] = []
         while True:
             # Read response length with timeout
             length_data = await self._read_with_timeout(4, self.socket_timeout)
             response_len = struct.unpack("<I", length_data)[0]
+            answered_with.clear()
 
             # Validate response size before reading from SHM
             # This catches protocol desync (garbage data) early
@@ -551,39 +599,43 @@ class AsyncGatunClient(_ValueEncoder):
 
             # Check if this is a callback request from Java
             if resp.IsCallback():
-                await self._handle_callback(resp)
+                answered_with.append(await self._handle_callback(resp))
                 # After handling callback, continue reading for the actual response
                 continue
 
-            if resp.IsError():
-                error_msg = resp.ErrorMsg().decode("utf-8")
-                error_type_bytes = resp.ErrorType()
-                error_type = (
-                    error_type_bytes.decode("utf-8")
-                    if error_type_bytes
-                    else "java.lang.RuntimeException"
-                )
-                try:
-                    _raise_java_exception_impl(error_type, error_msg)
-                except Exception as e:
-                    # Not every server error maps to a JavaException subclass
-                    # (PayloadTooLargeError, CancelledException); all of them
-                    # arrived as a complete response
-                    e._gatun_complete = True  # type: ignore[attr-defined]
-                    raise
+            return self._parse_response(resp)
 
-            # Location of an Arrow IPC stream (arrow_from_java)
-            arrow_stream = resp.ArrowStream()
-            if arrow_stream is not None:
-                return arrow_stream.Offset(), arrow_stream.Length()
+    def _parse_response(self, resp) -> Any:
+        """What a response means to the caller: its value, or its exception."""
+        if resp.IsError():
+            error_msg = resp.ErrorMsg().decode("utf-8")
+            error_type_bytes = resp.ErrorType()
+            error_type = (
+                error_type_bytes.decode("utf-8")
+                if error_type_bytes
+                else "java.lang.RuntimeException"
+            )
+            try:
+                _raise_java_exception_impl(error_type, error_msg)
+            except Exception as e:
+                # Not every server error maps to a JavaException subclass
+                # (PayloadTooLargeError, CancelledException); all of them
+                # arrived as a complete response
+                e._gatun_complete = True  # type: ignore[attr-defined]
+                raise
 
-            # Unpack the return value
-            return self._unpack_value(resp.ReturnValType(), resp.ReturnVal())
+        # Location of an Arrow IPC stream (arrow_from_java)
+        arrow_stream = resp.ArrowStream()
+        if arrow_stream is not None:
+            return arrow_stream.Offset(), arrow_stream.Length()
+
+        return self._unpack_value(resp.ReturnValType(), resp.ReturnVal())
 
     async def _handle_callback(
         self,
         resp,
         reply: Callable[[Any, bool, str | None], Awaitable[None]] | None = None,
+        channel_call: AsyncChannelCall | None = None,
     ):
         """Handle a callback invocation request from Java.
 
@@ -593,8 +645,10 @@ class AsyncGatunClient(_ValueEncoder):
         from it is refused instead of deadlocking.
 
         With `reply` (result, is_error, error message) the request came on the
-        callback connection, from some other Java thread. Only that thread
-        waits for it, so the callback may call Java like any other code.
+        callback connection, from some other Java thread, and `channel_call`
+        is the call that thread is waiting on. The callback may call Java:
+        its calls, and those of tasks it starts, travel on the callback
+        connection as part of that call.
         """
         callback_id = resp.CallbackId()
         in_band = reply is None
@@ -611,7 +665,7 @@ class AsyncGatunClient(_ValueEncoder):
         task = asyncio.current_task() if in_band else None
         if task is not None:
             self._callback_tasks.add(task)
-        scope_token = _enter_callback(self) if in_band else None
+        scope_token = _enter_callback(self, channel_call)
         try:
             # Unpacked even when the callback is gone (unregistered while Java
             # was calling it): the server registered the objects among the
@@ -644,18 +698,14 @@ class AsyncGatunClient(_ValueEncoder):
             else:
                 result = await pending
             await answer(result, False, None)
-        except ReentrancyError:
+            return result
+        except ReentrancyError as e:
             # Propagate reentrancy error with clear message
-            await answer(
-                None,
-                True,
-                "ReentrancyError: Cannot call Java from within a callback",
-            )
+            await answer(None, True, f"ReentrancyError: {e}")
         except Exception as e:  # noqa: BLE001 - any callback failure is forwarded to Java
             await answer(None, True, str(e))
         finally:
-            if scope_token is not None:
-                _exit_callback(*scope_token)
+            _exit_callback(*scope_token)
             if task is not None:
                 self._callback_tasks.discard(task)
 
@@ -668,19 +718,20 @@ class AsyncGatunClient(_ValueEncoder):
         """
         callback_id = resp.CallbackId()
         call_id = resp.CallId()
+        channel_call = channel.open_call(call_id)
         answered = False
 
         async def reply(result: Any, is_error: bool, error_msg: str | None) -> None:
             nonlocal answered
             answered = True
-            await channel.send(
+            await channel_call.answer(
                 self._build_callback_response(
                     callback_id, result, is_error, error_msg, call_id
                 )
             )
 
         try:
-            await self._handle_callback(resp, reply)
+            await self._handle_callback(resp, reply, channel_call)
         except OSError as e:
             # The connection closed under the callback; Java was told by that
             logger.debug("Callback %d could not be answered: %s", callback_id, e)
@@ -693,6 +744,7 @@ class AsyncGatunClient(_ValueEncoder):
                     pass
             raise
         finally:
+            channel.close_call(channel_call)
             await self._release_on_channel(channel)
 
     async def _release_on_channel(self, channel: AsyncCallbackChannel) -> None:
@@ -1323,10 +1375,14 @@ class AsyncGatunClient(_ValueEncoder):
         if self._writer is None or self._dead:
             return
 
+        channel = self._callback_channel
         builder = flatbuffers.Builder(64)
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.FreeObject)
         Cmd.CommandAddTargetId(builder, object_id)
+        if channel is not None:
+            # See _build_free_command
+            Cmd.CommandAddAnswersSent(builder, channel.answers_sent)
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 

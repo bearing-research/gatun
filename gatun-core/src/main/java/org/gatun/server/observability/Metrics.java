@@ -236,6 +236,7 @@ public class Metrics {
       case Action.ArrowToObject -> "ArrowToObject";
       case Action.ArrowFromObject -> "ArrowFromObject";
       case Action.OpenCallbackChannel -> "OpenCallbackChannel";
+      case Action.NestedCommand -> "NestedCommand";
       default -> "Unknown(" + action + ")";
     };
   }

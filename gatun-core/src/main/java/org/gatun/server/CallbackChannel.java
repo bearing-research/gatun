@@ -8,10 +8,15 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.gatun.protocol.Action;
 import org.gatun.protocol.Command;
 
 /**
@@ -23,6 +28,12 @@ import org.gatun.protocol.Command;
  * to the call its {@code call_id} names. A frame with no call ID is not part of any call (Python
  * releasing objects it was passed) and goes to the handler the channel was made with, on the reader
  * thread.
+ *
+ * <p>The reader decodes a callback's answer itself, before it reads the next frame, and counts the
+ * answers it has decoded. An answer can name an object that Python releases the moment the answer
+ * is on its way; the release must not be applied first. One that follows on this connection cannot
+ * be, and one that arrives on the session's own channel says how many answers had been sent before
+ * it and waits for that count ({@link #awaitAnswers}).
  *
  * <p>Callers never touch the socket. They are threads this server does not own (a Spark listener
  * bus, an executor's workers), and interrupting a thread that is blocked on a channel closes the
@@ -37,20 +48,36 @@ final class CallbackChannel {
   static final int MAX_FRAME_SIZE = 64 * 1024;
 
   // Put on a queue to wake whoever waits on it once the connection is gone
-  private static final ByteBuffer CLOSED = ByteBuffer.allocate(0);
+  private static final Object CLOSED = new Object();
 
   private final SocketChannel socket;
   private final String name;
   private final Consumer<Command> notices;
+  private final Function<Command, Object> decodeAnswer;
   private final AtomicLong callIds = new AtomicLong(1);
-  private final Map<Long, BlockingQueue<ByteBuffer>> calls = new ConcurrentHashMap<>();
+  private final Map<Long, BlockingQueue<Object>> calls = new ConcurrentHashMap<>();
   private final BlockingQueue<ByteBuffer> outbox = new LinkedBlockingQueue<>();
   private volatile boolean closed;
 
-  CallbackChannel(SocketChannel socket, String name, Consumer<Command> notices) {
+  // A lock, not a monitor: the waiters are virtual threads
+  private final ReentrantLock answersLock = new ReentrantLock();
+  private final Condition answersChanged = answersLock.newCondition();
+  private long answersDecoded; // guarded by answersLock
+
+  /**
+   * @param notices handles a frame that belongs to no call
+   * @param decodeAnswer turns a CallbackResponse into what {@link #await} returns for it; must not
+   *     throw
+   */
+  CallbackChannel(
+      SocketChannel socket,
+      String name,
+      Consumer<Command> notices,
+      Function<Command, Object> decodeAnswer) {
     this.socket = socket;
     this.name = name;
     this.notices = notices;
+    this.decodeAnswer = decodeAnswer;
   }
 
   boolean isClosed() {
@@ -60,7 +87,7 @@ final class CallbackChannel {
   /** Start a call: frames Python sends with the returned ID are kept for {@link #await}. */
   long begin() {
     long callId = callIds.getAndIncrement();
-    BlockingQueue<ByteBuffer> inbox = new LinkedBlockingQueue<>();
+    BlockingQueue<Object> inbox = new LinkedBlockingQueue<>();
     calls.put(callId, inbox);
     if (closed) {
       // close() may have gone through the calls before this one was added
@@ -82,18 +109,53 @@ final class CallbackChannel {
     outbox.add(frame);
   }
 
-  /** Wait for the next frame of a call. */
-  ByteBuffer await(long callId) throws IOException, InterruptedException {
-    BlockingQueue<ByteBuffer> inbox = calls.get(callId);
+  /**
+   * Wait for what Python sends next for a call: the decoded answer, or the {@link Command} of
+   * anything else.
+   */
+  Object await(long callId) throws IOException, InterruptedException {
+    BlockingQueue<Object> inbox = calls.get(callId);
     if (inbox == null) {
       throw new IllegalStateException("Call " + callId + " was not begun");
     }
-    ByteBuffer frame = inbox.take();
-    if (frame == CLOSED) {
+    Object item = inbox.take();
+    if (item == CLOSED) {
       inbox.add(CLOSED); // for a caller that waits again
       throw new IOException("The callback connection closed while Python was being called");
     }
-    return frame;
+    return item;
+  }
+
+  /**
+   * Wait until the reader has decoded {@code count} answers, the connection has closed or the time
+   * is up.
+   *
+   * @return false if the time ran out first
+   */
+  boolean awaitAnswers(long count, long timeoutMs) throws InterruptedException {
+    long remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+    answersLock.lock();
+    try {
+      while (answersDecoded < count && !closed) {
+        if (remaining <= 0) {
+          return false;
+        }
+        remaining = answersChanged.awaitNanos(remaining);
+      }
+      return true;
+    } finally {
+      answersLock.unlock();
+    }
+  }
+
+  private void answerDecoded() {
+    answersLock.lock();
+    try {
+      answersDecoded++;
+      answersChanged.signalAll();
+    } finally {
+      answersLock.unlock();
+    }
   }
 
   /** Serve the connection on the calling thread until it ends, then close it. */
@@ -133,12 +195,16 @@ final class CallbackChannel {
         }
         continue;
       }
-      BlockingQueue<ByteBuffer> inbox = calls.get(callId);
+      boolean isAnswer = command.action() == Action.CallbackResponse;
+      BlockingQueue<Object> inbox = calls.get(callId);
       if (inbox != null) {
-        inbox.add(frame);
+        inbox.add(isAnswer ? decodeAnswer.apply(command) : command);
       } else {
         // The caller gave up (it was interrupted) before Python answered
         LOG.fine(name + ": dropped a frame for call " + callId);
+      }
+      if (isAnswer) {
+        answerDecoded();
       }
     }
   }
@@ -182,8 +248,14 @@ final class CallbackChannel {
     } catch (IOException e) {
       // already gone
     }
-    for (BlockingQueue<ByteBuffer> inbox : calls.values()) {
+    for (BlockingQueue<Object> inbox : calls.values()) {
       inbox.add(CLOSED);
+    }
+    answersLock.lock();
+    try {
+      answersChanged.signalAll();
+    } finally {
+      answersLock.unlock();
     }
   }
 }
