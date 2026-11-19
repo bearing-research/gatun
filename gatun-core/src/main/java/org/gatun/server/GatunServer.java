@@ -515,9 +515,9 @@ public class GatunServer {
     activeShmPaths.add(sessionShmPath);
 
     // The Arrow handler is declared last so that it is closed first: the batch it holds points
-    // into the mapping that the arena unmaps.
-    try (client;
-        FileChannel channel = createSharedMemoryFile(sessionShmPath);
+    // into the mapping that the arena unmaps. The connection is not among these: it is closed
+    // in the finally block, after the catch blocks have logged why the session ended.
+    try (FileChannel channel = createSharedMemoryFile(sessionShmPath);
         Arena arena = Arena.ofConfined();
         ArrowMemoryHandler arrowHandler = new ArrowMemoryHandler(allocator)) {
 
@@ -1482,6 +1482,14 @@ public class GatunServer {
       // say) would otherwise close the connection without a trace
       LOG.log(Level.WARNING, "Client session " + sessionId + " failed", e);
     } finally {
+      // The client takes the close as its answer when a session is refused, and may stop the
+      // server at once to report it: the reason has to be in the log by now.
+      try {
+        client.close();
+      } catch (IOException e) {
+        // already gone
+      }
+
       // Notify observer of session end
       observer.onSessionEnd(quota.getTotalObjectsCreated());
 
