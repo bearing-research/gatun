@@ -291,6 +291,10 @@ table Command {
   // had sent on its callback connection when it built this command. One of them may name an
   // object that is released here, and the server has to have read it first.
   answers_sent: long;
+  // For Action.RegisterCallback with a handler that is an object, not a function: the names
+  // of its methods. A default method of the interface with one of these names is the
+  // handler's to answer; the others run in Java.
+  callback_methods: [string];
 }
 
 // Batch of commands to execute sequentially

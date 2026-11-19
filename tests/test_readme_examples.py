@@ -191,6 +191,50 @@ class TestPythonCallbacks:
         assert arr.get(1) == 2
         assert arr.get(2) == 3
 
+    def test_object_with_named_methods(self, client):
+        """Test the example of an interface with several methods."""
+
+        class Countdown:
+            def __init__(self, start):
+                self.left = start
+
+            def hasMoreElements(self):
+                return self.left > 0
+
+            def nextElement(self):
+                self.left -= 1
+                return self.left
+
+        enumeration = client.register_callback(Countdown(3), "java.util.Enumeration")
+        assert client.jvm.java.util.Collections.list(enumeration) == [2, 1, 0]
+
+
+class TestBridgeAdapter:
+    """Test the BridgeAdapter example."""
+
+    def test_bridge_adapter(self):
+        from gatun.bridge_adapters import GatunAdapter
+
+        bridge = GatunAdapter(memory="256MB")
+        try:
+            obj = bridge.new("java.util.ArrayList")
+            bridge.call(obj, "add", "hello")
+            assert bridge.call_static("java.lang.Math", "max", 10, 20) == 20
+
+            arr = bridge.new_array("java.lang.String", 3)
+            bridge.array_set(arr, 0, "hello")
+            assert bridge.array_get(arr, 0) == "hello"
+
+            by_length = bridge.register_callback(
+                lambda a, b: len(a) - len(b), "java.util.Comparator"
+            )
+            bridge.call(obj, "add", "hi")
+            bridge.call_static("java.util.Collections", "sort", obj, by_length)
+            assert bridge.call(obj, "get", 0) == "hi"
+            bridge.unregister_callback(by_length)
+        finally:
+            bridge.close()
+
 
 class TestIsInstanceOf:
     """Test is_instance_of examples."""

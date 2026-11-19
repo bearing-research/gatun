@@ -7,6 +7,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
@@ -661,11 +662,38 @@ public class GatunServer {
     return builder.dataBuffer();
   }
 
-  /** Forget a callback of the session; an ID that is not one of its callbacks is ignored. */
-  private void unregisterCallback(long callbackId, Set<Long> sessionCallbackIds) {
-    if (sessionCallbackIds.remove(callbackId)) {
-      callbackRegistry.remove(callbackId);
-      LOG.fine("Unregistered callback ID " + callbackId);
+  /**
+   * Unregister the callback that {@code id} names: the ID {@code RegisterCallback} returned, or the
+   * ID of any other handle the client has on the proxy. An object gets a new ID each time it is
+   * returned to the client, so a proxy the client read back out of a Java collection is known to it
+   * under another one.
+   *
+   * @return the ID of the callback that was unregistered, or 0 if there was none
+   */
+  private long unregisterCallback(long id, Set<Long> sessionCallbackIds) {
+    long callbackId = id;
+    if (!sessionCallbackIds.contains(id)) {
+      Object object = sessionObject(id);
+      if (object != null
+          && Proxy.isProxyClass(object.getClass())
+          && Proxy.getInvocationHandler(object) instanceof CallbackHandler handler) {
+        callbackId = handler.callbackId();
+      }
+    }
+    if (!sessionCallbackIds.remove(callbackId)) {
+      return 0;
+    }
+    callbackRegistry.remove(callbackId);
+    LOG.fine("Unregistered callback ID " + callbackId);
+    return callbackId;
+  }
+
+  /** A callback proxy's handler, which says which callback the proxy is. */
+  private record CallbackHandler(long callbackId, InvocationHandler calls)
+      implements InvocationHandler {
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      return calls.invoke(proxy, method, args);
     }
   }
 
@@ -1186,7 +1214,7 @@ public class GatunServer {
 
             // Create a dynamic proxy that will invoke Python when called
             // Use session context (captured at start of handleClient) for cross-thread callbacks
-            Object proxy = createCallbackProxy(callbackId, interfaceName, ctx);
+            Object proxy = createCallbackProxy(callbackId, interfaceName, ownMethods(cmd), ctx);
             quota.allocateObject();
 
             // Store in callback registry with session context
@@ -1201,8 +1229,8 @@ public class GatunServer {
             LOG.fine("Registered callback ID " + callbackId + " for interface " + interfaceName);
             result = new ObjectRefT(callbackId);
           } else if (cmd.action() == Action.UnregisterCallback) {
-            unregisterCallback(cmd.targetId(), sessionCallbackIds);
-            result = null;
+            long unregistered = unregisterCallback(cmd.targetId(), sessionCallbackIds);
+            result = unregistered == 0 ? null : unregistered;
           }
           // Note: CallbackResponse is handled directly in invokeCallback(), not here
           else if (cmd.action() == Action.OpenCallbackChannel) {
@@ -2778,14 +2806,26 @@ public class GatunServer {
 
   // --- CALLBACK HELPERS ---
 
+  /** The method names a RegisterCallback command lists: those of a handler that is an object. */
+  private static Set<String> ownMethods(Command cmd) {
+    List<String> names = new ArrayList<>();
+    for (int i = 0; i < cmd.callbackMethodsLength(); i++) {
+      names.add(cmd.callbackMethods(i));
+    }
+    return Set.copyOf(names);
+  }
+
   /**
    * Creates a dynamic proxy that implements the specified interface. When any method on the proxy
    * is called, it sends a callback request to Python and waits for the response.
    *
    * <p>The SessionContext is captured at proxy creation time: the proxy can be called by any
    * thread, long after the request that registered it, and has to find its session.
+   *
+   * @param ownMethods the method names of a Python handler that is an object; empty for a function
    */
-  private Object createCallbackProxy(long callbackId, String interfaceName, SessionContext ctx)
+  private Object createCallbackProxy(
+      long callbackId, String interfaceName, Set<String> ownMethods, SessionContext ctx)
       throws ClassNotFoundException {
     Class<?> interfaceClass = getClass(interfaceName);
     if (!interfaceClass.isInterface()) {
@@ -2807,8 +2847,11 @@ public class GatunServer {
           }
 
           // A default method runs as Java wrote it and reaches Python through the abstract
-          // method it calls: comparator.reversed() calls compare(), not Python's "reversed"
-          if (method.isDefault()) {
+          // method it calls: comparator.reversed() calls compare(), not Python's "reversed".
+          // Unless the handler is an object with a method of that name: it overrides the
+          // default, as a class implementing the interface would (a listener whose methods
+          // all have empty default bodies is implemented in no other way).
+          if (method.isDefault() && !ownMethods.contains(method.getName())) {
             return InvocationHandler.invokeDefault(proxy, method, args);
           }
 
@@ -2824,7 +2867,9 @@ public class GatunServer {
         };
 
     return Proxy.newProxyInstance(
-        interfaceClass.getClassLoader(), new Class<?>[] {interfaceClass}, handler);
+        interfaceClass.getClassLoader(),
+        new Class<?>[] {interfaceClass},
+        new CallbackHandler(callbackId, handler));
   }
 
   /**
@@ -3237,8 +3282,8 @@ public class GatunServer {
         // No shared memory: none of these use it, and this thread could not
         return executeCommand(cmd, ctx.sessionObjectIds, ctx.sessionCallbackIds, null, ctx.quota);
       case Action.UnregisterCallback:
-        unregisterCallback(cmd.targetId(), ctx.sessionCallbackIds);
-        return null;
+        long unregistered = unregisterCallback(cmd.targetId(), ctx.sessionCallbackIds);
+        return unregistered == 0 ? null : unregistered;
       case Action.OpenCallMemory:
         return memory.open();
       case Action.ArrowToObject:

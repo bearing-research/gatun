@@ -5,6 +5,7 @@ import calendar
 import contextvars
 import datetime
 import functools
+import inspect
 import logging
 import math
 import mmap
@@ -1814,6 +1815,68 @@ def _nested_command(call_id: int, data: bytes | bytearray) -> bytearray:
     return frame
 
 
+def _callback_target(handler: Any, method: bytes | None) -> Callable[..., Any]:
+    """What answers a call that Java made on a callback's proxy.
+
+    A callable answers every method of its interface. Anything else answers
+    with its own method of the same name, which is how an interface with
+    several methods (a listener) is implemented.
+    """
+    if callable(handler):
+        return cast(Callable[..., Any], handler)
+    name = method.decode("utf-8") if method else ""
+    target = getattr(handler, name, None)
+    if not callable(target):
+        raise TypeError(
+            f"{type(handler).__name__} has no method {name}() to answer the "
+            "Java call with"
+        )
+    return cast(Callable[..., Any], target)
+
+
+def _callback_methods(handler: Any) -> list[str]:
+    """The names of the methods a callback object answers Java's calls with.
+
+    Registration sends them: a default method of the interface that the object
+    has a method for is the object's to answer, and the others run in Java.
+    A callable has none. It answers the abstract methods only.
+    """
+    if callable(handler):
+        return []
+    names = []
+    for name in dir(handler):
+        if name.startswith("_"):
+            continue
+        # Without running a property to find out what it is
+        attribute = inspect.getattr_static(handler, name, None)
+        if callable(attribute) or isinstance(attribute, (classmethod, staticmethod)):
+            names.append(name)
+    if not names:
+        raise TypeError(
+            f"{type(handler).__name__} cannot be a callback: it is not callable "
+            "and has no public method for Java to call"
+        )
+    return names
+
+
+def _finish_register_callback(
+    builder: flatbuffers.Builder, interface_name: str, handler: Any
+) -> Any:
+    interface_off = builder.CreateString(interface_name)
+    names = [builder.CreateString(name) for name in _callback_methods(handler)]
+    Cmd.CommandStartCallbackMethodsVector(builder, len(names))
+    for name in reversed(names):
+        builder.PrependUOffsetTRelative(name)
+    names_off = builder.EndVector()
+
+    Cmd.CommandStart(builder)
+    Cmd.CommandAddAction(builder, Act.Action.RegisterCallback)
+    Cmd.CommandAddTargetName(builder, interface_off)
+    Cmd.CommandAddCallbackMethods(builder, names_off)
+    builder.Finish(Cmd.CommandEnd(builder))
+    return builder.Output()
+
+
 def _build_open_call_memory() -> bytes:
     builder = flatbuffers.Builder(32)
     Cmd.CommandStart(builder)
@@ -2308,7 +2371,7 @@ class GatunClient(_ValueEncoder):
         self._jvm: JVMView | None = None
 
         # Callback registry: callback_id -> callable
-        self._callbacks: dict[int, Callable[..., Any]] = {}
+        self._callbacks: dict[int, Any] = {}
 
         # Where Java threads other than the one running a request call Python.
         # Opened with the first register_callback; see _ensure_callback_channel
@@ -2909,7 +2972,7 @@ class GatunClient(_ValueEncoder):
             ]
             if callback_fn is None:
                 raise LookupError(f"Callback {callback_id} not found")
-            return callback_fn(*args)
+            return _callback_target(callback_fn, resp.CallbackMethod())(*args)
 
         def run() -> Any:
             if not in_band:
@@ -3808,18 +3871,19 @@ class GatunClient(_ValueEncoder):
 
         return cast(list["JavaObject"], self._send_raw(builder.Output()))
 
-    def register_callback(
-        self, callback_fn: Callable[..., Any], interface_name: str
-    ) -> JavaObject:
-        """Register a Python callable as a Java interface implementation.
+    def register_callback(self, callback_fn: Any, interface_name: str) -> JavaObject:
+        """Register a Python callable, or object, as a Java interface implementation.
 
         This creates a Java dynamic proxy that implements the specified interface.
         When Java code calls methods on this proxy, the calls are forwarded to
-        the Python callback function.
+        Python.
 
         Args:
-            callback_fn: A Python callable that will handle method invocations.
-                        It receives the method arguments and should return a value.
+            callback_fn: A callable, which receives the arguments of whichever
+                        method of the interface Java calls and returns its
+                        result. Or, for an interface with several methods, an
+                        object that is not callable: each call goes to its
+                        method of the same name (onQueryStarted, onQueryProgress).
             interface_name: Fully qualified Java interface name
                            (e.g., "java.util.function.Function")
 
@@ -3838,20 +3902,28 @@ class GatunClient(_ValueEncoder):
             arr.add(2)
             client.invoke_static_method("java.util.Collections", "sort", arr, comparator)
         """
+        command = _finish_register_callback(
+            self._get_builder(), interface_name, callback_fn
+        )
+        # This client calls the function and sends back what it returns: a
+        # coroutine would go unawaited
+        for target in (
+            [callback_fn]
+            if callable(callback_fn)
+            else [getattr(callback_fn, name) for name in _callback_methods(callback_fn)]
+        ):
+            if inspect.iscoroutinefunction(target):
+                raise TypeError(
+                    f"{getattr(target, '__qualname__', target)} is a coroutine "
+                    "function, which only the async client (aconnect) can run "
+                    "as a callback"
+                )
+
         # Java may call this callback from any thread from here on
         self._ensure_callback_channel()
 
-        builder = self._get_builder()
-        interface_off = self._create_string(builder, interface_name)
-
-        Cmd.CommandStart(builder)
-        Cmd.CommandAddAction(builder, Act.Action.RegisterCallback)
-        Cmd.CommandAddTargetName(builder, interface_off)
-        cmd = Cmd.CommandEnd(builder)
-        builder.Finish(cmd)
-
         # Send command and get back the proxy object
-        result: JavaObject = cast("JavaObject", self._send_raw(builder.Output()))
+        result: JavaObject = cast("JavaObject", self._send_raw(command))
 
         # Get the callback_id from the response - it's stored as the object_id
         # We need to also store our callback function
@@ -3861,12 +3933,20 @@ class GatunClient(_ValueEncoder):
 
         return result
 
-    def unregister_callback(self, callback_id: int) -> None:
+    def unregister_callback(self, callback: JavaObject | int) -> None:
         """Unregister a previously registered callback.
 
         Args:
-            callback_id: The callback ID to unregister
+            callback: What register_callback() returned, or any other handle
+                on the same Java object, such as one read back out of a Java
+                collection. Or the object ID of one, while the handle is alive.
         """
+        # `callback` stays referenced until the server has answered: a handle
+        # that dies is queued for release, the queue is sent ahead of the next
+        # command, and the server could not tell what a released ID had named
+        callback_id = (
+            callback.object_id if isinstance(callback, JavaObject) else callback
+        )
         builder = self._get_builder()
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.UnregisterCallback)
@@ -3875,7 +3955,7 @@ class GatunClient(_ValueEncoder):
         builder.Finish(cmd)
 
         try:
-            self._send_raw(builder.Output())
+            unregistered = self._send_raw(builder.Output())
         except BaseException:
             # A request that was refused must not leave Java calling a function
             # that is gone. On a client that is closed or dead the session is
@@ -3884,6 +3964,9 @@ class GatunClient(_ValueEncoder):
                 self._callbacks.pop(callback_id, None)
             raise
         self._callbacks.pop(callback_id, None)
+        # The callback's own ID, when it was named by another handle
+        if isinstance(unregistered, int):
+            self._callbacks.pop(unregistered, None)
 
     def free_object(self, object_id):
         """Release a Java object.

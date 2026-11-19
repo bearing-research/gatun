@@ -122,6 +122,27 @@ class BridgeAdapter(Protocol):
         """Get length of JVM array."""
         ...
 
+    # === Callbacks ===
+
+    def register_callback(self, handler: Any, interface: str) -> JVMRef:
+        """Make a JVM object that implements a Java interface in Python.
+
+        Args:
+            handler: A callable, which is given the arguments of whichever
+                method of the interface the JVM calls and returns its result.
+                Or an object that is not callable, for an interface with
+                several methods: each call goes to its method of the same name.
+            interface: Fully qualified interface name (e.g., "java.util.Comparator")
+
+        Returns:
+            Reference to an object that implements the interface
+        """
+        ...
+
+    def unregister_callback(self, ref: JVMRef) -> None:
+        """Stop serving a callback and let go of its handler."""
+        ...
+
     # === JVM View (Optional but Convenient) ===
 
     @property
@@ -177,6 +198,42 @@ class BridgeAdapter(Protocol):
 | Arrays (primitive) | `list` |
 | Arrays (object) | `list` |
 | Other objects | `JVMRef` |
+
+## Callbacks
+
+`register_callback` is how the JVM calls Python: a foreachBatch function, a streaming query
+listener, a comparator. The rules an implementation must keep:
+
+- The returned reference is an ordinary JVM object that implements the interface. It can be
+  passed to any method that takes one and stored by JVM code.
+- A callable handler answers every abstract method of the interface. Any other handler
+  answers each call with its method of the same name, and a call to a method it lacks fails in
+  the JVM caller with an exception that names the method. A default method of the interface
+  runs in the JVM unless such a handler has a method of that name, which then overrides it (a
+  listener interface whose methods all have empty default bodies is implemented that way). The
+  methods of `java.lang.Object` run in the JVM and do not reach Python.
+- Arguments and the return value follow the type conversion rules above. JVM objects among the
+  arguments arrive as `JVMRef`.
+- An exception raised by the handler is thrown in the JVM thread that made the call. If it
+  reaches Python again through the call that led to it, it is a `JavaException`.
+- The JVM may call from any thread and at any time, also while no call from Python is running
+  and several at once. Handlers must be safe for that.
+- A callback made by a thread other than the one serving the current call from Python may
+  call back into the JVM through the bridge. Whether one made by that thread itself may do so
+  is up to the implementation (Py4J allows it; Gatun raises `ReentrancyError`).
+- An implementation may limit how long a handler runs. `GatunAdapter` does: after
+  `callback_timeout` seconds (30 by default) the JVM caller gets an exception while the
+  handler is still running. Pass `callback_timeout=None` when handlers run long, as a
+  foreachBatch function does.
+- The handler stays registered, and referenced, until `unregister_callback` or `close()`:
+  JVM code may hold the object indefinitely. After `unregister_callback` a call fails in the
+  JVM with an exception and does not reach Python.
+- `unregister_callback` takes any reference to the callback object: the one
+  `register_callback` returned, or one that came back from the JVM later (read out of a
+  collection of listeners, for example).
+
+With Py4J the handler corresponds to an object with `class Java: implements = [interface]`
+passed through the gateway's callback server.
 
 ## Exception Handling
 
@@ -527,6 +584,65 @@ class BridgeContractTests:
             items.append(bridge.array_get(arr, i))
 
         assert items == ["x", "y", "z"]
+
+    # === Callbacks ===
+
+    def test_callback_function(self, bridge):
+        """A function implements an interface with one method."""
+        longest_first = bridge.register_callback(
+            lambda a, b: len(b) - len(a), "java.util.Comparator"
+        )
+        words = bridge.new("java.util.ArrayList")
+        for word in ("bb", "a", "ccc"):
+            bridge.call(words, "add", word)
+
+        bridge.call_static("java.util.Collections", "sort", words, longest_first)
+
+        assert [bridge.call(words, "get", i) for i in range(3)] == ["ccc", "bb", "a"]
+
+    def test_callback_object_with_named_methods(self, bridge):
+        """An object implements an interface with several methods."""
+
+        class Countdown:
+            def __init__(self):
+                self.left = 3
+
+            def hasMoreElements(self):
+                return self.left > 0
+
+            def nextElement(self):
+                self.left -= 1
+                return self.left
+
+        enumeration = bridge.register_callback(Countdown(), "java.util.Enumeration")
+
+        assert bridge.call_static("java.util.Collections", "list", enumeration) == [2, 1, 0]
+
+    def test_callback_exception(self, bridge):
+        """An exception in the callback is an exception in its JVM caller."""
+
+        def compare(a, b):
+            raise ValueError("cannot compare these")
+
+        comparator = bridge.register_callback(compare, "java.util.Comparator")
+        words = bridge.new("java.util.ArrayList")
+        bridge.call(words, "add", "b")
+        bridge.call(words, "add", "a")
+
+        with pytest.raises(JavaException, match="cannot compare these"):
+            bridge.call_static("java.util.Collections", "sort", words, comparator)
+
+    def test_unregister_callback(self, bridge):
+        """An unregistered callback fails in the JVM instead of reaching Python."""
+        comparator = bridge.register_callback(lambda a, b: 0, "java.util.Comparator")
+        words = bridge.new("java.util.ArrayList")
+        bridge.call(words, "add", "b")
+        bridge.call(words, "add", "a")
+
+        bridge.unregister_callback(comparator)
+
+        with pytest.raises(JavaException):
+            bridge.call_static("java.util.Collections", "sort", words, comparator)
 ```
 
 ## PySpark Integration Points
@@ -541,6 +657,8 @@ class BridgeContractTests:
 | `gateway.new_array(cls, n)` | `bridge.new_array("cls", n)` |
 | `is_instance_of(obj, cls)` | `bridge.is_instance_of(obj, "cls")` |
 | `java_import(jvm, "pkg.*")` | `bridge.java_import("pkg.*")` |
+| Object with `class Java: implements = ["Iface"]` | `bridge.register_callback(obj, "Iface")` |
+| `ensure_callback_server_started(gw)` | Not needed: the adapter serves callbacks once one is registered |
 
 ### Key Files to Modify in PySpark
 
@@ -551,3 +669,5 @@ class BridgeContractTests:
 5. `pyspark/sql/utils.py` - to_java_array function
 6. `pyspark/ml/wrapper.py` - ML wrappers use new_array
 7. `pyspark/ml/pipeline.py` - Pipeline stages use new_array
+8. `pyspark/sql/utils.py` - `ForeachBatchFunction`, a callback object
+9. `pyspark/sql/streaming/listener.py` - the streaming query listener, a callback object with several methods

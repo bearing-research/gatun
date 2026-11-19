@@ -173,6 +173,40 @@ class BridgeAdapter(ABC):
         """Get length of JVM array."""
         ...
 
+    # === Callbacks ===
+
+    @abstractmethod
+    def register_callback(self, handler: Any, interface: str) -> JVMRef:
+        """Make a JVM object that implements a Java interface in Python.
+
+        Args:
+            handler: A callable, which is given the arguments of whichever
+                method of the interface the JVM calls and returns its result.
+                Or an object that is not callable, for an interface with
+                several methods: each call goes to its method of the same name.
+            interface: Fully qualified name of the interface
+                (e.g., "java.util.Comparator")
+
+        Returns:
+            Reference to an object that implements the interface. Pass it to
+            any JVM method that takes one. The JVM may call it from any thread,
+            and at any time, until unregister_callback() or close().
+        """
+        ...
+
+    @abstractmethod
+    def unregister_callback(self, ref: JVMRef) -> None:
+        """Stop serving a callback and let go of its handler.
+
+        Args:
+            ref: Any reference to the callback object: the one
+                register_callback() returned, or one the JVM gave back later.
+
+        JVM code may still hold the object; calling it from then on fails
+        there with an exception.
+        """
+        ...
+
     # === JVM View ===
 
     @property
