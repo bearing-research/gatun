@@ -23,7 +23,8 @@ Usage, from the repository root (the helper needs a JDK 22+ and the built gatun 
         benchmarks/java/bench/TransportBench.java
     uv run python benchmarks/benchmark_transport.py --classes benchmarks/java/out
 
-On macOS there is no /dev/shm, so the file baseline falls back to /tmp, which is on disk.
+gatun's shared memory file and the file baseline both go to /dev/shm where there is one.
+On macOS there is none, so both fall back to /tmp, which is on disk.
 """
 
 from __future__ import annotations
@@ -94,6 +95,7 @@ class Bench:
     def close(self) -> None:
         self.jroot.close()
         self._reset_arena()
+        self.arena.close()
         for path in (self.file_path, self.sock_path):
             try:
                 os.unlink(path)
@@ -306,14 +308,18 @@ def main() -> None:
     parser.add_argument(
         "--sizes", default="1,16,128", help="table sizes in MiB, comma separated"
     )
+    # The same place for both, so that gatun's shared memory file and the file
+    # baseline sit on the same kind of storage
+    memory_dir = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
     parser.add_argument(
         "--shm-dir",
-        default="/tmp",
-        help="where gatun puts its socket and shared memory file",
+        default=memory_dir,
+        help="where gatun puts its socket and shared memory file "
+        "(tmpfs where there is one)",
     )
     parser.add_argument(
         "--file-dir",
-        default="/dev/shm" if os.path.isdir("/dev/shm") else "/tmp",
+        default=memory_dir,
         help="where the file baseline writes (tmpfs where there is one)",
     )
     parser.add_argument(

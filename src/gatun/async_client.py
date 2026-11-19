@@ -69,7 +69,6 @@ from gatun.client import (
     _unpack_value_impl,
     _usable_timeout,
     _ValueEncoder,
-    _write_arrow_stream,
     _write_arrow_table,
 )
 from gatun.generated.org.gatun.protocol import Action as Act
@@ -1199,24 +1198,16 @@ class AsyncGatunClient(_ValueEncoder):
     async def send_arrow_table(self, table: pa.Table):
         """Send an Arrow table to Java via shared memory asynchronously.
 
-        This writes Arrow IPC data to the shared memory mmap using a single
-        memmove, avoiding the overhead of opening a new memory-mapped file.
-
         The data flow is:
-        1. Python serializes Arrow IPC to a buffer (Arrow's efficient internal format)
-        2. Buffer is copied to shared memory via ctypes.memmove (single copy)
-        3. Java reads Arrow IPC from shared memory (zero-copy read via mmap)
+        1. Python serializes the table as an Arrow IPC stream straight into
+           shared memory (one pass over the data)
+        2. Java reads the stream from shared memory
 
-        Note: Arrow IPC serialization still occurs (table → IPC format).
-        For true zero-copy, use send_arrow_buffers() instead.
+        Java only counts the rows. To hand the table to Java code use
+        arrow_to_java(); to have Java read the buffers in place use
+        send_arrow_buffers().
         """
-        # Serialize to an in-memory buffer first
-        # Arrow's IPC serialization is already optimized and this is fast
-        sink = pa.BufferOutputStream()
-        with pa.ipc.new_stream(sink, table.schema) as writer:
-            writer.write_table(table)
-
-        ipc_buffer = sink.getvalue()
+        size = _arrow_stream_size(table)
 
         builder = flatbuffers.Builder(256)
         Cmd.CommandStart(builder)
@@ -1224,10 +1215,10 @@ class AsyncGatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        # Copied into the payload zone once this request holds the channel
+        # Written into the payload zone once this request holds the channel
         return await self._send_raw(
             builder.Output(),
-            prepare=lambda: _write_arrow_stream(self, ipc_buffer, 0, "Arrow batch"),
+            prepare=lambda: _write_arrow_table(self, table, 0, size, "Arrow batch"),
         )
 
     async def arrow_to_java(self, table: pa.Table | pa.RecordBatch) -> AsyncJavaObject:

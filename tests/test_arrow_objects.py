@@ -8,10 +8,13 @@ import ctypes
 import datetime
 import decimal
 import gc
+import threading
+import weakref
 
 import pyarrow as pa
 import pytest
 
+import gatun.client
 from gatun import (
     ArrowTableView,
     JavaException,
@@ -392,6 +395,97 @@ class TestReadingInPlace:
         finally:
             arena.close()
 
+    def test_view_ends_when_the_overwriting_transfer_starts(self, client, root):
+        """Java writes as soon as it has the command; an answer that never
+        arrives must not leave the view looking valid."""
+        other = client.arrow_to_java(pa.table({"y": [1]}))
+        view = client.arrow_from_java(root, copy=False)
+        seen = []
+
+        real_send = client._send_raw
+
+        def send_then_lose_the_answer(data):
+            real_send(data)
+            seen.append("stale" if "STALE" in repr(view) else "valid")
+            raise TimeoutError("no answer")
+
+        client._send_raw = send_then_lose_the_answer
+        try:
+            with pytest.raises(TimeoutError):
+                client.arrow_from_java(other)
+        finally:
+            client._send_raw = real_send
+
+        assert seen == ["stale"]
+        with pytest.raises(StaleArenaError):
+            view.to_pydict()
+
+    def test_failed_fetch_ends_views_in_both_halves(self):
+        """However it fails, there is no telling how far Java got."""
+        client = connect(memory="2MB")
+        arena = client.get_payload_arena()
+        try:
+            client.send_arrow_buffers(pa.table({"x": [1, 2, 3]}), arena, {})
+            root = client.arrow_to_java(pa.table({"y": [1]}))
+            loaded = client.get_arrow_data()
+            borrowed = client.arrow_from_java(root, copy=False)
+
+            with pytest.raises(JavaIllegalArgumentException):
+                client.arrow_from_java(client.create_object("java.util.ArrayList"))
+
+            for view in (loaded, borrowed):
+                with pytest.raises(StaleArenaError):
+                    view.to_pydict()
+        finally:
+            arena.close()
+            client.close()
+
+    def test_send_that_fails_halfway_ends_the_view(self, client, root, monkeypatch):
+        """The stream is written piece by piece, so a failed write has still
+        changed the zone."""
+        view = client.arrow_from_java(root, copy=False)
+
+        def fail(*args):
+            raise OSError("disk went away")
+
+        monkeypatch.setattr(gatun.client, "_write_arrow_table", fail)
+        with pytest.raises(OSError, match="disk went away"):
+            client.arrow_to_java(pa.table({"y": [1]}))
+
+        with pytest.raises(StaleArenaError):
+            view.to_pydict()
+
+    def test_refused_send_leaves_the_view_valid(self):
+        client = connect(memory="2MB")
+        try:
+            table = pa.table({"x": [1, 2, 3]})
+            view = client.arrow_from_java(client.arrow_to_java(table), copy=False)
+            too_big = pa.table({"x": pa.array(range(400_000), type=pa.int64())})
+
+            with pytest.raises(PayloadTooLargeError):
+                client.arrow_to_java(too_big)
+            with pytest.raises(PayloadTooLargeError):
+                client.send_arrow_table(too_big)
+
+            assert view.table.equals(table)
+        finally:
+            client.close()
+
+    def test_copying_out_waits_for_a_transfer_in_progress(self, client, root):
+        """A transfer on another thread holds the channel while it writes; a
+        view must not be read in the middle of that."""
+        view = client.arrow_from_java(root, copy=False)
+        result = []
+        reader = threading.Thread(target=lambda: result.append(view.to_pydict()))
+
+        with client._exchange_lock:
+            reader.start()
+            reader.join(timeout=0.3)
+            assert reader.is_alive(), "read the view while the channel was held"
+        reader.join(timeout=10)
+
+        assert result == [self.TABLE.to_pydict()]
+
     def test_close_ends_the_view_and_the_table_keeps_the_mapping(self, make_client):
         client = make_client()
         shm = client.shm
@@ -408,6 +502,40 @@ class TestReadingInPlace:
         del table, view
         gc.collect()
         shm.close()
+
+
+class TestClientArena:
+    def test_arena_does_not_keep_its_client_alive(self):
+        client = connect(memory="2MB")
+        arena = client.get_payload_arena()
+        arena.allocate(8)
+        client_ref = weakref.ref(client)
+
+        client.close()
+        del client
+        gc.collect()
+
+        assert client_ref() is None
+        arena.close()
+
+    def test_allocation_over_a_loaded_view_ends_it(self):
+        """Buffers put into the arena by hand, with no send after them."""
+        client = connect(memory="2MB")
+        arena = client.get_payload_arena()
+        try:
+            client.send_arrow_buffers(pa.table({"x": [1, 2, 3]}), arena, {})
+            view = client.get_arrow_data()
+
+            arena.allocate(4096)
+            assert view.to_pydict() == {"x": [1, 2, 3]}
+
+            # Past the middle of the zone, where the view's data is
+            arena.allocate(arena.size // 2)
+            with pytest.raises(StaleArenaError, match="reused the shared memory"):
+                view.to_pydict()
+        finally:
+            arena.close()
+            client.close()
 
 
 class TestTableLifetime:
