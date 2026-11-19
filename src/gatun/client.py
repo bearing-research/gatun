@@ -2695,19 +2695,20 @@ class GatunClient(_ValueEncoder):
             else:
                 reply(result, is_error, error_msg)
 
-        # Look up the callback function
         callback_fn = self._callbacks.get(callback_id)
-        if callback_fn is None:
-            answer(None, True, f"Callback {callback_id} not found")
-            return
 
         def call() -> Any:
+            # Unpacked even when the callback is gone (unregistered while Java
+            # was calling it): the server registered the objects among the
+            # arguments for this client, and their wrappers are what frees them
             args = [
                 self._unpack_value(arg.ValType(), arg.Val())
                 for arg in (
                     resp.CallbackArgs(i) for i in range(resp.CallbackArgsLength())
                 )
             ]
+            if callback_fn is None:
+                raise LookupError(f"Callback {callback_id} not found")
             return callback_fn(*args)
 
         def run() -> Any:
@@ -2787,8 +2788,11 @@ class GatunClient(_ValueEncoder):
         """
         callback_id = resp.CallbackId()
         call_id = resp.CallId()
+        answered = False
 
         def reply(result: Any, is_error: bool, error_msg: str | None) -> None:
+            nonlocal answered
+            answered = True
             channel.send(
                 self._build_callback_response(
                     callback_id, result, is_error, error_msg, call_id
@@ -2800,6 +2804,35 @@ class GatunClient(_ValueEncoder):
         except OSError as e:
             # The connection closed under the callback; Java was told by that
             logger.debug("Callback %d could not be answered: %s", callback_id, e)
+        except BaseException as e:
+            # A Java thread is waiting for this call and nothing else ends its wait
+            if not answered:
+                try:
+                    reply(None, True, f"{type(e).__name__}: {e}")
+                except OSError:
+                    pass
+            raise
+        finally:
+            self._release_on_channel(channel)
+
+    def _release_on_channel(self, channel: CallbackChannel) -> None:
+        """Send the queued object releases on the callback connection.
+
+        They normally ride ahead of the client's next request. A client that
+        only receives callbacks, or sits in one long request, makes none, and
+        the arguments of every call would stay registered on the server.
+        """
+        frees = self._pending_frees
+        while frees:
+            ids = _take_free_chunk(frees)
+            if not ids:
+                return
+            try:
+                channel.send(_build_free_command(flatbuffers.Builder(64), ids))
+            except OSError:
+                # The connection is gone; the next request can still send them
+                frees.extend(ids)
+                return
 
     def _ensure_callback_channel(self) -> None:
         """Open the callback connection, the first time a callback is registered.
@@ -2810,6 +2843,9 @@ class GatunClient(_ValueEncoder):
         to open it is logged and not raised: the server tells any other thread
         that calls a callback why it cannot.
         """
+        # Before waiting for the channel: inside a callback the request that is
+        # waiting for it holds the channel
+        self._check_reentrancy()
         # Under the lock: threads registering callbacks at the same time open
         # it once
         with self._exchange_lock:

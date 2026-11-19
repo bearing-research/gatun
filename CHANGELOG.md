@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Protocol version is now 4: `Action.OpenCallbackChannel` and a `call_id` on commands and responses, for the callback connection. Client and server must be upgraded together
 - A callback's arguments that could not be sent (more than 64KB of them) no longer leave their objects registered for the session
+- Calling a callback after `unregister_callback` throws `IllegalStateException` in Java before its arguments are sent. The client used to answer "not found", and in the sync client the objects among the arguments stayed registered for the rest of the session
 - Protocol version 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together
 - The async client accepts `datetime` / `date` / `time` arguments
 - Executing a batch from inside a callback raises `ReentrancyError`, like any other call

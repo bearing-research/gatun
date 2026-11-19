@@ -898,6 +898,138 @@ class TestCallbacksFromOtherThreads:
         finally:
             client.close()
 
+    def test_arguments_are_released_while_the_client_makes_no_requests(
+        self, other_thread_classes
+    ):
+        """A client that only listens sends nothing a release could ride on."""
+        limit = 20
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            extra_jvm_flags=[f"-Dgatun.limits.max_objects={limit}"],
+        )
+        try:
+            calls = []
+            function = client.register_callback(
+                lambda obj: calls.append(None), "java.util.function.Function"
+            )
+            supplier = client.register_callback(
+                lambda: 1, "java.util.function.Supplier"
+            )
+            text = client.jvm.java.lang.StringBuilder("abc")
+            held = 3  # the two proxies and the StringBuilder
+
+            client.jvm.OtherThread.repeat(function, text, 200)
+
+            # Nothing is asked of the client while the calls arrive
+            def all_released():
+                serving = any(t.name == "gatun-callback" for t in threading.enumerate())
+                done = len(calls) == 200 and not serving
+                return True if done and not client._pending_frees else None
+
+            _eventually(all_released)
+
+            # The server reads the connection in order: once it has this call's
+            # answer, it has every release sent before it
+            assert client.jvm.OtherThread.call(supplier) == 1
+            created = []
+            with pytest.raises(JavaException, match="limit"):
+                for _ in range(limit):
+                    created.append(client.jvm.java.util.ArrayList())
+            assert len(created) == limit - held
+        finally:
+            client.close()
+
+    def test_unregistered_callback_is_refused_before_its_arguments_are_sent(
+        self, other_thread_classes
+    ):
+        """Nobody would release the objects among them."""
+        limit = 10
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            extra_jvm_flags=[f"-Dgatun.limits.max_objects={limit}"],
+        )
+        try:
+            function = client.register_callback(
+                lambda obj: None, "java.util.function.Function"
+            )
+            text = client.jvm.java.lang.StringBuilder("abc")
+            items = client.jvm.java.util.ArrayList([1])
+            held = 3  # the proxy, the StringBuilder and the list
+            client.unregister_callback(function.object_id)
+
+            for _ in range(3 * limit):
+                with pytest.raises(JavaException, match="after it was unregistered"):
+                    client.jvm.OtherThread.apply(function, text)
+            # On the request's own thread too
+            with pytest.raises(JavaException, match="after it was unregistered"):
+                items.stream().map(function).toList()
+
+            created = []
+            with pytest.raises(JavaException, match="limit"):
+                for _ in range(limit):
+                    created.append(client.jvm.java.util.HashMap())
+            assert len(created) == limit - held
+        finally:
+            client.close()
+
+    def test_arguments_python_cannot_read_fail_the_call(self, other_thread):
+        """The Java thread is waiting for an answer whatever goes wrong."""
+        client = other_thread
+        function = client.register_callback(
+            lambda obj: None, "java.util.function.Function"
+        )
+        keyed_by_a_map = client.jvm.java.util.HashMap()
+        keyed_by_a_map.put(client.jvm.java.util.HashMap(), 1)
+
+        with pytest.raises(JavaException, match="unhashable"):
+            client.jvm.OtherThread.apply(function, keyed_by_a_map)
+        assert client.jvm.java.lang.Math.max(1, 2) == 2
+
+    def test_registering_a_callback_inside_a_callback_fails_at_once(self, other_thread):
+        """It must not wait for the channel: the request waiting for the
+        callback holds it."""
+        client = other_thread
+
+        def register(value):
+            client.register_callback(lambda: None, "java.lang.Runnable")
+
+        function = client.register_callback(register, "java.util.function.Function")
+        items = client.jvm.java.util.ArrayList([1])
+
+        started = time.monotonic()
+        with pytest.raises(JavaException, match="ReentrancyError"):
+            items.stream().map(function).toList()
+        assert time.monotonic() - started < 5
+
+    def test_session_is_not_idle_while_python_is_being_called(
+        self, other_thread_classes
+    ):
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            extra_jvm_flags=["-Dgatun.limits.session_idle_timeout_ms=1000"],
+        )
+        try:
+            entered = threading.Event()
+
+            def work():
+                entered.set()
+                time.sleep(2.5)  # the client asks for nothing meanwhile
+
+            task = client.register_callback(work, "java.lang.Runnable")
+            client.jvm.OtherThread.later(task, 0)
+            assert entered.wait(10)
+            time.sleep(2.7)
+
+            assert client.jvm.OtherThread.lastError() == ""
+        finally:
+            client.close()
+
     def test_callback_on_the_request_thread_still_works(self, other_thread):
         client = other_thread
         doubled = client.register_callback(
@@ -1084,6 +1216,44 @@ class TestAsyncCallbacksFromOtherThreads:
         with pytest.raises(JavaException, match="no such luck"):
             await client.jvm.OtherThread.call(supplier)
         assert await client.jvm.java.lang.Math.max(1, 2) == 2
+
+    async def test_arguments_python_cannot_read_fail_the_call(self, client):
+        """The Java thread is waiting for an answer whatever goes wrong."""
+        function = await client.register_callback(
+            lambda obj: None, "java.util.function.Function"
+        )
+        keyed_by_a_map = await client.jvm.java.util.HashMap()
+        await keyed_by_a_map.put(await client.jvm.java.util.HashMap(), 1)
+
+        with pytest.raises(JavaException, match="unhashable"):
+            await asyncio.wait_for(
+                client.jvm.OtherThread.apply(function, keyed_by_a_map), 20
+            )
+
+    async def test_arguments_are_released_while_the_client_makes_no_requests(
+        self, client
+    ):
+        calls = []
+        function = await client.register_callback(
+            lambda obj: calls.append(None), "java.util.function.Function"
+        )
+        text = await client.jvm.java.lang.StringBuilder("abc")
+
+        await client.jvm.OtherThread.repeat(function, text, 100)
+
+        async with asyncio.timeout(10):
+            channel = client._callback_channel
+            while len(calls) < 100 or channel._calls or client._pending_frees:
+                await asyncio.sleep(0.05)
+
+    async def test_unregistered_callback_is_refused(self, client):
+        function = await client.register_callback(
+            lambda obj: None, "java.util.function.Function"
+        )
+        await client.unregister_callback(function.object_id)
+
+        with pytest.raises(JavaException, match="after it was unregistered"):
+            await client.jvm.OtherThread.apply(function, 1)
 
     async def test_callbacks_registered_at_once_open_one_connection(self, client):
         first, second = await asyncio.gather(

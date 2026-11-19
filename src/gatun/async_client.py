@@ -607,24 +607,25 @@ class AsyncGatunClient(_ValueEncoder):
             else:
                 await reply(result, is_error, error_msg)
 
-        # Unpack callback arguments
-        args = []
-        for i in range(resp.CallbackArgsLength()):
-            arg = resp.CallbackArgs(i)
-            args.append(self._unpack_value(arg.ValType(), arg.Val()))
-
-        # Look up the callback function
-        callback_fn = self._callbacks.get(callback_id)
-        if callback_fn is None:
-            await answer(None, True, f"Callback {callback_id} not found")
-            return
-
         # Execute the callback with timeout and, in band, the reentrancy guard
         task = asyncio.current_task() if in_band else None
         if task is not None:
             self._callback_tasks.add(task)
         scope_token = _enter_callback(self) if in_band else None
         try:
+            # Unpacked even when the callback is gone (unregistered while Java
+            # was calling it): the server registered the objects among the
+            # arguments for this client, and their wrappers are what frees
+            # them. Inside the try, because Java is waiting for an answer
+            # whatever goes wrong here.
+            args = []
+            for i in range(resp.CallbackArgsLength()):
+                arg = resp.CallbackArgs(i)
+                args.append(self._unpack_value(arg.ValType(), arg.Val()))
+
+            callback_fn = self._callbacks.get(callback_id)
+            if callback_fn is None:
+                raise LookupError(f"Callback {callback_id} not found")
             if inspect.iscoroutinefunction(callback_fn):
                 pending = callback_fn(*args)
             else:
@@ -667,8 +668,11 @@ class AsyncGatunClient(_ValueEncoder):
         """
         callback_id = resp.CallbackId()
         call_id = resp.CallId()
+        answered = False
 
         async def reply(result: Any, is_error: bool, error_msg: str | None) -> None:
+            nonlocal answered
+            answered = True
             await channel.send(
                 self._build_callback_response(
                     callback_id, result, is_error, error_msg, call_id
@@ -680,6 +684,35 @@ class AsyncGatunClient(_ValueEncoder):
         except OSError as e:
             # The connection closed under the callback; Java was told by that
             logger.debug("Callback %d could not be answered: %s", callback_id, e)
+        except Exception as e:
+            # A Java thread is waiting for this call and nothing else ends its wait
+            if not answered:
+                try:
+                    await reply(None, True, f"{type(e).__name__}: {e}")
+                except OSError:
+                    pass
+            raise
+        finally:
+            await self._release_on_channel(channel)
+
+    async def _release_on_channel(self, channel: AsyncCallbackChannel) -> None:
+        """Send the queued object releases on the callback connection.
+
+        They normally ride ahead of the client's next request. A client that
+        only receives callbacks, or sits in one long request, makes none, and
+        the arguments of every call would stay registered on the server.
+        """
+        frees = self._pending_frees
+        while frees:
+            ids = _take_free_chunk(frees)
+            if not ids:
+                return
+            try:
+                await channel.send(_build_free_command(flatbuffers.Builder(64), ids))
+            except OSError:
+                # The connection is gone; the next request can still send them
+                frees.extend(ids)
+                return
 
     async def _ensure_callback_channel(self) -> None:
         """Open the callback connection, the first time a callback is registered.

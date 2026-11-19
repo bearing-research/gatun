@@ -9,6 +9,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.gatun.protocol.Command;
@@ -19,7 +20,9 @@ import org.gatun.protocol.Command;
  *
  * <p>Frames are a four-byte little-endian length followed by a FlatBuffer. Any number of threads
  * have a call in flight at once; each call has an ID, and the reader hands every frame Python sends
- * to the call its {@code call_id} names.
+ * to the call its {@code call_id} names. A frame with no call ID is not part of any call (Python
+ * releasing objects it was passed) and goes to the handler the channel was made with, on the reader
+ * thread.
  *
  * <p>Callers never touch the socket. They are threads this server does not own (a Spark listener
  * bus, an executor's workers), and interrupting a thread that is blocked on a channel closes the
@@ -38,14 +41,16 @@ final class CallbackChannel {
 
   private final SocketChannel socket;
   private final String name;
+  private final Consumer<Command> notices;
   private final AtomicLong callIds = new AtomicLong(1);
   private final Map<Long, BlockingQueue<ByteBuffer>> calls = new ConcurrentHashMap<>();
   private final BlockingQueue<ByteBuffer> outbox = new LinkedBlockingQueue<>();
   private volatile boolean closed;
 
-  CallbackChannel(SocketChannel socket, String name) {
+  CallbackChannel(SocketChannel socket, String name, Consumer<Command> notices) {
     this.socket = socket;
     this.name = name;
+    this.notices = notices;
   }
 
   boolean isClosed() {
@@ -118,8 +123,16 @@ final class CallbackChannel {
         return;
       }
       frame.flip();
-      long callId =
-          Command.getRootAsCommand(frame.duplicate().order(ByteOrder.LITTLE_ENDIAN)).callId();
+      Command command = Command.getRootAsCommand(frame.duplicate().order(ByteOrder.LITTLE_ENDIAN));
+      long callId = command.callId();
+      if (callId == 0) {
+        try {
+          notices.accept(command);
+        } catch (RuntimeException e) {
+          LOG.log(Level.WARNING, name + ": a notice from Python failed", e);
+        }
+        continue;
+      }
       BlockingQueue<ByteBuffer> inbox = calls.get(callId);
       if (inbox != null) {
         inbox.add(frame);

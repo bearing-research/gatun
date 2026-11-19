@@ -138,6 +138,9 @@ public class GatunServer {
     volatile CallbackChannel callbackChannel;
     // Set when the session ends. Its proxies can outlive it in whatever Java code holds them.
     volatile boolean closed;
+    // Calls on the callback connection that Python has not answered yet. The session is in use
+    // for as long as there are any, whatever its own channel is doing.
+    final AtomicInteger channelCalls = new AtomicInteger();
 
     SessionContext(
         SocketChannel channel,
@@ -499,7 +502,9 @@ public class GatunServer {
         return;
       }
       for (SessionContext session : sessions.values()) {
-        if (session.quota.isTimedOut() && !session.control.isRequestActive()) {
+        if (session.quota.isTimedOut()
+            && !session.control.isRequestActive()
+            && session.channelCalls.get() == 0) {
           LOG.warning("Closing idle session " + session.quota.getSessionId());
           try {
             session.channel.close();
@@ -574,7 +579,8 @@ public class GatunServer {
         sessionFiles.remove(path);
       }
 
-      CallbackChannel channel = new CallbackChannel(peer, name);
+      CallbackChannel channel =
+          new CallbackChannel(peer, name, notice -> handleChannelNotice(ctx, notice));
       ctx.callbackChannel = channel;
       if (ctx.closed) {
         // The session ended while the client was connecting, and found no channel to close
@@ -599,6 +605,25 @@ public class GatunServer {
           // already gone
         }
       }
+    }
+  }
+
+  /**
+   * A frame on the callback connection that belongs to no call: Python releasing objects. A client
+   * that only receives callbacks, or sits in one long request, sends nothing on its own channel
+   * that the release could ride on, and the arguments of every call would pile up.
+   */
+  private void handleChannelNotice(SessionContext ctx, Command notice) {
+    if (notice.action() != Action.FreeObject) {
+      throw new IllegalArgumentException("Unexpected action " + notice.action());
+    }
+    checkArgumentCount(notice.argsLength());
+    // For the session ID in what the registry logs; this is the connection's reader thread
+    sessionContext.set(ctx);
+    try {
+      freeObjects(notice, ctx.sessionObjectIds, ctx.quota);
+    } finally {
+      sessionContext.remove();
     }
   }
 
@@ -2838,6 +2863,16 @@ public class GatunServer {
       throw new IllegalStateException("Callback invoked with invalid session context");
     }
     boolean inBand = ctx.control.isSessionThread();
+    if (ctx.closed) {
+      throw new IllegalStateException(
+          "Python callback " + methodName + " was called after its client disconnected");
+    }
+    // Before anything is packed: the objects among the arguments would be registered for a
+    // client that will not take them
+    if (!callbackRegistry.containsKey(callbackId)) {
+      throw new IllegalStateException(
+          "Python callback " + methodName + " was called after it was unregistered");
+    }
 
     GatunEvents.CallbackEvent event =
         GatunEvents.beginCallback(ctx.quota.getSessionId(), callbackId, methodName, args.length);
@@ -2895,14 +2930,19 @@ public class GatunServer {
   /**
    * Build the request that asks Python to run a callback. The objects among the arguments are
    * registered for the session while packing and counted, because the client frees them like any
-   * other object; if the request cannot be sent they are dropped again.
+   * other object. Their IDs are added to {@code registered}, for a caller that finds it cannot
+   * deliver the request; if the request cannot be built they are dropped here.
    *
    * @param callId the call's ID on the callback connection; 0 in band
    */
   private ByteBuffer buildCallbackRequest(
-      long callId, long callbackId, String methodName, Object[] args, SessionContext ctx) {
+      long callId,
+      long callbackId,
+      String methodName,
+      Object[] args,
+      SessionContext ctx,
+      List<Long> registered) {
     FlatBufferBuilder builder = new FlatBufferBuilder(1024);
-    List<Long> registered = new ArrayList<>();
     List<Long> outer = packRecorder.get();
     packRecorder.set(registered);
     boolean built = false;
@@ -2947,6 +2987,7 @@ public class GatunServer {
       ctx.quota.countRegisteredObjects(registered.size());
       if (!built) {
         discardObjects(registered, ctx.sessionObjectIds, ctx.quota);
+        registered.clear();
       }
     }
   }
@@ -2987,7 +3028,8 @@ public class GatunServer {
     // The round trip uses the socket, so a cancel must not interrupt it
     ctx.control.beginSocketUse();
     try {
-      ByteBuffer resBuf = buildCallbackRequest(0, callbackId, methodName, args, ctx);
+      ByteBuffer resBuf =
+          buildCallbackRequest(0, callbackId, methodName, args, ctx, new ArrayList<>());
       int resSize = resBuf.remaining();
 
       // Write to response zone
@@ -3034,10 +3076,6 @@ public class GatunServer {
    */
   private Object callOnChannel(
       long callbackId, String methodName, Object[] args, SessionContext ctx) {
-    if (ctx.closed) {
-      throw new IllegalStateException(
-          "Python callback " + methodName + " was called after its client disconnected");
-    }
     CallbackChannel channel = ctx.callbackChannel;
     if (channel == null || channel.isClosed()) {
       throw new IllegalStateException(
@@ -3056,13 +3094,30 @@ public class GatunServer {
     SessionContext previous = sessionContext.get();
     sessionContext.set(ctx);
     long callId = channel.begin();
+    // Until Python answers, the session is in use: the idle reaper must leave it alone
+    ctx.channelCalls.incrementAndGet();
+    ctx.quota.touchActivity();
+    List<Long> registered = new ArrayList<>();
+    boolean sent = false;
     try {
-      channel.send(buildCallbackRequest(callId, callbackId, methodName, args, ctx));
+      ByteBuffer request =
+          buildCallbackRequest(callId, callbackId, methodName, args, ctx, registered);
+      if (ctx.closed) {
+        // The session ended while the arguments were being packed, and its cleanup may
+        // already have gone past the objects registered just now
+        throw new IOException("its client disconnected");
+      }
+      channel.send(request);
+      sent = true;
       ByteBuffer answer = channel.await(callId);
-      // A session that only receives callbacks is in use
-      ctx.quota.touchActivity();
       return readCallbackResult(Command.getRootAsCommand(answer));
     } catch (IOException e) {
+      // Nobody will free the arguments' objects if the request never went out, or if the
+      // session is over. Otherwise Python may hold them: it frees them, or the session's end
+      // does.
+      if (!sent || ctx.closed) {
+        discardObjects(registered, ctx.sessionObjectIds, ctx.quota);
+      }
       // Unchecked: the interface method the caller invoked declares no such exception, and a
       // proxy wraps what its method does not declare in one without a message
       throw new IllegalStateException(
@@ -3073,6 +3128,8 @@ public class GatunServer {
           "Interrupted while Python callback " + methodName + " was running", e);
     } finally {
       channel.end(callId);
+      ctx.channelCalls.decrementAndGet();
+      ctx.quota.touchActivity();
       if (previous == null) {
         sessionContext.remove();
       } else {
