@@ -62,12 +62,14 @@ from gatun.client import (
     _arrow_stream_size,
     _arrow_table_to_send,
     _build_free_command,
+    _callback_target,
     _channel_call_of,
     _close_shared_memory,
     _enter_callback,
     _exit_callback,
     _finish_arrow_from_object,
     _finish_arrow_to_object,
+    _finish_register_callback,
     _in_callback_of,
     _LRUCache,
     _nested_command,
@@ -315,7 +317,7 @@ class AsyncGatunClient(_ValueEncoder):
         self.response_offset = 0
 
         self._jvm: AsyncJVMView | None = None
-        self._callbacks: dict[int, Callable[..., Any]] = {}
+        self._callbacks: dict[int, Any] = {}
 
         # Where Java threads other than the one running a request call Python.
         # Opened with the first register_callback; see _ensure_callback_channel
@@ -724,9 +726,10 @@ class AsyncGatunClient(_ValueEncoder):
                 arg = resp.CallbackArgs(i)
                 args.append(self._unpack_value(arg.ValType(), arg.Val()))
 
-            callback_fn = self._callbacks.get(callback_id)
-            if callback_fn is None:
+            handler = self._callbacks.get(callback_id)
+            if handler is None:
                 raise LookupError(f"Callback {callback_id} not found")
+            callback_fn = _callback_target(handler, resp.CallbackMethod())
             if inspect.iscoroutinefunction(callback_fn):
                 pending = callback_fn(*args)
             else:
@@ -1346,27 +1349,21 @@ class AsyncGatunClient(_ValueEncoder):
         return cast(list["AsyncJavaObject"], await self._send_raw(builder.Output()))
 
     async def register_callback(
-        self, callback_fn: Callable[..., Any], interface_name: str
+        self, callback_fn: Any, interface_name: str
     ) -> AsyncJavaObject:
-        """Register a Python callable as a Java interface implementation.
+        """Register a Python callable, or object, as a Java interface implementation.
 
-        The callback can be either a sync function or an async coroutine.
+        The callback can be either a sync function or an async coroutine. For
+        an interface with several methods it can be an object that is not
+        callable: each call goes to its method of the same name, sync or async.
         """
+        command = _finish_register_callback(
+            flatbuffers.Builder(256), interface_name, callback_fn
+        )
         # Java may call this callback from any thread from here on
         await self._ensure_callback_channel()
 
-        builder = flatbuffers.Builder(256)
-        interface_off = builder.CreateString(interface_name)
-
-        Cmd.CommandStart(builder)
-        Cmd.CommandAddAction(builder, Act.Action.RegisterCallback)
-        Cmd.CommandAddTargetName(builder, interface_off)
-        cmd = Cmd.CommandEnd(builder)
-        builder.Finish(cmd)
-
-        result: AsyncJavaObject = cast(
-            AsyncJavaObject, await self._send_raw(builder.Output())
-        )
+        result: AsyncJavaObject = cast(AsyncJavaObject, await self._send_raw(command))
 
         # Store the callback function
         callback_id = result.object_id
@@ -1374,8 +1371,21 @@ class AsyncGatunClient(_ValueEncoder):
 
         return result
 
-    async def unregister_callback(self, callback_id: int) -> None:
-        """Unregister a previously registered callback."""
+    async def unregister_callback(self, callback: AsyncJavaObject | int) -> None:
+        """Unregister a previously registered callback.
+
+        Args:
+            callback: What register_callback() returned, or any other handle
+                on the same Java object. Or the object ID of one, while the
+                handle is alive.
+        """
+        # `callback` stays referenced until the server has answered; see the
+        # sync client
+        callback_id = (
+            callback.object_id
+            if isinstance(callback, (JavaObject, AsyncJavaObject))
+            else callback
+        )
         builder = flatbuffers.Builder(64)
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.UnregisterCallback)
@@ -1384,7 +1394,7 @@ class AsyncGatunClient(_ValueEncoder):
         builder.Finish(cmd)
 
         try:
-            await self._send_raw(builder.Output())
+            unregistered = await self._send_raw(builder.Output())
         except BaseException:
             # A request that was refused must not leave Java calling a function
             # that is gone. On a client that is closed or dead the session is
@@ -1393,6 +1403,9 @@ class AsyncGatunClient(_ValueEncoder):
                 self._callbacks.pop(callback_id, None)
             raise
         self._callbacks.pop(callback_id, None)
+        # The callback's own ID, when it was named by another handle
+        if isinstance(unregistered, int):
+            self._callbacks.pop(unregistered, None)
 
     async def reflect(self, full_name: str) -> str:
         """Ask the server what a dotted name is.

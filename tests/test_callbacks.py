@@ -20,6 +20,7 @@ from gatun import (
     aconnect,
     connect,
 )
+from gatun.async_client import AsyncGatunClient
 from gatun.callback_channel import AsyncChannelCall
 from gatun.client import GatunClient
 
@@ -368,6 +369,44 @@ class TestCallbackCleanup:
 
         # Callback should be removed from client's registry
         assert callback_id not in client._callbacks
+
+    def test_unregister_through_another_handle(self, client):
+        """Read back out of Java, the proxy has another object ID."""
+        comparator = client.register_callback(lambda a, b: 0, "java.util.Comparator")
+        holder = client.jvm.java.util.ArrayList()
+        holder.add(comparator)
+        again = holder.get(0)
+        assert again.object_id != comparator.object_id
+
+        client.unregister_callback(again.object_id)
+
+        assert comparator.object_id not in client._callbacks
+        words = client.jvm.java.util.ArrayList(["b", "a"])
+        with pytest.raises(JavaException, match="after it was unregistered"):
+            client.jvm.java.util.Collections.sort(words, comparator)
+
+    def test_unregister_through_a_handle_that_lives_for_the_call_only(self, client):
+        """A handle that dies is queued for release, and the queue is sent
+        ahead of the next command."""
+        comparator = client.register_callback(lambda a, b: 0, "java.util.Comparator")
+        holder = client.jvm.java.util.ArrayList()
+        holder.add(comparator)
+
+        client.unregister_callback(holder.get(0))
+
+        assert comparator.object_id not in client._callbacks
+        words = client.jvm.java.util.ArrayList(["b", "a"])
+        with pytest.raises(JavaException, match="after it was unregistered"):
+            client.jvm.java.util.Collections.sort(words, comparator)
+
+    def test_unregister_something_that_is_no_callback(self, client):
+        comparator = client.register_callback(lambda a, b: 0, "java.util.Comparator")
+        words = client.jvm.java.util.ArrayList(["b", "a"])
+
+        client.unregister_callback(words.object_id)
+
+        assert comparator.object_id in client._callbacks
+        client.jvm.java.util.Collections.sort(words, comparator)
 
 
 class TestReentrancyDetection:
@@ -2621,6 +2660,188 @@ class TestAsyncArrowInsideChannelCallbacks:
         release.set()
 
         assert (await asyncio.wait_for(started[0], 5)).equals(table)
+
+
+class TestCallbackObjects:
+    """An object that is not callable implements an interface with several
+    methods: each call goes to its method of the same name."""
+
+    class Countdown:
+        def __init__(self, start, client=None):
+            self.left = start
+            self.client = client
+            self.came_on_the_callback_connection = []
+
+        def hasMoreElements(self):
+            if self.client is not None:
+                call = gatun.client._channel_call_of(self.client)
+                self.came_on_the_callback_connection.append(call is not None)
+            return self.left > 0
+
+        def nextElement(self):
+            self.left -= 1
+            return self.left
+
+    def test_each_call_goes_to_the_method_of_its_name(self, client):
+        enumeration = client.register_callback(
+            self.Countdown(3), "java.util.Enumeration"
+        )
+
+        assert client.jvm.java.util.Collections.list(enumeration) == [2, 1, 0]
+
+    def test_from_another_thread(self, other_thread_classes):
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            socket_timeout=10,
+        )
+        try:
+            countdown = self.Countdown(2, client)
+            enumeration = client.register_callback(countdown, "java.util.Enumeration")
+            drain = client.register_callback(
+                lambda: client.jvm.java.util.Collections.list(enumeration),
+                "java.util.function.Supplier",
+            )
+
+            # The Java thread that runs the supplier's call is the one that
+            # calls the enumeration
+            assert client.jvm.OtherThread.call(drain) == [1, 0]
+            assert countdown.came_on_the_callback_connection == [True] * 3
+        finally:
+            client.close()
+
+    def test_method_the_object_lacks(self, client):
+        class Half:
+            def hasMoreElements(self):
+                return True
+
+        enumeration = client.register_callback(Half(), "java.util.Enumeration")
+
+        with pytest.raises(JavaException, match=r"Half has no method nextElement\(\)"):
+            client.jvm.java.util.Collections.list(enumeration)
+
+    def test_object_overrides_a_default_method(self, client):
+        """Iterator.remove() has a default body, which throws."""
+
+        class Numbers:
+            def __init__(self):
+                self.left = [1, 2, 3]
+                self.removed = 0
+
+            def hasNext(self):
+                return bool(self.left)
+
+            def next(self):
+                return self.left.pop(0)
+
+            def remove(self):
+                self.removed += 1
+
+        numbers = Numbers()
+        iterator = client.register_callback(numbers, "java.util.Iterator")
+
+        assert iterator.next() == 1
+        iterator.remove()
+
+        assert numbers.removed == 1
+
+    def test_default_method_the_object_lacks_runs_in_java(self, client):
+        class ByLength:
+            def compare(self, a, b):
+                return len(a) - len(b)
+
+        by_length = client.register_callback(ByLength(), "java.util.Comparator")
+        words = client.jvm.java.util.ArrayList(["bb", "a", "ccc"])
+
+        client.jvm.java.util.Collections.sort(words, by_length.reversed())
+
+        assert list(words) == ["ccc", "bb", "a"]
+
+    def test_object_with_nothing_to_call_is_refused(self, client):
+        class Empty:
+            size = 3
+
+            def _private(self):
+                return None
+
+        with pytest.raises(TypeError, match="Empty cannot be a callback"):
+            client.register_callback(Empty(), "java.lang.Runnable")
+        assert client._callbacks == {}
+
+    def test_sync_client_refuses_a_coroutine_function(self, client):
+        """It would call it and send the coroutine back unawaited."""
+
+        async def compare(a, b):
+            return 0
+
+        class Listener:
+            async def run(self):
+                return None
+
+        with pytest.raises(TypeError, match="compare is a coroutine function"):
+            client.register_callback(compare, "java.util.Comparator")
+        with pytest.raises(TypeError, match="Listener.run is a coroutine function"):
+            client.register_callback(Listener(), "java.lang.Runnable")
+        assert client._callbacks == {}
+
+    def test_callable_answers_every_method(self, client):
+        answers = iter([True, "a", True, "b", False])
+        enumeration = client.register_callback(
+            lambda: next(answers), "java.util.Enumeration"
+        )
+
+        assert client.jvm.java.util.Collections.list(enumeration) == ["a", "b"]
+
+    async def test_async_client_sync_and_async_methods(self, java_gateway):
+        class Countdown:
+            def __init__(self):
+                self.left = 3
+
+            def hasMoreElements(self):
+                return self.left > 0
+
+            async def nextElement(self):
+                await asyncio.sleep(0)
+                self.left -= 1
+                return self.left
+
+        async with AsyncGatunClient(java_gateway.socket_path) as client:
+            enumeration = await client.register_callback(
+                Countdown(), "java.util.Enumeration"
+            )
+
+            assert await client.jvm.java.util.Collections.list(enumeration) == [
+                2,
+                1,
+                0,
+            ]
+
+    async def test_async_client_object_overrides_a_default_method(self, java_gateway):
+        class Numbers:
+            removed = 0
+
+            def hasNext(self):
+                return True
+
+            def next(self):
+                return 1
+
+            async def remove(self):
+                await asyncio.sleep(0)
+                self.removed += 1
+
+        numbers = Numbers()
+        async with AsyncGatunClient(java_gateway.socket_path) as client:
+            iterator = await client.register_callback(numbers, "java.util.Iterator")
+            await iterator.remove()
+
+            assert numbers.removed == 1
+            # Through a handle that lives for this one call only
+            holder = await client.jvm.java.util.ArrayList()
+            await holder.add(iterator)
+            await client.unregister_callback(await holder.get(0))
+            assert client._callbacks == {}
 
 
 class TestCallbackOwnership:

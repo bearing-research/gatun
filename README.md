@@ -291,6 +291,26 @@ client.jvm.java.util.Collections.sort(arr, comparator)
 # arr is now [1, 2, 3]
 ```
 
+An interface with several methods takes an object instead of a function. Each call goes to the object's method of the same name. That includes a default method of the interface, if the object has a method for it; the other default methods run in Java:
+
+```python
+class Countdown:
+    def __init__(self, start):
+        self.left = start
+
+    def hasMoreElements(self):
+        return self.left > 0
+
+    def nextElement(self):
+        self.left -= 1
+        return self.left
+
+enumeration = client.register_callback(Countdown(3), "java.util.Enumeration")
+client.jvm.java.util.Collections.list(enumeration)  # [2, 1, 0]
+```
+
+A function, or any other callable, answers every method of its interface.
+
 Async callbacks work too:
 
 ```python
@@ -869,6 +889,11 @@ result = bridge.call_static("java.lang.Math", "max", 10, 20)
 arr = bridge.new_array("java.lang.String", 3)
 bridge.array_set(arr, 0, "hello")
 bridge.array_get(arr, 0)  # "hello"
+
+# Callbacks: a Python function (or object) as a Java interface
+by_length = bridge.register_callback(lambda a, b: len(a) - len(b), "java.util.Comparator")
+bridge.call_static("java.util.Collections", "sort", obj, by_length)
+bridge.unregister_callback(by_length)
 
 bridge.close()
 ```

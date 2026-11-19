@@ -275,6 +275,15 @@ async def async_compare(a, b):
 comparator = await async_client.register_callback(async_compare, "java.util.Comparator")
 ```
 
+A callable answers every abstract method of its interface. An object that is not callable answers each call with its method of the same name (`_callback_target` in `client.py`, from `Response.callback_method`), which is how an interface with several methods is implemented. Registration sends the object's method names (`Command.callback_methods`, `_callback_methods`), and the proxy sends a default method to Python only if its name is among them; the sync client refuses coroutine functions at registration:
+```python
+class Listener:
+    def onQueryStarted(self, event): ...
+    def onQueryProgress(self, event): ...
+
+listener = client.register_callback(Listener(), "com.example.QueryListener")
+```
+
 **Important: Reentrancy Policy**
 
 A callback made by the thread that is running the client's request cannot call Java. Attempting to raises `ReentrancyError`:
@@ -303,7 +312,7 @@ Workarounds:
 - Use pure Python logic in callbacks (no Java calls)
 - Pre-create any Java objects you need before the callback is invoked
 
-The policy above is for callbacks made by the thread that is running the request, which travel in band. Default methods of the interface (`Comparator.reversed()`) run in Java and never reach Python.
+The policy above is for callbacks made by the thread that is running the request, which travel in band. Default methods of the interface (`Comparator.reversed()`) run in Java and never reach Python, unless the handler is an object with a method of that name.
 
 **Callbacks from other threads: the callback connection**
 
@@ -825,6 +834,11 @@ length = bridge.array_length(arr)              # Get length
 
 # Type checking
 bridge.is_instance_of(obj, "java.util.List")  # True
+
+# Callbacks (a callable, or an object with the interface's method names).
+# Any reference to the callback object unregisters it.
+comparator = bridge.register_callback(lambda a, b: a - b, "java.util.Comparator")
+bridge.unregister_callback(comparator)
 ```
 
 ### PySpark Usage

@@ -389,6 +389,142 @@ class BridgeContractTests:
         assert bridge.call(obj, "size") == 100
 
     # ==========================================================================
+    # Callbacks (8 tests)
+    # ==========================================================================
+
+    def test_callback_function(self, bridge: BridgeAdapter):
+        """A function implements an interface with one method."""
+        longest_first = bridge.register_callback(
+            lambda a, b: len(b) - len(a), "java.util.Comparator"
+        )
+        words = bridge.new("java.util.ArrayList")
+        for word in ("bb", "a", "ccc"):
+            bridge.call(words, "add", word)
+
+        bridge.call_static("java.util.Collections", "sort", words, longest_first)
+
+        assert [bridge.call(words, "get", i) for i in range(3)] == ["ccc", "bb", "a"]
+
+    def test_callback_returns_jvm_ref(self, bridge: BridgeAdapter):
+        """The callback is a JVM object like any other."""
+        comparator = bridge.register_callback(lambda a, b: 0, "java.util.Comparator")
+        assert bridge.is_instance_of(comparator, "java.util.Comparator")
+
+    def test_callback_object_with_named_methods(self, bridge: BridgeAdapter):
+        """An object implements an interface with several methods."""
+
+        class Countdown:
+            def __init__(self):
+                self.left = 3
+
+            def hasMoreElements(self):
+                return self.left > 0
+
+            def nextElement(self):
+                self.left -= 1
+                return self.left
+
+        enumeration = bridge.register_callback(Countdown(), "java.util.Enumeration")
+
+        assert bridge.call_static("java.util.Collections", "list", enumeration) == [
+            2,
+            1,
+            0,
+        ]
+
+    def test_callback_object_overrides_default_method(self, bridge: BridgeAdapter):
+        """A default method the object has a method for is the object's to
+        answer; Iterator.remove()'s own body throws."""
+
+        class Numbers:
+            removed = 0
+
+            def hasNext(self):
+                return True
+
+            def next(self):
+                return 1
+
+            def remove(self):
+                self.removed += 1
+
+        numbers = Numbers()
+        iterator = bridge.register_callback(numbers, "java.util.Iterator")
+
+        bridge.call(iterator, "remove")
+
+        assert numbers.removed == 1
+
+    def test_callback_object_without_the_method(self, bridge: BridgeAdapter):
+        """The JVM caller gets an exception that names the missing method."""
+
+        class Half:
+            def hasMoreElements(self):
+                return True
+
+        enumeration = bridge.register_callback(Half(), "java.util.Enumeration")
+
+        with pytest.raises(JavaException, match="nextElement"):
+            bridge.call_static("java.util.Collections", "list", enumeration)
+
+    def test_callback_exception(self, bridge: BridgeAdapter):
+        """An exception in the callback is an exception in its JVM caller."""
+
+        def compare(a, b):
+            raise ValueError("cannot compare these")
+
+        comparator = bridge.register_callback(compare, "java.util.Comparator")
+        words = bridge.new("java.util.ArrayList")
+        bridge.call(words, "add", "b")
+        bridge.call(words, "add", "a")
+
+        with pytest.raises(JavaException, match="cannot compare these"):
+            bridge.call_static("java.util.Collections", "sort", words, comparator)
+
+    def test_unregister_callback(self, bridge: BridgeAdapter):
+        """An unregistered callback fails in the JVM instead of reaching Python."""
+        calls = []
+
+        def compare(a, b):
+            calls.append((a, b))
+            return 0
+
+        comparator = bridge.register_callback(compare, "java.util.Comparator")
+        words = bridge.new("java.util.ArrayList")
+        bridge.call(words, "add", "b")
+        bridge.call(words, "add", "a")
+        bridge.call_static("java.util.Collections", "sort", words, comparator)
+        seen = len(calls)
+        assert seen > 0
+
+        bridge.unregister_callback(comparator)
+
+        with pytest.raises(JavaException):
+            bridge.call_static("java.util.Collections", "sort", words, comparator)
+        assert len(calls) == seen
+
+    def test_unregister_callback_read_back_from_the_jvm(self, bridge: BridgeAdapter):
+        """Any reference to the callback object unregisters it."""
+        calls = []
+
+        def compare(a, b):
+            calls.append((a, b))
+            return 0
+
+        comparator = bridge.register_callback(compare, "java.util.Comparator")
+        holder = bridge.new("java.util.ArrayList")
+        bridge.call(holder, "add", comparator)
+        words = bridge.new("java.util.ArrayList")
+        bridge.call(words, "add", "b")
+        bridge.call(words, "add", "a")
+
+        bridge.unregister_callback(bridge.call(holder, "get", 0))
+
+        with pytest.raises(JavaException):
+            bridge.call_static("java.util.Collections", "sort", words, comparator)
+        assert calls == []
+
+    # ==========================================================================
     # JVM View (6 tests)
     # ==========================================================================
 

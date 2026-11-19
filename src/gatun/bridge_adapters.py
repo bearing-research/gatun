@@ -219,6 +219,25 @@ class GatunAdapter(BridgeAdapter):
         except GatunJavaException as e:
             raise self._convert_exception(e) from None
 
+    # === Callbacks ===
+
+    def register_callback(self, handler: Any, interface: str) -> JVMRef:
+        """Make a JVM object that implements a Java interface in Python."""
+        try:
+            assert self._client is not None, "Bridge is closed"
+            result: JVMRef = self._client.register_callback(handler, interface)
+            return result
+        except GatunJavaException as e:
+            raise self._convert_exception(e) from None
+
+    def unregister_callback(self, ref: JVMRef) -> None:
+        """Stop serving a callback and let go of its handler."""
+        try:
+            assert self._client is not None, "Bridge is closed"
+            self._client.unregister_callback(cast(Any, ref))
+        except GatunJavaException as e:
+            raise self._convert_exception(e) from None
+
     # === JVM View ===
 
     @property
