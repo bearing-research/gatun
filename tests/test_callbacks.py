@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import glob
+import os
 import threading
 import time
 import weakref
@@ -11,7 +12,14 @@ import pyarrow as pa
 import pytest
 
 import gatun.client
-from gatun import DeadConnectionError, JavaException, aconnect, connect
+from gatun import (
+    DeadConnectionError,
+    JavaException,
+    PayloadTooLargeError,
+    StaleArenaError,
+    aconnect,
+    connect,
+)
 from gatun.callback_channel import AsyncChannelCall
 from gatun.client import GatunClient
 
@@ -401,6 +409,30 @@ class TestReentrancyDetection:
         assert nested_call_attempted[0], "Callback was not invoked"
         assert error_caught[0] is not None, "ReentrancyError was not caught in callback"
         assert "ReentrancyError" in str(excinfo.value)
+
+    def test_arrow_transfer_is_refused_without_waiting_for_the_channel(self, client):
+        """The request that holds the channel is the one waiting for the
+        callback, so waiting for it could only end with the callback's timeout."""
+        waited = []
+
+        def compare(a, b):
+            started = time.monotonic()
+            try:
+                client.arrow_to_java(pa.table({"x": [1]}))
+            finally:
+                waited.append(time.monotonic() - started)
+            return 0
+
+        comparator = client.register_callback(compare, "java.util.Comparator")
+        arr = client.create_object("java.util.ArrayList")
+        arr.add("b")
+        arr.add("a")
+
+        with pytest.raises(JavaException, match="ReentrancyError"):
+            client.invoke_static_method(
+                "java.util.Collections", "sort", arr, comparator
+            )
+        assert waited[0] < 5
 
     def test_nested_invoke_method_raises_reentrancy_error(self, client):
         """Test that invoke_method from callback also raises ReentrancyError."""
@@ -1579,20 +1611,21 @@ class TestJavaCallsInsideChannelCallbacks:
         finally:
             client.close()
 
-    def test_arrow_transfer_is_refused_with_the_reason(self, client):
-        """It needs the client's shared memory, which belongs to its own channel."""
+    def test_transfer_into_the_payload_zone_is_refused_with_the_reason(self, client):
+        """The zone belongs to the client's own channel. Only tables as Java
+        objects have another way."""
         table = pa.table({"x": [1, 2, 3]})
         supplier = client.register_callback(
-            lambda: client.arrow_to_java(table), "java.util.function.Supplier"
+            lambda: client.send_arrow_table(table), "java.util.function.Supplier"
         )
 
         with pytest.raises(
             JavaException,
-            match=r"ReentrancyError: arrow_to_java\(\) cannot be used inside a callback",
+            match=r"ReentrancyError: send_arrow_table\(\) cannot be used inside a callback",
         ):
             client.jvm.OtherThread.call(supplier)
         # Outside the callback it works as ever
-        assert client.arrow_to_java(table).getRowCount() == 3
+        assert client.send_arrow_table(table) == "Received 3 rows"
 
     def test_batch_is_refused_with_the_reason(self, client):
         def batch():
@@ -1981,21 +2014,22 @@ class TestAsyncJavaCallsInsideChannelCallbacks:
 
         assert await client.jvm.OtherThread.call(supplier) == [2, 4, 6]
 
-    async def test_arrow_transfer_is_refused_with_the_reason(self, client):
+    async def test_transfer_into_the_payload_zone_is_refused_with_the_reason(
+        self, client
+    ):
         table = pa.table({"x": [1, 2, 3]})
 
         async def send():
-            await client.arrow_to_java(table)
+            await client.send_arrow_table(table)
 
         supplier = await client.register_callback(send, "java.util.function.Supplier")
 
         with pytest.raises(
             JavaException,
-            match="ReentrancyError: ArrowToObject cannot be used inside a callback",
+            match="ReentrancyError: SendArrowBatch cannot be used inside a callback",
         ):
             await client.jvm.OtherThread.call(supplier)
-        root = await client.arrow_to_java(table)
-        assert await root.getRowCount() == 3
+        assert await client.send_arrow_table(table) == "Received 3 rows"
 
     async def test_task_that_outlives_its_callback_can_still_call_java(self, client):
         """Java has stopped waiting, so the call takes the client's own channel."""
@@ -2160,6 +2194,433 @@ class TestAsyncJavaCallsInsideChannelCallbacks:
         with pytest.raises(DeadConnectionError):
             await client.unregister_callback(callback_id)
         assert callback_id not in client._callbacks
+
+
+class TestArrowInsideChannelCallbacks:
+    """A callback that came on the callback connection moves Arrow tables
+    through shared memory of its own call: the client's belongs to its
+    channel, which is busy with the request that is waiting for the callback."""
+
+    @pytest.fixture
+    def client(self, other_thread_classes):
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            socket_timeout=10,
+        )
+        yield client
+        client.close()
+
+    @staticmethod
+    def _call_memory_files(client):
+        return glob.glob(f"{client.socket_path}.*.call*.shm")
+
+    def test_table_to_java_and_back(self, client):
+        table = pa.table({"x": list(range(1000)), "s": [str(i) for i in range(1000)]})
+        seen = []
+
+        def roundtrip():
+            root = client.arrow_to_java(table)
+            seen.append(client.arrow_from_java(root))
+            return root.getRowCount()
+
+        supplier = client.register_callback(roundtrip, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(supplier) == 1000
+        assert seen[0].equals(table)
+
+    def test_while_the_client_is_in_another_request(self, client):
+        table = pa.table({"x": [1, 2, 3]})
+        seen = []
+
+        def send():
+            seen.append((client.arrow_to_java(table).getRowCount(), time.monotonic()))
+
+        task = client.register_callback(send, "java.lang.Runnable")
+        client.jvm.OtherThread.later(task, 100)
+
+        client.jvm.OtherThread.pause(1500)
+        ended = time.monotonic()
+
+        assert [rows for rows, _ in seen] == [3]
+        assert seen[0][1] < ended - 0.5, "the transfer waited for the request to end"
+
+    def test_memory_file_gone_before_the_client_opens_it(self, client, monkeypatch):
+        """Java stopped waiting for the callback right after it said where the
+        memory is, and removed it. The table takes the client's channel, as
+        it does whenever the call is over."""
+        send_nested = client._send_nested
+
+        def lose_the_file(call, data):
+            routed, result = send_nested(call, data)
+            if isinstance(result, str) and result.endswith(".shm"):
+                os.remove(result)
+            return routed, result
+
+        monkeypatch.setattr(client, "_send_nested", lose_the_file)
+        seen = []
+
+        def send():
+            seen.append(client.arrow_to_java(pa.table({"x": [1, 2, 3]})))
+
+        task = client.register_callback(send, "java.lang.Runnable")
+        client.jvm.OtherThread.later(task, 0)
+
+        root = _eventually(lambda: seen[0] if seen else None)
+        assert root.getRowCount() == 3
+
+    def test_memory_file_gone_between_two_transfers(self, client):
+        """Java stopped waiting for the callback after its first transfer, and
+        removed the memory. Nothing more is written there: the server keeps no
+        free space for it any longer."""
+        seen = []
+
+        def send():
+            first = client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
+            memory = gatun.client._channel_call_of(client).memory
+            before = bytes(memory.shm[:512])
+            os.remove(memory.path)
+            second = client.arrow_to_java(pa.table({"x": list(range(1000))}))
+            seen.append((first, second, bytes(memory.shm[:512]) == before))
+
+        task = client.register_callback(send, "java.lang.Runnable")
+        client.jvm.OtherThread.later(task, 0)
+
+        first, second, untouched = _eventually(lambda: seen[0] if seen else None)
+        assert (first.getRowCount(), second.getRowCount()) == (3, 1000)
+        assert untouched
+
+    def test_call_lets_go_of_its_memory_when_the_callback_returns(self, client):
+        """A thread or task the callback started keeps the call reachable."""
+        calls = []
+
+        def send():
+            client.arrow_to_java(pa.table({"x": [1]}))
+            call = gatun.client._channel_call_of(client)
+            calls.append((call, call.memory is not None))
+
+        task = client.register_callback(send, "java.lang.Runnable")
+        client.jvm.OtherThread.later(task, 0)
+
+        _eventually(lambda: True if calls and calls[0][0].memory is None else None)
+        assert calls[0][1]
+
+    def test_callbacks_at_once_each_have_their_own_memory(self, client):
+        everyone_holds_a_view = threading.Barrier(4, timeout=10)
+
+        def read_in_place(index):
+            root = client.arrow_to_java(pa.table({"x": [index] * 10_000}))
+            view = client.arrow_from_java(root, copy=False)
+            everyone_holds_a_view.wait()
+            return view.to_pydict()["x"] == [index] * 10_000
+
+        function = client.register_callback(
+            read_in_place, "java.util.function.Function"
+        )
+
+        assert client.jvm.OtherThread.applyAll(function, 4) == [True] * 4
+
+    def test_view_ends_with_the_callbacks_next_transfer(self, client):
+        def read():
+            root = client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
+            view = client.arrow_from_java(root, copy=False)
+            first = view.to_pydict()["x"]
+            client.arrow_to_java(pa.table({"x": [4]}))
+            try:
+                view.to_pydict()
+            except StaleArenaError:
+                return first
+            return "still readable"
+
+        supplier = client.register_callback(read, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(supplier) == [1, 2, 3]
+
+    def test_view_outlives_the_callback(self, client):
+        """Nothing writes to a call's memory once the call is over."""
+        table = pa.table({"x": list(range(5000))})
+        views = []
+
+        def read():
+            views.append(
+                client.arrow_from_java(client.arrow_to_java(table), copy=False)
+            )
+
+        supplier = client.register_callback(read, "java.util.function.Supplier")
+        client.jvm.OtherThread.call(supplier)
+
+        # A transfer on the client's own channel uses other memory
+        assert client.arrow_to_java(pa.table({"x": [0] * 5000})).getRowCount() == 5000
+        assert views[0].table.equals(table)
+
+    def test_memory_file_lasts_as_long_as_the_call(self, client):
+        during = []
+
+        def send():
+            during.append(len(self._call_memory_files(client)))
+            client.arrow_to_java(pa.table({"x": [1]}))
+            during.append(len(self._call_memory_files(client)))
+            client.arrow_to_java(pa.table({"x": [2]}))
+            during.append(len(self._call_memory_files(client)))
+
+        supplier = client.register_callback(send, "java.util.function.Supplier")
+        client.jvm.OtherThread.call(supplier)
+
+        # Made by the first transfer, and used again by the second
+        assert during == [0, 1, 1]
+        assert self._call_memory_files(client) == []
+
+    def test_memory_file_is_removed_when_the_client_goes_away(self, client):
+        owner = client
+        victim = GatunClient(owner.socket_path)
+        assert victim.connect()
+        sent = threading.Event()
+        hold = threading.Event()
+
+        def send():
+            victim.arrow_to_java(pa.table({"x": [1]}))
+            sent.set()
+            hold.wait(10)
+
+        try:
+            task = victim.register_callback(send, "java.lang.Runnable")
+            victim.jvm.OtherThread.later(task, 0)
+            assert sent.wait(10)
+            assert len(self._call_memory_files(owner)) == 1
+        finally:
+            victim.close()
+            hold.set()
+
+        assert _eventually(lambda: None if self._call_memory_files(owner) else True)
+
+    def test_table_larger_than_the_memory(self, other_thread_classes):
+        client = connect(
+            memory="192KB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            socket_timeout=10,
+        )
+        try:
+
+            def send(rows):
+                table = pa.table({"x": pa.array(range(rows), pa.int64())})
+                try:
+                    return client.arrow_to_java(table).getRowCount()
+                except PayloadTooLargeError as e:
+                    return f"at most {e.max_size}"
+
+            function = client.register_callback(send, "java.util.function.Function")
+
+            # All of a call's memory is payload: more than the client's own zone
+            # holds, with its command and response zones taken out
+            assert client.jvm.OtherThread.apply(function, 12_000) == 12_000
+            assert send(12_000) == "at most 65536"
+            assert client.jvm.OtherThread.apply(function, 50_000) == "at most 196608"
+        finally:
+            client.close()
+
+    def test_table_too_large_to_fetch(self, other_thread_classes):
+        client = connect(
+            memory="192KB",
+            classpath=[other_thread_classes],
+            allowed_classes=[
+                "OtherThread",
+                "org.apache.arrow.vector.util.VectorSchemaRootAppender",
+            ],
+            socket_timeout=10,
+        )
+        try:
+            caught = []
+
+            def fetch(root):
+                try:
+                    client.arrow_from_java(root)
+                except PayloadTooLargeError:
+                    caught.append("too large")
+                # The call and its memory are still good
+                return client.arrow_from_java(root.slice(0, 10)).num_rows
+
+            function = client.register_callback(fetch, "java.util.function.Function")
+            piece = pa.table({"x": pa.array(range(4000), pa.int64())})
+            root = client.arrow_to_java(piece)
+            Appender = client.jvm.org.apache.arrow.vector.util.VectorSchemaRootAppender
+            for _ in range(8):
+                Appender.append(root, client.arrow_to_java(piece))
+
+            assert root.getRowCount() == 36_000
+            assert client.jvm.OtherThread.apply(function, root) == 10
+            assert caught == ["too large"]
+        finally:
+            client.close()
+
+    def test_after_the_callback_has_timed_out(self, other_thread_classes):
+        """Java has stopped waiting, so the table takes the client's own channel."""
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            callback_timeout=0.4,
+            socket_timeout=10,
+        )
+        try:
+            table = pa.table({"x": [1, 2, 3]})
+            done = []
+
+            def slow():
+                time.sleep(1.0)
+                done.append(client.arrow_from_java(client.arrow_to_java(table)))
+
+            supplier = client.register_callback(slow, "java.util.function.Supplier")
+            with pytest.raises(JavaException, match="CallbackTimeoutError"):
+                client.jvm.OtherThread.call(supplier)
+
+            assert _eventually(lambda: done or None)[0].equals(table)
+            assert self._call_memory_files(client) == []
+        finally:
+            client.close()
+
+    def test_tables_made_in_callbacks_are_counted_and_released(self, client):
+        def live_objects():
+            report = client.get_metrics()
+            return int(report.split("current_objects:")[1].split()[0])
+
+        made = []
+
+        def send():
+            made.append(client.arrow_to_java(pa.table({"x": [1, 2, 3]})))
+
+        supplier = client.register_callback(send, "java.util.function.Supplier")
+        before = live_objects()
+        client.jvm.OtherThread.call(supplier)
+        assert live_objects() == before + 1
+
+        made.clear()
+        gc.collect()
+        assert (
+            _eventually(lambda: live_objects() if live_objects() <= before else None)
+            == before
+        )
+
+
+class TestAsyncArrowInsideChannelCallbacks:
+    @pytest.fixture
+    async def client(self, other_thread_classes):
+        client = await aconnect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            socket_timeout=10,
+        )
+        yield client
+        await client.close()
+
+    async def test_table_to_java_and_back(self, client):
+        table = pa.table({"x": list(range(1000)), "s": [str(i) for i in range(1000)]})
+        seen = []
+
+        async def roundtrip():
+            root = await client.arrow_to_java(table)
+            seen.append(await client.arrow_from_java(root))
+            return await root.getRowCount()
+
+        supplier = await client.register_callback(
+            roundtrip, "java.util.function.Supplier"
+        )
+
+        assert await client.jvm.OtherThread.call(supplier) == 1000
+        assert seen[0].equals(table)
+        assert glob.glob(f"{client.socket_path}.*.call*.shm") == []
+
+    async def test_memory_file_gone_before_the_client_opens_it(
+        self, client, monkeypatch
+    ):
+        send_nested = client._send_nested
+
+        async def lose_the_file(call, data):
+            routed, result = await send_nested(call, data)
+            if isinstance(result, str) and result.endswith(".shm"):
+                os.remove(result)
+            return routed, result
+
+        monkeypatch.setattr(client, "_send_nested", lose_the_file)
+        seen = asyncio.get_running_loop().create_future()
+
+        async def send():
+            seen.set_result(await client.arrow_to_java(pa.table({"x": [1, 2, 3]})))
+
+        task = await client.register_callback(send, "java.lang.Runnable")
+        await client.jvm.OtherThread.later(task, 0)
+
+        root = await asyncio.wait_for(seen, 10)
+        assert await root.getRowCount() == 3
+
+    async def test_memory_file_gone_between_two_transfers(self, client):
+        seen = asyncio.get_running_loop().create_future()
+
+        async def send():
+            first = await client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
+            memory = gatun.client._channel_call_of(client).memory
+            before = bytes(memory.shm[:512])
+            os.remove(memory.path)
+            second = await client.arrow_to_java(pa.table({"x": list(range(1000))}))
+            seen.set_result((first, second, bytes(memory.shm[:512]) == before))
+
+        task = await client.register_callback(send, "java.lang.Runnable")
+        await client.jvm.OtherThread.later(task, 0)
+
+        first, second, untouched = await asyncio.wait_for(seen, 10)
+        assert (await first.getRowCount(), await second.getRowCount()) == (3, 1000)
+        assert untouched
+
+    async def test_transfers_made_together_inside_one_callback(self, client):
+        """They share the call's memory, one after the other."""
+
+        async def roundtrip(n):
+            table = pa.table({"x": [n] * 5000})
+            root = await client.arrow_to_java(table)
+            return (await client.arrow_from_java(root)).equals(table)
+
+        async def together():
+            return list(await asyncio.gather(*(roundtrip(n) for n in range(6))))
+
+        supplier = await client.register_callback(
+            together, "java.util.function.Supplier"
+        )
+
+        assert await client.jvm.OtherThread.call(supplier) == [True] * 6
+
+    async def test_callbacks_at_once_each_have_their_own_memory(self, client):
+        async def roundtrip(index):
+            table = pa.table({"x": [index] * 10_000})
+            root = await client.arrow_to_java(table)
+            await asyncio.sleep(0.05)
+            return (await client.arrow_from_java(root)).equals(table)
+
+        function = await client.register_callback(
+            roundtrip, "java.util.function.Function"
+        )
+
+        assert await client.jvm.OtherThread.applyAll(function, 4) == [True] * 4
+
+    async def test_task_that_outlives_its_callback(self, client):
+        """Java has stopped waiting, so the table takes the client's own channel."""
+        table = pa.table({"x": [1, 2, 3]})
+        release = asyncio.Event()
+        started = []
+
+        async def later():
+            await release.wait()
+            return await client.arrow_from_java(await client.arrow_to_java(table))
+
+        async def start():
+            started.append(asyncio.create_task(later()))
+
+        supplier = await client.register_callback(start, "java.util.function.Supplier")
+        await client.jvm.OtherThread.call(supplier)
+        release.set()
+
+        assert (await asyncio.wait_for(started[0], 5)).equals(table)
 
 
 class TestCallbackOwnership:

@@ -24,7 +24,12 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from gatun.arena import PayloadArena, ScopedArenaContext
 
-from gatun.callback_channel import MAX_FRAME_SIZE, CallbackChannel, ChannelCall
+from gatun.callback_channel import (
+    MAX_FRAME_SIZE,
+    CallbackChannel,
+    CallMemory,
+    ChannelCall,
+)
 from gatun.generated.org.gatun.protocol import Action as Act
 from gatun.generated.org.gatun.protocol import (
     Argument,
@@ -603,7 +608,7 @@ class ArrowTableView:
         self,
         table: pa.Table,
         epoch: int,
-        client: GatunClient,
+        client: GatunClient | CallMemory,
         *,
         any_write: bool = False,
     ):
@@ -1749,8 +1754,9 @@ def _channel_call_of(client: Any) -> Any:
 
 
 # What a callback may send on the callback connection. The rest needs the
-# client's shared memory (Arrow, and responses larger than a frame) or is
-# simply not served there.
+# client's shared memory (responses larger than a frame, and every Arrow
+# transfer but the two that go through the call's own memory) or is simply not
+# served there.
 _NESTABLE_ACTIONS = frozenset(
     {
         Act.Action.Ping,
@@ -1765,6 +1771,9 @@ _NESTABLE_ACTIONS = frozenset(
         Act.Action.GetStaticField,
         Act.Action.SetStaticField,
         Act.Action.UnregisterCallback,
+        Act.Action.OpenCallMemory,
+        Act.Action.ArrowToObject,
+        Act.Action.ArrowFromObject,
     }
 )
 # The error type of the response to a command sent for a call that Java has
@@ -1779,8 +1788,9 @@ def _not_inside_channel_callback(what: str) -> ReentrancyError:
     return ReentrancyError(
         f"{what} cannot be used inside a callback that Java made from another "
         "thread. Such a callback reaches Java over the callback connection, "
-        "which carries object creation, method calls and field access only. "
-        "Do it after the callback has returned."
+        "which carries object creation, method calls, field access and tables "
+        "moved with arrow_to_java() or arrow_from_java() only. Do it after the "
+        "callback has returned."
     )
 
 
@@ -1804,6 +1814,17 @@ def _nested_command(call_id: int, data: bytes | bytearray) -> bytearray:
     return frame
 
 
+def _build_open_call_memory() -> bytes:
+    builder = flatbuffers.Builder(32)
+    Cmd.CommandStart(builder)
+    Cmd.CommandAddAction(builder, Act.Action.OpenCallMemory)
+    builder.Finish(Cmd.CommandEnd(builder))
+    return bytes(builder.Output())
+
+
+_OPEN_CALL_MEMORY = _build_open_call_memory()
+
+
 def _holding_channel(method):
     """Run a client method with the channel held from start to finish.
 
@@ -1818,6 +1839,9 @@ def _holding_channel(method):
         # the very request that is waiting for this callback
         if _channel_call_of(self) is not None:
             raise _not_inside_channel_callback(f"{method.__name__}()")
+        # Before waiting for the channel: the request that holds it is the one
+        # waiting for this callback
+        self._check_reentrancy()
         with self._exchange_lock:
             return method(self, *args, **kwargs)
 
@@ -2525,12 +2549,7 @@ class GatunClient(_ValueEncoder):
         nothing is read. That is only true of CallbackResponse.
         """
         # 0a. Fail fast on a connection that cannot be used
-        if self._closed:
-            raise DeadConnectionError("Client is closed. Create a new client.")
-        if self._dead:
-            raise DeadConnectionError(
-                "Connection is dead after protocol error. Create a new client."
-            )
+        self._require_usable()
 
         # 1. Validate command size
         max_command_size = self.payload_offset  # Command zone ends where payload starts
@@ -2563,6 +2582,14 @@ class GatunClient(_ValueEncoder):
 
             self._write_command(data)
             return self._read_response()
+
+    def _require_usable(self) -> None:
+        if self._closed:
+            raise DeadConnectionError("Client is closed. Create a new client.")
+        if self._dead:
+            raise DeadConnectionError(
+                "Connection is dead after protocol error. Create a new client."
+            )
 
     def _send_nested(self, call: ChannelCall, data: bytes) -> tuple[bool, Any]:
         """Send a command on the callback connection, as part of `call`.
@@ -4224,7 +4251,6 @@ class GatunClient(_ValueEncoder):
         self._end_views()
         return cast(ArrowTableView, self._send_raw(builder.Output()))
 
-    @_holding_channel
     def arrow_to_java(self, table: pa.Table | pa.RecordBatch) -> JavaObject:
         """Copy an Arrow table into the JVM and return a handle to it.
 
@@ -4237,6 +4263,10 @@ class GatunClient(_ValueEncoder):
         The table is sent in one piece and must fit in the payload zone; connect
         with more memory, or send it in slices, if it does not. It is written
         into shared memory as it is serialized, and Java copies it out from there.
+
+        Inside a callback that Java made from another thread the table goes
+        through shared memory of that call's own, as large as the client's, so
+        it does not wait for the request the client may be running.
 
         Args:
             table: A pyarrow Table or RecordBatch.
@@ -4254,12 +4284,95 @@ class GatunClient(_ValueEncoder):
             client.jvm.com.example.Stats.sum(root)  # your own Java code
         """
         table = _arrow_table_to_send(table)
+        call = _channel_call_of(self)
+        if call is not None:
+            routed, result = self._arrow_to_java_in_call(call, table)
+            if routed:
+                return cast(JavaObject, result)
+        return cast(JavaObject, self._arrow_to_java_on_channel(table))
+
+    @_holding_channel
+    def _arrow_to_java_on_channel(self, table: pa.Table) -> JavaObject:
         # Stay clear of a batch Java is still reading in place
         offset = (self._arrow_loaded_end + 63) & ~63
         size = self._write_table_to_payload(table, offset)
 
         command = _finish_arrow_to_object(self._get_builder(), offset, size)
         return cast(JavaObject, self._send_raw(command))
+
+    def _call_memory(self, call: ChannelCall) -> CallMemory | None:
+        """The call's shared memory, which Java creates when first asked.
+
+        None if Java is no longer waiting for the callback. The caller holds
+        the call's transfer lock.
+        """
+        memory = call.memory
+        if memory is None:
+            routed, path = self._send_nested(call, _OPEN_CALL_MEMORY)
+            if not routed:
+                return None
+            try:
+                memory = CallMemory(path, call.transfer_lock)
+            except FileNotFoundError:
+                # Java stopped waiting for the callback after it replied, and
+                # removed the file
+                call.abandon()
+                return None
+            if call.active:
+                call.memory = memory
+        elif memory.removed():
+            # Java stopped waiting for the callback (its thread was
+            # interrupted) and this callback has not sent a command since
+            call.abandon()
+            call.memory = None
+            return None
+        return memory
+
+    def _arrow_to_java_in_call(
+        self, call: ChannelCall, table: pa.Table
+    ) -> tuple[bool, Any]:
+        """arrow_to_java() inside a callback that came on the callback connection.
+
+        The table goes through the call's own memory. Returns (False, None),
+        like _send_nested, if Java is no longer waiting for the callback: the
+        table then belongs on the client's own channel.
+        """
+        self._require_usable()
+        self._check_reentrancy()
+        with call.transfer_lock:
+            memory = self._call_memory(call)
+            if memory is None:
+                return False, None
+            size = _arrow_stream_size(table)
+            _require_payload_room(memory, size, 0)
+            # Tables read in place there end before the first byte is written
+            memory._payload_writes += 1
+            _write_arrow_table(memory, table, 0, size)
+            command = _finish_arrow_to_object(self._get_builder(), 0, size)
+            return self._send_nested(call, command)
+
+    def _arrow_from_java_in_call(
+        self, call: ChannelCall, object_id: int, copy: bool
+    ) -> tuple[bool, Any]:
+        """arrow_from_java() inside a callback that came on the callback connection."""
+        self._require_usable()
+        self._check_reentrancy()
+        with call.transfer_lock:
+            memory = self._call_memory(call)
+            if memory is None:
+                return False, None
+            # Java writes at the front of the memory as soon as it has the
+            # command, so tables read in place there end now
+            memory._payload_writes += 1
+            command = _finish_arrow_from_object(self._get_builder(), object_id)
+            routed, location = self._send_nested(call, command)
+            if not routed:
+                return False, None
+            if copy:
+                return True, _read_arrow_stream(memory, location)
+            borrowed = _read_arrow_stream(memory, location, in_place=True)
+            view = ArrowTableView(borrowed, memory._arena_epoch, memory, any_write=True)
+            return True, view
 
     @overload
     def arrow_from_java(
@@ -4276,7 +4389,6 @@ class GatunClient(_ValueEncoder):
         self, table: JavaObject | int, *, copy: bool
     ) -> pa.Table | ArrowTableView: ...
 
-    @_holding_channel
     def arrow_from_java(
         self, table: JavaObject | int, *, copy: bool = True
     ) -> pa.Table | ArrowTableView:
@@ -4298,6 +4410,10 @@ class GatunClient(_ValueEncoder):
         and keep copy=True for a table you hold on to. A pyarrow Table taken
         from the view (view.table) is not checked: reading it after the next
         transfer returns whatever was written over it.
+
+        Inside a callback that Java made from another thread the table comes
+        through shared memory of that call's own, and a view of it is good
+        until the callback's next Arrow transfer.
 
         Args:
             table: JavaObject (or object ID) of a VectorSchemaRoot.
@@ -4321,6 +4437,17 @@ class GatunClient(_ValueEncoder):
             total = pc.sum(client.arrow_from_java(result, copy=False).column("x"))
         """
         object_id = table.object_id if isinstance(table, JavaObject) else table
+        call = _channel_call_of(self)
+        if call is not None:
+            routed, result = self._arrow_from_java_in_call(call, object_id, copy)
+            if routed:
+                return cast("pa.Table | ArrowTableView", result)
+        return self._arrow_from_java_on_channel(object_id, copy)
+
+    @_holding_channel
+    def _arrow_from_java_on_channel(
+        self, object_id: int, copy: bool
+    ) -> pa.Table | ArrowTableView:
         command = _finish_arrow_from_object(self._get_builder(), object_id)
         # Java starts writing at the front of the free part of the zone as soon
         # as it has the command, so tables read in place there end now

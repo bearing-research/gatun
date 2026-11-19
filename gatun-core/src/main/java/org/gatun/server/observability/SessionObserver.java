@@ -83,6 +83,12 @@ public class SessionObserver {
 
   /** Called when Arrow data is transferred. */
   public void onArrowTransfer(String direction, long rowCount, long bytesCopied, boolean zeroCopy) {
+    recordArrowTransfer(sessionId, direction, rowCount, bytesCopied, zeroCopy);
+  }
+
+  /** As {@link #onArrowTransfer}, for a transfer made by a thread other than the session's own. */
+  public static void recordArrowTransfer(
+      long sessionId, String direction, long rowCount, long bytesCopied, boolean zeroCopy) {
     Metrics.getInstance().recordArrowTransfer(rowCount, bytesCopied);
 
     StructuredLogger.logArrowTransfer(sessionId, direction, rowCount, bytesCopied, zeroCopy);

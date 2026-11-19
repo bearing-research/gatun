@@ -36,7 +36,8 @@ enum Action : byte {
   ArrowFromObject = 26,    // Write the VectorSchemaRoot target_id as an IPC stream; see Response.arrow_stream
   OpenCallbackChannel = 27, // Open the session's callback connection; returns the path of a socket
                            // that accepts exactly one connection (see "Callback connection" below)
-  NestedCommand = 28       // On the callback connection: a command sent from inside a callback; see Command.nested_command
+  NestedCommand = 28,      // On the callback connection: a command sent from inside a callback; see Command.nested_command
+  OpenCallMemory = 29      // Inside a NestedCommand: create the call's own shared memory; returns the file's path
 }
 
 // Element types for arrays
@@ -252,6 +253,11 @@ table CreateObjectsRequest {
 // "org.gatun.server.CallbackCallEnded"; the client then uses its own channel.
 // A frame with no call_id belongs to no call: Python releasing
 // objects (FreeObject).
+//
+// Arrow tables do not travel in frames. A callback that moves one (ArrowToObject,
+// ArrowFromObject) first sends OpenCallMemory: Java creates a shared memory file for that
+// call, as large as the session's, and returns its path. The file is all payload: a stream's
+// offset counts from its start. It belongs to the call and is removed when the call ends.
 //
 // The server reads this connection in order and decodes each answer before it reads on, so
 // a release that follows an answer on it never overtakes the answer. See also
