@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `client.arrow_from_java(obj, copy=False)` (sync client) reads a table where Java wrote it in shared memory instead of copying it out. It returns an `ArrowTableView` that is good until the client's next Arrow transfer and raises `StaleArenaError` after it
 - `benchmarks/benchmark_transport.py` measures Arrow transfer through shared memory against a Unix socket and a file, in both directions
 - Java can call a Python callback from any thread and at any time, not only from the thread running the client's request: listeners, timers, executors and parallel streams work, several calls at once. These calls travel on a second connection that the client opens with its first `register_callback`. Both clients
-- A callback that arrives on that connection can call Java (object creation, method calls, field access), also while the client's own channel is busy with a long request or with the request that is waiting for the callback: its calls travel on the callback connection and are run by the Java thread that waits for it. Arrow transfers, batches and vectorized calls are refused there with `ReentrancyError`
+- A callback that arrives on that connection can call Java (object creation, method calls, field access, `batch()`, the vectorized calls, `register_callback`, `get_metrics`), also while the client's own channel is busy with a long request or with the request that is waiting for the callback: its calls travel on the callback connection and are run by the Java thread that waits for it. Arrow transfers that use the client's own shared memory (`send_arrow_table`, `send_arrow_buffers`, `get_arrow_data`) are refused there with `ReentrancyError`
 - `arrow_to_java()` and `arrow_from_java()` work inside a callback that Java made from another thread (a Spark `foreachBatch` function fetching its batch as Arrow, for example), on both clients. The table goes through shared memory that belongs to that one call, so it does not wait for the request the client is running, and callbacks running at the same time do not share it
 - `register_callback()` accepts an object that is not callable, for an interface with several methods (a listener): each call Java makes goes to the object's method of the same name, a default method of the interface included if the object has one for it. A callable still answers every abstract method
 - `BridgeAdapter.register_callback(handler, interface)` and `unregister_callback(ref)`, implemented by `GatunAdapter`. Subclasses of `BridgeAdapter` have two more methods to implement
@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Calling a callback after `unregister_callback` throws `IllegalStateException` in Java before its arguments are sent. The client used to answer "not found", and in the sync client the objects among the arguments stayed registered for the rest of the session
 - Protocol version 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together
 - The async client accepts `datetime` / `date` / `time` arguments
-- Executing a batch from inside a callback raises `ReentrancyError`, like any other call
+- Executing a batch from inside a callback made by the thread running the client's request raises `ReentrancyError`, like any other call
 - `arrow_to_java()` and `send_arrow_table()` serialize the table straight into shared memory instead of building the stream in a buffer and copying that across: about half the time for a 128 MiB table in `arrow_to_java()`, and no buffer the size of the stream. A table that does not fit is refused before its stream is written
 - `ArrowTableView.to_pandas()` / `to_pydict()` / `to_pylist()` hold the client's channel while they copy, so a transfer on another thread cannot change the data under them. A view also ends when the transfer that overwrites it starts, not when it succeeds, and when the client's arena allocates over it
 - Connecting no longer writes zeros over the whole shared memory file: about 7 ms instead of 260 ms at 64MB, and no longer proportional to the memory size. Disk (or tmpfs) pages are now allocated as they are first used rather than all at connect time
@@ -60,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Connecting checks that the filesystem has room for the whole shared memory file and refuses the session if not, with the reason in the error. The file is still sparse, so this is a check and not a reservation: it catches a disk that cannot hold the file, not several sessions that later fill it between them
 
 ### Fixed
+- `client.cancel()` during a batch ends the batch. It used to cancel only the command that was running: with `stop_on_error=False` the rest of the batch still ran. The batch now raises `CancelledException`
 - An Arrow transfer attempted inside a callback made by the request's own thread raises `ReentrancyError` at once. With a callback timeout set it used to wait for the channel the waiting request held, and failed only when the callback timed out
 - `pytest` no longer collects tests from an extracted Spark distribution (`testpaths`)
 - `spotlessCheck` no longer fails on generated FlatBuffers code
@@ -78,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The async client can decode returned maps and primitive arrays, and accepts the same argument types as the sync client (`dict`, `bytes`, arrays, `TypeHint`); the two now share one encoder and one decoder
 - `char[]` is supported as an argument and a return value (`JavaArray` with `element_type="Char"`); returning one used to fail with `ClassCastException`
 - Stopping the server removes its per-session shared memory files instead of leaving them in the temp directory
-- Objects in a response that turns out too large to send are released rather than kept until the client disconnects
+- Objects in a response that turns out too large to send are released rather than kept until the client disconnects, those a batch's commands created included
 - Arrow state (the loaded table, the arena epoch, the schema cache) is kept per session; it was shared by every client of a server, so one client could read another's table and one client's arena reset invalidated the others'
 - The server checks that the Arrow buffers a client describes lie inside the payload zone before reading them
 - A batch sent without its schema, to a session that does not have it, is an error; it used to be reported as received

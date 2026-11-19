@@ -1202,32 +1202,7 @@ public class GatunServer {
           }
           // --- CALLBACK BLOCK ---
           else if (cmd.action() == Action.RegisterCallback) {
-            // Register a Python callback and create a Java proxy
-            String interfaceName = cmd.targetName();
-
-            // Refuse before creating the proxy; the slot is taken once that succeeds
-            quota.checkObjectLimit();
-
-            // Use the same ID for both callback and object registry
-            // This way Python can use the object_id as the callback_id
-            long callbackId = objectIdCounter.getAndIncrement();
-
-            // Create a dynamic proxy that will invoke Python when called
-            // Use session context (captured at start of handleClient) for cross-thread callbacks
-            Object proxy = createCallbackProxy(callbackId, interfaceName, ownMethods(cmd), ctx);
-            quota.allocateObject();
-
-            // Store in callback registry with session context
-            CallbackInfo info = new CallbackInfo(callbackId, interfaceName, proxy, ctx);
-            callbackRegistry.put(callbackId, info);
-            sessionCallbackIds.add(callbackId);
-
-            // Also register proxy in object registry with the SAME ID
-            putObject(callbackId, proxy);
-            sessionObjectIds.add(callbackId);
-
-            LOG.fine("Registered callback ID " + callbackId + " for interface " + interfaceName);
-            result = new ObjectRefT(callbackId);
+            result = registerCallback(cmd, ctx);
           } else if (cmd.action() == Action.UnregisterCallback) {
             long unregistered = unregisterCallback(cmd.targetId(), sessionCallbackIds);
             result = unregistered == 0 ? null : unregistered;
@@ -1313,211 +1288,30 @@ public class GatunServer {
           } else if (cmd.action() == Action.Reflect) {
             result = reflect(cmd.targetName());
           } else if (cmd.action() == Action.GetFields) {
-            // Vectorized field reads: get multiple fields from one object
-            long targetId = cmd.targetId();
-            Object target = sessionObject(targetId);
-            if (target == null) {
-              throw new RuntimeException("Object " + targetId + " not found");
-            }
-
-            GetFieldsRequest req = cmd.getFields();
-            if (req == null) {
-              throw new IllegalArgumentException("GetFields action requires get_fields field");
-            }
-
-            int fieldCount = req.fieldNamesLength();
-            java.util.ArrayList<Object> results = new java.util.ArrayList<>(fieldCount);
-            vectorResults = results;
-
-            for (int i = 0; i < fieldCount; i++) {
-              String fieldName = req.fieldNames(i);
-              allowlist.checkInstanceMember(target, fieldName);
-
-              // Try VarHandle for faster access
-              java.lang.invoke.VarHandle vh = getInstanceVarHandle(target.getClass(), fieldName);
-              Object fieldValue;
-              if (vh != null) {
-                fieldValue = vh.get(target);
-              } else {
-                java.lang.reflect.Field field = getInstanceField(target.getClass(), fieldName);
-                field.setAccessible(true);
-                fieldValue = field.get(target);
-              }
-
-              // Wrap non-auto-convertible objects
-              if (fieldValue != null && !MethodResolver.isAutoConvertible(fieldValue)) {
-                quota.allocateObject();
-                long newId = objectIdCounter.getAndIncrement();
-                putObject(newId, fieldValue);
-                sessionObjectIds.add(newId);
-                fieldValue = new ObjectRefT(newId);
-              }
-              results.add(fieldValue);
-            }
-            result = results; // Will be packed as ListVal
+            vectorResults = new ArrayList<>();
+            getFields(cmd, sessionObjectIds, quota, vectorResults);
+            result = vectorResults; // Will be packed as ListVal
 
           } else if (cmd.action() == Action.InvokeMethods) {
-            // Vectorized method calls: invoke multiple methods on same target
-            long targetId = cmd.targetId();
-            Object target = sessionObject(targetId);
-            if (target == null) {
-              throw new RuntimeException("Object " + targetId + " not found");
-            }
-
-            InvokeMethodsRequest req = cmd.invokeMethods();
-            if (req == null) {
-              throw new IllegalArgumentException(
-                  "InvokeMethods action requires invoke_methods field");
-            }
-
-            int callCount = req.methodCallsLength();
-            ResourceLimits.checkMethodCallsSize(callCount);
-            java.util.ArrayList<Object> results = new java.util.ArrayList<>(callCount);
-            vectorResults = results;
-
-            for (int i = 0; i < callCount; i++) {
-              MethodCall call = req.methodCalls(i);
-              String methodName = call.methodName();
-              allowlist.checkInstanceMember(target, methodName);
-              boolean returnObjectRef = call.returnObjectRef();
-
-              // Convert arguments
-              int argCount = call.argsLength();
-              Object[] javaArgs = new Object[argCount];
-              Class<?>[] argTypes = new Class<?>[argCount];
-              for (int j = 0; j < argCount; j++) {
-                Argument arg = call.args(j);
-                Object[] converted = convertArgument(arg);
-                javaArgs[j] = converted[0];
-                argTypes[j] = (Class<?>) converted[1];
-              }
-
-              // Invoke method
-              Object methodResult;
-              if (argCount == 0) {
-                MethodHandle handle = getNoArgMethodHandle(target.getClass(), methodName);
-                if (handle != null) {
-                  methodResult = handle.invoke(target);
-                } else {
-                  var mwa =
-                      MethodResolver.findMethodWithArgs(
-                          target.getClass(), methodName, argTypes, javaArgs);
-                  methodResult = mwa.cached.invoke(target, mwa.args);
-                }
-              } else {
-                var mwa =
-                    MethodResolver.findMethodWithArgs(
-                        target.getClass(), methodName, argTypes, javaArgs);
-                methodResult = mwa.cached.invoke(target, mwa.args);
-              }
-
-              // Wrap result if needed
-              if (methodResult != null
-                  && (returnObjectRef || !MethodResolver.isAutoConvertible(methodResult))) {
-                quota.allocateObject();
-                long newId = objectIdCounter.getAndIncrement();
-                putObject(newId, methodResult);
-                sessionObjectIds.add(newId);
-                methodResult = new ObjectRefT(newId);
-              }
-              results.add(methodResult);
-            }
-            result = results; // Will be packed as ListVal
+            vectorResults = new ArrayList<>();
+            invokeMethods(cmd, sessionObjectIds, quota, vectorResults);
+            result = vectorResults; // Will be packed as ListVal
 
           } else if (cmd.action() == Action.CreateObjects) {
-            // Vectorized object creation: create multiple objects
-            CreateObjectsRequest req = cmd.createObjects();
-            if (req == null) {
-              throw new IllegalArgumentException(
-                  "CreateObjects action requires create_objects field");
-            }
-
-            int objCount = req.objectsLength();
-            ResourceLimits.checkCreateObjectsSize(objCount);
-            java.util.ArrayList<Object> results = new java.util.ArrayList<>(objCount);
-            vectorResults = results;
-
-            for (int i = 0; i < objCount; i++) {
-              ObjectSpec spec = req.objects(i);
-              String className = spec.className();
-
-              requireClassAllowed(className);
-
-              // Refuse before running the constructor; the slot is taken once it succeeds
-              quota.checkObjectLimit();
-
-              Class<?> clazz = getClass(className);
-              Object instance;
-
-              int argCount = spec.argsLength();
-              if (argCount == 0) {
-                instance = getNoArgConstructor(clazz).newInstance();
-              } else {
-                Object[] javaArgs = new Object[argCount];
-                Class<?>[] argTypes = new Class<?>[argCount];
-                for (int j = 0; j < argCount; j++) {
-                  Argument arg = spec.args(j);
-                  Object[] converted = convertArgument(arg);
-                  javaArgs[j] = converted[0];
-                  argTypes[j] = (Class<?>) converted[1];
-                }
-
-                var ctorResult = MethodResolver.findConstructorWithArgs(clazz, argTypes, javaArgs);
-                instance = ctorResult.cached.newInstance(ctorResult.args);
-              }
-
-              quota.allocateObject();
-              long newId = objectIdCounter.getAndIncrement();
-              putObject(newId, instance);
-              sessionObjectIds.add(newId);
-              results.add(new ObjectRefT(newId));
-            }
-            result = results; // Will be packed as ListVal of ObjectRefs
+            vectorResults = new ArrayList<>();
+            createObjects(cmd, sessionObjectIds, quota, vectorResults);
+            result = vectorResults; // Will be packed as ListVal
 
           } else if (cmd.action() == Action.Batch) {
-            // Batch command: execute multiple sub-commands in sequence
-            BatchCommand batch = cmd.batch();
-            if (batch == null) {
-              throw new IllegalArgumentException("Batch action requires batch field");
-            }
-
-            int commandCount = batch.commandsLength();
-            ResourceLimits.checkBatchSize(commandCount);
-            boolean stopOnError = batch.stopOnError();
-
-            // Execute each sub-command, collect response offsets
-            int[] subResponseOffsets = new int[commandCount];
-            int errorIndex = -1;
-            int executedCount = 0;
-
-            for (int i = 0; i < commandCount; i++) {
-              Command subCmd = batch.commands(i);
-
-              try {
-                // Execute sub-command and get result
-                Object subResult =
-                    executeCommand(subCmd, sessionObjectIds, sessionCallbackIds, sharedMem, quota);
-                subResponseOffsets[i] =
-                    packResult(builder, subResult, sessionObjectIds, quota, packedIds);
-                executedCount++;
-              } catch (Throwable subT) {
-                // Pack error for this sub-command
-                Throwable subCause = unwrap(subT);
-                String subMessage = formatException(subCause);
-                String subErrorType = subCause.getClass().getName();
-                subResponseOffsets[i] = packError(builder, subMessage, subErrorType);
-                executedCount++;
-
-                if (stopOnError) {
-                  errorIndex = i;
-                  break; // Stop executing remaining commands
-                }
-              }
-            }
-
-            // Build BatchResponse
             responseOffset =
-                packBatchResponse(builder, subResponseOffsets, executedCount, errorIndex);
+                runBatch(
+                    cmd.batch(),
+                    builder,
+                    sessionObjectIds,
+                    sessionCallbackIds,
+                    quota,
+                    packedIds,
+                    0);
             responsePacked = true;
 
           } else if (cmd.action() == Action.GetMetrics) {
@@ -3195,6 +2989,8 @@ public class GatunServer {
       Command envelope, long callId, SessionContext ctx, CallMemory memory) {
     FlatBufferBuilder builder = new FlatBufferBuilder(256);
     List<Long> registered = new ArrayList<>();
+    // What a vectorized command has made so far, should a later step of it fail
+    List<Object> vector = new ArrayList<>();
     RequestContext request = null;
     Object result = null;
     String errorType = null;
@@ -3211,11 +3007,23 @@ public class GatunServer {
       if (ctx.closed) {
         throw new IllegalStateException("The client has disconnected");
       }
-      result = executeNested(cmd, ctx, memory);
-      response =
-          result instanceof ArrowStreamLocation stream
-              ? packArrowStreamResponse(builder, stream.offset(), stream.length(), callId)
-              : packResult(builder, result, ctx.sessionObjectIds, ctx.quota, registered, callId);
+      if (cmd.action() == Action.Batch) {
+        response =
+            runBatch(
+                cmd.batch(),
+                builder,
+                ctx.sessionObjectIds,
+                ctx.sessionCallbackIds,
+                ctx.quota,
+                registered,
+                callId);
+      } else {
+        result = executeNested(cmd, ctx, memory, vector);
+        response =
+            result instanceof ArrowStreamLocation stream
+                ? packArrowStreamResponse(builder, stream.offset(), stream.length(), callId)
+                : packResult(builder, result, ctx.sessionObjectIds, ctx.quota, registered, callId);
+      }
     } catch (Throwable t) {
       Throwable cause = unwrap(t);
       if (cause instanceof InterruptedException) {
@@ -3224,6 +3032,10 @@ public class GatunServer {
         Thread.currentThread().interrupt();
       }
       LOG.log(Level.FINE, "Command from inside a callback failed: " + cause);
+      // The client gets the error, not the results gathered before it
+      discardResultRefs(vector, ctx.sessionObjectIds, ctx.quota);
+      vector.clear();
+      result = null;
       errorType = cause.getClass().getName();
       builder = new FlatBufferBuilder(256);
       response = packError(builder, formatException(cause), errorType, callId);
@@ -3232,7 +3044,7 @@ public class GatunServer {
     ByteBuffer frame = builder.dataBuffer();
     if (frame.remaining() > CallbackChannel.MAX_FRAME_SIZE) {
       // The client never sees the IDs in the response it was meant to get
-      discardNested(result, registered, ctx);
+      discardNested(result, vector, registered, ctx);
       PayloadTooLargeException tooLarge =
           new PayloadTooLargeException(
               "Response", frame.remaining(), CallbackChannel.MAX_FRAME_SIZE);
@@ -3243,7 +3055,7 @@ public class GatunServer {
     } else if (ctx.closed) {
       // The session ended while the command ran, and its cleanup may already have gone past
       // what the command registered
-      discardNested(result, registered, ctx);
+      discardNested(result, vector, registered, ctx);
     }
     if (request != null) {
       // Not through the session's observer: it follows the one request its own thread runs
@@ -3254,17 +3066,291 @@ public class GatunServer {
     return frame;
   }
 
-  /** Drop the objects a nested command registered for a client that will not receive them. */
-  private void discardNested(Object result, List<Long> registered, SessionContext ctx) {
+  /**
+   * Drop the objects a nested command registered for a client that will not receive them.
+   *
+   * @param vector what a vectorized command made. Not taken from {@code result}: a list there may
+   *     as well be one of the user's own that a method returned, and walking that runs their code
+   */
+  private void discardNested(
+      Object result, List<Object> vector, List<Long> registered, SessionContext ctx) {
     if (result instanceof ObjectRefT ref) {
+      // If it is a callback's proxy, the callback goes with it
+      unregisterCallback(ref.id, ctx.sessionCallbackIds);
       freeObject(ref.id, ctx.sessionObjectIds, ctx.quota);
     }
+    discardResultRefs(vector, ctx.sessionObjectIds, ctx.quota);
     discardObjects(registered, ctx.sessionObjectIds, ctx.quota);
   }
 
-  /** The commands a callback may send on the callback connection. */
-  private Object executeNested(Command cmd, SessionContext ctx, CallMemory memory)
+  /**
+   * Read several fields of one object. The results go into {@code results} as they are made, so
+   * that the caller can release the objects among them if a later step fails.
+   */
+  private void getFields(
+      Command cmd, Set<Long> sessionObjectIds, SessionQuota quota, List<Object> results)
       throws Throwable {
+    // Vectorized field reads: get multiple fields from one object
+    long targetId = cmd.targetId();
+    Object target = sessionObject(targetId);
+    if (target == null) {
+      throw new RuntimeException("Object " + targetId + " not found");
+    }
+
+    GetFieldsRequest req = cmd.getFields();
+    if (req == null) {
+      throw new IllegalArgumentException("GetFields action requires get_fields field");
+    }
+
+    int fieldCount = req.fieldNamesLength();
+
+    for (int i = 0; i < fieldCount; i++) {
+      String fieldName = req.fieldNames(i);
+      allowlist.checkInstanceMember(target, fieldName);
+
+      // Try VarHandle for faster access
+      java.lang.invoke.VarHandle vh = getInstanceVarHandle(target.getClass(), fieldName);
+      Object fieldValue;
+      if (vh != null) {
+        fieldValue = vh.get(target);
+      } else {
+        java.lang.reflect.Field field = getInstanceField(target.getClass(), fieldName);
+        field.setAccessible(true);
+        fieldValue = field.get(target);
+      }
+
+      // Wrap non-auto-convertible objects
+      if (fieldValue != null && !MethodResolver.isAutoConvertible(fieldValue)) {
+        quota.allocateObject();
+        long newId = objectIdCounter.getAndIncrement();
+        putObject(newId, fieldValue);
+        sessionObjectIds.add(newId);
+        fieldValue = new ObjectRefT(newId);
+      }
+      results.add(fieldValue);
+    }
+  }
+
+  /**
+   * Call several methods of one object, in order. The results go into {@code results} as they are
+   * made, so that the caller can release the objects among them if a later step fails.
+   */
+  private void invokeMethods(
+      Command cmd, Set<Long> sessionObjectIds, SessionQuota quota, List<Object> results)
+      throws Throwable {
+    // Vectorized method calls: invoke multiple methods on same target
+    long targetId = cmd.targetId();
+    Object target = sessionObject(targetId);
+    if (target == null) {
+      throw new RuntimeException("Object " + targetId + " not found");
+    }
+
+    InvokeMethodsRequest req = cmd.invokeMethods();
+    if (req == null) {
+      throw new IllegalArgumentException("InvokeMethods action requires invoke_methods field");
+    }
+
+    int callCount = req.methodCallsLength();
+    ResourceLimits.checkMethodCallsSize(callCount);
+
+    for (int i = 0; i < callCount; i++) {
+      MethodCall call = req.methodCalls(i);
+      String methodName = call.methodName();
+      allowlist.checkInstanceMember(target, methodName);
+      boolean returnObjectRef = call.returnObjectRef();
+
+      // Convert arguments
+      int argCount = call.argsLength();
+      Object[] javaArgs = new Object[argCount];
+      Class<?>[] argTypes = new Class<?>[argCount];
+      for (int j = 0; j < argCount; j++) {
+        Argument arg = call.args(j);
+        Object[] converted = convertArgument(arg);
+        javaArgs[j] = converted[0];
+        argTypes[j] = (Class<?>) converted[1];
+      }
+
+      // Invoke method
+      Object methodResult;
+      if (argCount == 0) {
+        MethodHandle handle = getNoArgMethodHandle(target.getClass(), methodName);
+        if (handle != null) {
+          methodResult = handle.invoke(target);
+        } else {
+          var mwa =
+              MethodResolver.findMethodWithArgs(target.getClass(), methodName, argTypes, javaArgs);
+          methodResult = mwa.cached.invoke(target, mwa.args);
+        }
+      } else {
+        var mwa =
+            MethodResolver.findMethodWithArgs(target.getClass(), methodName, argTypes, javaArgs);
+        methodResult = mwa.cached.invoke(target, mwa.args);
+      }
+
+      // Wrap result if needed
+      if (methodResult != null
+          && (returnObjectRef || !MethodResolver.isAutoConvertible(methodResult))) {
+        quota.allocateObject();
+        long newId = objectIdCounter.getAndIncrement();
+        putObject(newId, methodResult);
+        sessionObjectIds.add(newId);
+        methodResult = new ObjectRefT(newId);
+      }
+      results.add(methodResult);
+    }
+  }
+
+  /**
+   * Create several objects. The results go into {@code results} as they are made, so that the
+   * caller can release the objects among them if a later step fails.
+   */
+  private void createObjects(
+      Command cmd, Set<Long> sessionObjectIds, SessionQuota quota, List<Object> results)
+      throws Throwable {
+    // Vectorized object creation: create multiple objects
+    CreateObjectsRequest req = cmd.createObjects();
+    if (req == null) {
+      throw new IllegalArgumentException("CreateObjects action requires create_objects field");
+    }
+
+    int objCount = req.objectsLength();
+    ResourceLimits.checkCreateObjectsSize(objCount);
+
+    for (int i = 0; i < objCount; i++) {
+      ObjectSpec spec = req.objects(i);
+      String className = spec.className();
+
+      requireClassAllowed(className);
+
+      // Refuse before running the constructor; the slot is taken once it succeeds
+      quota.checkObjectLimit();
+
+      Class<?> clazz = getClass(className);
+      Object instance;
+
+      int argCount = spec.argsLength();
+      if (argCount == 0) {
+        instance = getNoArgConstructor(clazz).newInstance();
+      } else {
+        Object[] javaArgs = new Object[argCount];
+        Class<?>[] argTypes = new Class<?>[argCount];
+        for (int j = 0; j < argCount; j++) {
+          Argument arg = spec.args(j);
+          Object[] converted = convertArgument(arg);
+          javaArgs[j] = converted[0];
+          argTypes[j] = (Class<?>) converted[1];
+        }
+
+        var ctorResult = MethodResolver.findConstructorWithArgs(clazz, argTypes, javaArgs);
+        instance = ctorResult.cached.newInstance(ctorResult.args);
+      }
+
+      quota.allocateObject();
+      long newId = objectIdCounter.getAndIncrement();
+      putObject(newId, instance);
+      sessionObjectIds.add(newId);
+      results.add(new ObjectRefT(newId));
+    }
+  }
+
+  /**
+   * Run a batch's sub-commands in order and pack the response, one sub-response each, into {@code
+   * builder}. A sub-command that fails gets an error sub-response; the batch itself does not fail,
+   * unless the thread was interrupted: see below.
+   *
+   * @param registered receives the IDs of the objects the batch registered for the client, those
+   *     its commands made and those registered while packing results, for a caller that cannot
+   *     deliver the response
+   * @param callId the call the response belongs to on the callback connection, or 0
+   */
+  private int runBatch(
+      BatchCommand batch,
+      FlatBufferBuilder builder,
+      Set<Long> sessionObjectIds,
+      Set<Long> sessionCallbackIds,
+      SessionQuota quota,
+      List<Long> registered,
+      long callId)
+      throws InterruptedException {
+    if (batch == null) {
+      throw new IllegalArgumentException("Batch action requires batch field");
+    }
+
+    int commandCount = batch.commandsLength();
+    ResourceLimits.checkBatchSize(commandCount);
+    boolean stopOnError = batch.stopOnError();
+
+    int[] subResponseOffsets = new int[commandCount];
+    int errorIndex = -1;
+    int executedCount = 0;
+
+    for (int i = 0; i < commandCount; i++) {
+      Command subCmd = batch.commands(i);
+      try {
+        // None of the commands a batch may hold uses shared memory
+        Object subResult =
+            executeCommand(subCmd, sessionObjectIds, sessionCallbackIds, null, quota);
+        if (subResult instanceof ObjectRefT made) {
+          registered.add(made.id);
+        }
+        subResponseOffsets[i] = packResult(builder, subResult, sessionObjectIds, quota, registered);
+        executedCount++;
+      } catch (Throwable subT) {
+        Throwable subCause = unwrap(subT);
+        if (subCause instanceof InterruptedException interrupted) {
+          // The request was cancelled or, on the callback connection, the thread running it
+          // was interrupted. That is not this one command's failure: nothing after it may run,
+          // whatever stop_on_error says, and the client gets the cancellation in place of
+          // results, some of which would stand for commands that never ran.
+          discardObjects(registered, sessionObjectIds, quota);
+          registered.clear();
+          throw interrupted;
+        }
+        subResponseOffsets[i] =
+            packError(builder, formatException(subCause), subCause.getClass().getName());
+        executedCount++;
+
+        if (stopOnError) {
+          errorIndex = i;
+          break; // The remaining commands are not run
+        }
+      }
+    }
+    return packBatchResponse(builder, subResponseOffsets, executedCount, errorIndex, callId);
+  }
+
+  /**
+   * Make a proxy for a Python callback and register it, as callback and as object, for {@code ctx}.
+   */
+  private ObjectRefT registerCallback(Command cmd, SessionContext ctx) throws Exception {
+    String interfaceName = cmd.targetName();
+    // Refuse before creating the proxy; the slot is taken once that succeeds
+    ctx.quota.checkObjectLimit();
+
+    // One ID for the callback and for the proxy as an object: Python uses the object's ID as
+    // the callback's
+    long callbackId = objectIdCounter.getAndIncrement();
+
+    // The proxy keeps the session's context: whichever thread calls it reaches that session
+    Object proxy = createCallbackProxy(callbackId, interfaceName, ownMethods(cmd), ctx);
+    ctx.quota.allocateObject();
+
+    callbackRegistry.put(callbackId, new CallbackInfo(callbackId, interfaceName, proxy, ctx));
+    ctx.sessionCallbackIds.add(callbackId);
+
+    putObject(callbackId, proxy);
+    ctx.sessionObjectIds.add(callbackId);
+
+    LOG.fine("Registered callback ID " + callbackId + " for interface " + interfaceName);
+    return new ObjectRefT(callbackId);
+  }
+
+  /**
+   * The commands a callback may send on the callback connection. {@code Batch} is one of them too,
+   * but packs its own response: see {@code runNested}.
+   */
+  private Object executeNested(
+      Command cmd, SessionContext ctx, CallMemory memory, List<Object> vector) throws Throwable {
     switch (cmd.action()) {
       case Action.Ping:
         return true;
@@ -3284,6 +3370,19 @@ public class GatunServer {
       case Action.UnregisterCallback:
         long unregistered = unregisterCallback(cmd.targetId(), ctx.sessionCallbackIds);
         return unregistered == 0 ? null : unregistered;
+      case Action.RegisterCallback:
+        return registerCallback(cmd, ctx);
+      case Action.GetFields:
+        getFields(cmd, ctx.sessionObjectIds, ctx.quota, vector);
+        return vector;
+      case Action.InvokeMethods:
+        invokeMethods(cmd, ctx.sessionObjectIds, ctx.quota, vector);
+        return vector;
+      case Action.CreateObjects:
+        createObjects(cmd, ctx.sessionObjectIds, ctx.quota, vector);
+        return vector;
+      case Action.GetMetrics:
+        return Metrics.getInstance().report();
       case Action.OpenCallMemory:
         return memory.open();
       case Action.ArrowToObject:
@@ -3395,7 +3494,7 @@ public class GatunServer {
    * @param errorIndex Index of first error (-1 if no errors)
    */
   private int packBatchResponse(
-      FlatBufferBuilder builder, int[] responseOffsets, int count, int errorIndex) {
+      FlatBufferBuilder builder, int[] responseOffsets, int count, int errorIndex, long callId) {
     // Create vector of response offsets (only include executed ones)
     int[] toInclude =
         count == responseOffsets.length
@@ -3413,6 +3512,9 @@ public class GatunServer {
     Response.startResponse(builder);
     Response.addIsError(builder, false);
     Response.addBatch(builder, batchRespOffset);
+    if (callId != 0) {
+      Response.addCallId(builder, callId);
+    }
     return Response.endResponse(builder);
   }
 

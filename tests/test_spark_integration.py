@@ -980,3 +980,73 @@ class TestLargeDataFrameArrowTransfer:
 
         # Total transactions should equal size
         assert sum(txn_counts) == size
+
+
+class TestForeachBatch:
+    """A streaming query calls Python for every micro-batch from a thread of
+    its own, while the client waits in awaitTermination()."""
+
+    def test_batches_come_back_as_arrow(self, spark_session, spark_client, tmp_path):
+        import json
+
+        import pyarrow as pa
+
+        source = tmp_path / "in"
+        source.mkdir()
+        for part in range(3):
+            rows = [{"id": part * 10 + i, "name": f"n{part}_{i}"} for i in range(5)]
+            (source / f"part{part}.json").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows)
+            )
+
+        schema = spark_session.read().json(str(source)).schema()
+        stream = (
+            spark_session.readStream()
+            .schema(schema)
+            .option("maxFilesPerTrigger", "1")
+            .json(str(source))
+        )
+        batches = {}
+        tagged = {}
+
+        def each(batch, batch_id):
+            # The batch comes to Python as Arrow, and a table goes the other
+            # way to be joined with it, both inside the callback
+            batches[batch_id] = arrow_from_dataframe(spark_client, batch)
+            tags = dataframe_from_arrow(
+                spark_client,
+                spark_session,
+                pa.table({"id": [0, 10, 20], "tag": ["a", "b", "c"]}),
+            )
+            tagged[batch_id] = batch.join(tags, "id").count()
+
+        function = spark_client.register_callback(
+            each, "org.apache.spark.api.java.function.VoidFunction2"
+        )
+        trigger = spark_client.jvm.org.apache.spark.sql.streaming.Trigger.AvailableNow()
+        # The whole stream runs inside the one awaitTermination() request
+        timeout, spark_client.socket_timeout = spark_client.socket_timeout, 180
+        try:
+            query = (
+                stream.writeStream()
+                .foreachBatch(function)
+                .option("checkpointLocation", str(tmp_path / "checkpoint"))
+                .trigger(trigger)
+                .start()
+            )
+            try:
+                query.awaitTermination()
+            finally:
+                query.stop()
+        finally:
+            spark_client.socket_timeout = timeout
+            spark_client.unregister_callback(function.object_id)
+
+        assert len(batches) == 3
+        ids = sorted(
+            value
+            for table in batches.values()
+            for value in table.column("id").to_pylist()
+        )
+        assert ids == [part * 10 + i for part in range(3) for i in range(5)]
+        assert sorted(tagged.values()) == [1, 1, 1]

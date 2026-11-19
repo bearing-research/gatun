@@ -106,6 +106,29 @@ class TestWrapperRelease:
         with pytest.raises(JavaException, match="not found"):
             client.invoke_method(object_id, "size")
 
+    def test_batch_whose_response_is_too_large_keeps_nothing(self):
+        """The client never learns the IDs of what the batch made."""
+        # The count is the whole server's, so on a server of its own: on the
+        # shared one, sessions of earlier tests are still being cleaned up
+        client = connect(memory="16MB")
+
+        def live_objects():
+            report = client.get_metrics()
+            return int(report.split("current_objects:")[1].split()[0])
+
+        try:
+            text = client.create_object("java.lang.String", "ab")
+            before = live_objects()
+
+            with pytest.raises(PayloadTooLargeError), client.batch() as b:
+                for _ in range(5):
+                    b.create("java.util.ArrayList")
+                b.call(text, "repeat", 40_000)
+
+            assert live_objects() == before
+        finally:
+            client.close()
+
     def test_batch_keeps_its_targets_alive(self, client):
         """A batch target with no other reference survives until the batch runs."""
         with client.batch() as b:
