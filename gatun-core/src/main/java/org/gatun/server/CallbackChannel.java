@@ -14,6 +14,7 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.gatun.protocol.Action;
@@ -54,6 +55,7 @@ final class CallbackChannel {
   private final String name;
   private final Consumer<Command> notices;
   private final Function<Command, Object> decodeAnswer;
+  private final LongFunction<ByteBuffer> callEnded;
   private final AtomicLong callIds = new AtomicLong(1);
   private final Map<Long, BlockingQueue<Object>> calls = new ConcurrentHashMap<>();
   private final BlockingQueue<ByteBuffer> outbox = new LinkedBlockingQueue<>();
@@ -68,16 +70,20 @@ final class CallbackChannel {
    * @param notices handles a frame that belongs to no call
    * @param decodeAnswer turns a CallbackResponse into what {@link #await} returns for it; must not
    *     throw
+   * @param callEnded builds the reply to a command that Python sent for a call nobody waits on any
+   *     more
    */
   CallbackChannel(
       SocketChannel socket,
       String name,
       Consumer<Command> notices,
-      Function<Command, Object> decodeAnswer) {
+      Function<Command, Object> decodeAnswer,
+      LongFunction<ByteBuffer> callEnded) {
     this.socket = socket;
     this.name = name;
     this.notices = notices;
     this.decodeAnswer = decodeAnswer;
+    this.callEnded = callEnded;
   }
 
   boolean isClosed() {
@@ -96,9 +102,27 @@ final class CallbackChannel {
     return callId;
   }
 
-  /** Forget a call. Frames that still arrive for it are dropped. */
+  /**
+   * Forget a call. Python may not know yet that nobody waits on it (the caller was interrupted),
+   * and its callback may still send commands for it: those, and any that already arrived, are
+   * answered by {@code callEnded} instead of being left without a reply.
+   */
   void end(long callId) {
-    calls.remove(callId);
+    BlockingQueue<Object> inbox = calls.remove(callId);
+    if (inbox == null) {
+      return;
+    }
+    for (Object item; (item = inbox.poll()) != null; ) {
+      if (item instanceof Command command && command.action() == Action.NestedCommand) {
+        refuse(callId);
+      }
+    }
+  }
+
+  private void refuse(long callId) {
+    if (!closed) {
+      outbox.add(callEnded.apply(callId));
+    }
   }
 
   /** Queue one frame for Python. The buffer must not be touched again by the caller. */
@@ -196,12 +220,21 @@ final class CallbackChannel {
         continue;
       }
       boolean isAnswer = command.action() == Action.CallbackResponse;
-      BlockingQueue<Object> inbox = calls.get(callId);
-      if (inbox != null) {
-        inbox.add(isAnswer ? decodeAnswer.apply(command) : command);
-      } else {
+      // Added under the map's lock for the key, so that end() either sees the frame in the
+      // inbox it removes or has removed the inbox already
+      BlockingQueue<Object> inbox =
+          calls.computeIfPresent(
+              callId,
+              (id, waiting) -> {
+                waiting.add(isAnswer ? decodeAnswer.apply(command) : command);
+                return waiting;
+              });
+      if (inbox == null) {
         // The caller gave up (it was interrupted) before Python answered
-        LOG.fine(name + ": dropped a frame for call " + callId);
+        LOG.fine(name + ": no one waits for call " + callId);
+        if (command.action() == Action.NestedCommand) {
+          refuse(callId);
+        }
       }
       if (isAnswer) {
         answerDecoded();

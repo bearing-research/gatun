@@ -1739,8 +1739,12 @@ _NESTABLE_ACTIONS = frozenset(
         Act.Action.IsInstanceOf,
         Act.Action.GetStaticField,
         Act.Action.SetStaticField,
+        Act.Action.UnregisterCallback,
     }
 )
+# The error type of the response to a command sent for a call that Java has
+# stopped waiting on. Must match GatunServer.CALL_ENDED.
+_CALL_ENDED = b"org.gatun.server.CallbackCallEnded"
 _ACTION_NAMES = {
     value: name for name, value in vars(Act.Action).items() if isinstance(value, int)
 }
@@ -2560,6 +2564,11 @@ class GatunClient(_ValueEncoder):
         if reply is None:
             return False, None
         resp = Response.Response.GetRootAsResponse(reply, 0)
+        if resp.IsError() and resp.ErrorType() == _CALL_ENDED:
+            # The Java thread gave up on the callback (it was interrupted) and
+            # did not run the command
+            call.abandon()
+            return False, None
         return True, self._parse_response(resp)
 
     def _check_reentrancy(self) -> None:
@@ -2953,7 +2962,7 @@ class GatunClient(_ValueEncoder):
                     pass
             raise
         finally:
-            channel.close_call(channel_call)
+            channel_call.finish()
             self._release_on_channel(channel)
 
     def _release_on_channel(self, channel: CallbackChannel) -> None:
@@ -3803,9 +3812,6 @@ class GatunClient(_ValueEncoder):
         Args:
             callback_id: The callback ID to unregister
         """
-        # Remove from local registry
-        self._callbacks.pop(callback_id, None)
-
         builder = self._get_builder()
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.UnregisterCallback)
@@ -3814,14 +3820,18 @@ class GatunClient(_ValueEncoder):
         builder.Finish(cmd)
 
         self._send_raw(builder.Output())
+        # Only once the server has dropped it: a request that could not be
+        # sent must not leave Java calling a function that is gone
+        self._callbacks.pop(callback_id, None)
 
     def free_object(self, object_id):
         """Release a Java object.
 
         Sent to the server straight away, except inside a callback made by the
         thread that runs the client's request, where it goes out with the next
-        request. The server ignores an unknown or already-freed ID. JavaObject wrappers release themselves when garbage collected, so this
-        is only needed for objects that were detach()ed.
+        request. The server ignores an unknown or already-freed ID. JavaObject
+        wrappers release themselves when garbage collected, so this is only
+        needed for objects that were detach()ed.
         """
         if self._dead or self.sock is None or self.sock.fileno() == -1:
             return
