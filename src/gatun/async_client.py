@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 from gatun.callback_channel import AsyncCallbackChannel, AsyncChannelCall
 from gatun.client import (
+    _CALL_ENDED,
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
     HANDSHAKE_TIMEOUT,
@@ -67,6 +68,7 @@ from gatun.client import (
     _nested_command,
     _raise_java_exception_impl,
     _read_arrow_stream,
+    _release_unread_response,
     _remember_reflection,
     _take_free_chunk,
     _unpack_value_impl,
@@ -405,6 +407,9 @@ class AsyncGatunClient(_ValueEncoder):
             self.connect_error = e
             return False
 
+    def _release_unread_response(self, reply: bytes) -> None:
+        _release_unread_response(self, reply)
+
     def _queue_free(self, object_id: int) -> None:
         """Queue a Java object for release. Called by AsyncJavaObject finalizers."""
         if not self._dead and not self._closed:
@@ -529,6 +534,11 @@ class AsyncGatunClient(_ValueEncoder):
         if reply is None:
             return False, None
         resp = Response.Response.GetRootAsResponse(reply, 0)
+        if resp.IsError() and resp.ErrorType() == _CALL_ENDED:
+            # The Java thread gave up on the callback (it was interrupted) and
+            # did not run the command
+            call.abandon()
+            return False, None
         return True, self._parse_response(resp)
 
     async def _exchange(self, data: bytes, wait_for_response: bool = True):
@@ -744,7 +754,7 @@ class AsyncGatunClient(_ValueEncoder):
                     pass
             raise
         finally:
-            channel.close_call(channel_call)
+            channel_call.finish()
             await self._release_on_channel(channel)
 
     async def _release_on_channel(self, channel: AsyncCallbackChannel) -> None:
@@ -1329,8 +1339,6 @@ class AsyncGatunClient(_ValueEncoder):
 
     async def unregister_callback(self, callback_id: int) -> None:
         """Unregister a previously registered callback."""
-        self._callbacks.pop(callback_id, None)
-
         builder = flatbuffers.Builder(64)
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.UnregisterCallback)
@@ -1338,7 +1346,16 @@ class AsyncGatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        await self._send_raw(builder.Output())
+        try:
+            await self._send_raw(builder.Output())
+        except BaseException:
+            # A request that was refused must not leave Java calling a function
+            # that is gone. On a client that is closed or dead the session is
+            # over, and its callbacks with it.
+            if self._closed or self._dead:
+                self._callbacks.pop(callback_id, None)
+            raise
+        self._callbacks.pop(callback_id, None)
 
     async def reflect(self, full_name: str) -> str:
         """Ask the server what a dotted name is.

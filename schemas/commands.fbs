@@ -35,8 +35,8 @@ enum Action : byte {
   ArrowToObject = 25,      // Turn the IPC stream at arrow_stream into a VectorSchemaRoot object
   ArrowFromObject = 26,    // Write the VectorSchemaRoot target_id as an IPC stream; see Response.arrow_stream
   OpenCallbackChannel = 27, // Open the session's callback connection; returns the path of a socket
-  NestedCommand = 28       // On the callback connection: a command sent from inside a callback; see Command.nested_command
                            // that accepts exactly one connection (see "Callback connection" below)
+  NestedCommand = 28       // On the callback connection: a command sent from inside a callback; see Command.nested_command
 }
 
 // Element types for arrays
@@ -247,7 +247,10 @@ table CreateObjectsRequest {
 //                   command to run, serialized, in nested_command
 //   Java -> Python: a Response (is_callback not set) with the same call_id
 //
-// One at a time per call. A frame with no call_id belongs to no call: Python releasing
+// One at a time per call. If Java is no longer waiting for the call (its thread was
+// interrupted), the command is not run and the Response is an error of type
+// "org.gatun.server.CallbackCallEnded"; the client then uses its own channel.
+// A frame with no call_id belongs to no call: Python releasing
 // objects (FreeObject).
 //
 // The server reads this connection in order and decodes each answer before it reads on, so

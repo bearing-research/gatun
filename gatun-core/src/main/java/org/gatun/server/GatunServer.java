@@ -22,7 +22,6 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.attribute.UserPrincipal;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,6 +42,7 @@ import org.gatun.protocol.*; // Import all generated classes
 import org.gatun.server.MethodResolver.MethodWithArgs;
 import org.gatun.server.observability.GatunEvents;
 import org.gatun.server.observability.Metrics;
+import org.gatun.server.observability.RequestContext;
 import org.gatun.server.observability.SessionObserver;
 import org.gatun.server.observability.StructuredLogger;
 
@@ -129,6 +129,7 @@ public class GatunServer {
     final SocketChannel channel;
     final MemorySegment sharedMem;
     final Set<Long> sessionObjectIds; // Track object IDs for cleanup
+    final Set<Long> sessionCallbackIds;
     final SessionQuota quota;
     final SessionControl control = new SessionControl();
 
@@ -146,10 +147,12 @@ public class GatunServer {
         SocketChannel channel,
         MemorySegment sharedMem,
         Set<Long> sessionObjectIds,
+        Set<Long> sessionCallbackIds,
         SessionQuota quota) {
       this.channel = channel;
       this.sharedMem = sharedMem;
       this.sessionObjectIds = sessionObjectIds;
+      this.sessionCallbackIds = sessionCallbackIds;
       this.quota = quota;
     }
   }
@@ -584,7 +587,8 @@ public class GatunServer {
               peer,
               name,
               notice -> handleChannelNotice(ctx, notice),
-              answer -> decodeChannelAnswer(ctx, answer));
+              answer -> decodeChannelAnswer(ctx, answer),
+              this::callEndedReply);
       ctx.callbackChannel = channel;
       if (ctx.closed) {
         // The session ended while the client was connecting, and found no channel to close
@@ -628,6 +632,25 @@ public class GatunServer {
       freeObjects(notice, ctx.sessionObjectIds, ctx.quota);
     } finally {
       sessionContext.remove();
+    }
+  }
+
+  /** The error type that tells the client Java no longer waits for a call. */
+  private static final String CALL_ENDED = "org.gatun.server.CallbackCallEnded";
+
+  /** The reply to a command that a callback sent for a call nobody waits on any more. */
+  private ByteBuffer callEndedReply(long callId) {
+    FlatBufferBuilder builder = new FlatBufferBuilder(128);
+    builder.finish(
+        packError(builder, "Java is no longer waiting for this callback", CALL_ENDED, callId));
+    return builder.dataBuffer();
+  }
+
+  /** Forget a callback of the session; an ID that is not one of its callbacks is ignored. */
+  private void unregisterCallback(long callbackId, Set<Long> sessionCallbackIds) {
+    if (sessionCallbackIds.remove(callbackId)) {
+      callbackRegistry.remove(callbackId);
+      LOG.fine("Unregistered callback ID " + callbackId);
     }
   }
 
@@ -692,7 +715,8 @@ public class GatunServer {
   private void handleClient(SocketChannel client, long sessionId) {
     // Threads calling Python on the callback connection register the objects they pass
     Set<Long> sessionObjectIds = ConcurrentHashMap.newKeySet();
-    Set<Long> sessionCallbackIds = new HashSet<>();
+    // Concurrent: a callback on another thread can unregister one
+    Set<Long> sessionCallbackIds = ConcurrentHashMap.newKeySet();
     SessionObserver observer = new SessionObserver(sessionId);
     SessionQuota quota = new SessionQuota(sessionId);
     LOG.fine("New client session " + sessionId + " started");
@@ -714,7 +738,8 @@ public class GatunServer {
       LOG.fine("Session " + sessionId + " SHM mapped at: " + sessionShmPath);
 
       // Set up session context for callbacks (captured by callback proxies)
-      SessionContext ctx = new SessionContext(client, sharedMem, sessionObjectIds, quota);
+      SessionContext ctx =
+          new SessionContext(client, sharedMem, sessionObjectIds, sessionCallbackIds, quota);
       sessionContext.set(ctx);
       SessionControl control = ctx.control;
       sessions.put(sessionShmPath.toString(), ctx);
@@ -1214,12 +1239,7 @@ public class GatunServer {
             LOG.fine("Registered callback ID " + callbackId + " for interface " + interfaceName);
             result = new ObjectRefT(callbackId);
           } else if (cmd.action() == Action.UnregisterCallback) {
-            long callbackId = cmd.targetId();
-            CallbackInfo info = callbackRegistry.remove(callbackId);
-            if (info != null) {
-              sessionCallbackIds.remove(callbackId);
-              LOG.fine("Unregistered callback ID " + callbackId);
-            }
+            unregisterCallback(cmd.targetId(), sessionCallbackIds);
             result = null;
           }
           // Note: CallbackResponse is handled directly in invokeCallback(), not here
@@ -3164,34 +3184,68 @@ public class GatunServer {
   private ByteBuffer runNested(Command envelope, long callId, SessionContext ctx) {
     FlatBufferBuilder builder = new FlatBufferBuilder(256);
     List<Long> registered = new ArrayList<>();
+    RequestContext request = null;
+    Object result = null;
+    String errorType = null;
     int response;
     try {
       ByteBuffer serialized = envelope.nestedCommandAsByteBuffer();
       if (serialized == null) {
         throw new IllegalArgumentException("NestedCommand carries no command");
       }
-      Object result = executeNested(Command.getRootAsCommand(serialized), ctx);
+      Command cmd = Command.getRootAsCommand(serialized);
+      request =
+          RequestContext.create(
+              ctx.quota.getSessionId(), cmd.requestId(), cmd.action(), cmd.targetName());
+      if (ctx.closed) {
+        throw new IllegalStateException("The client has disconnected");
+      }
+      result = executeNested(cmd, ctx);
       response = packResult(builder, result, ctx.sessionObjectIds, ctx.quota, registered, callId);
     } catch (Throwable t) {
       Throwable cause = unwrap(t);
+      if (cause instanceof InterruptedException) {
+        // The interrupt was meant for this thread, which the server does not own, and not
+        // for the command: Python is told, and the wait for the callback then ends
+        Thread.currentThread().interrupt();
+      }
       LOG.log(Level.FINE, "Command from inside a callback failed: " + cause);
+      errorType = cause.getClass().getName();
       builder = new FlatBufferBuilder(256);
-      response = packError(builder, formatException(cause), cause.getClass().getName(), callId);
+      response = packError(builder, formatException(cause), errorType, callId);
     }
     builder.finish(response);
     ByteBuffer frame = builder.dataBuffer();
     if (frame.remaining() > CallbackChannel.MAX_FRAME_SIZE) {
       // The client never sees the IDs in the response it was meant to get
-      discardObjects(registered, ctx.sessionObjectIds, ctx.quota);
+      discardNested(result, registered, ctx);
       PayloadTooLargeException tooLarge =
           new PayloadTooLargeException(
               "Response", frame.remaining(), CallbackChannel.MAX_FRAME_SIZE);
+      errorType = tooLarge.getClass().getName();
       builder = new FlatBufferBuilder(256);
-      builder.finish(
-          packError(builder, tooLarge.getMessage(), tooLarge.getClass().getName(), callId));
+      builder.finish(packError(builder, tooLarge.getMessage(), errorType, callId));
       frame = builder.dataBuffer();
+    } else if (ctx.closed) {
+      // The session ended while the command ran, and its cleanup may already have gone past
+      // what the command registered
+      discardNested(result, registered, ctx);
+    }
+    if (request != null) {
+      // Not through the session's observer: it follows the one request its own thread runs
+      StructuredLogger.logRequest(request, errorType == null, errorType);
+      Metrics.getInstance()
+          .recordRequest(request.action(), request.elapsedMicros(), errorType == null, errorType);
     }
     return frame;
+  }
+
+  /** Drop the objects a nested command registered for a client that will not receive them. */
+  private void discardNested(Object result, List<Long> registered, SessionContext ctx) {
+    if (result instanceof ObjectRefT ref) {
+      freeObject(ref.id, ctx.sessionObjectIds, ctx.quota);
+    }
+    discardObjects(registered, ctx.sessionObjectIds, ctx.quota);
   }
 
   /** The commands a callback may send on the callback connection. */
@@ -3211,7 +3265,10 @@ public class GatunServer {
       case Action.GetStaticField:
       case Action.SetStaticField:
         // No shared memory: none of these use it, and this thread could not
-        return executeCommand(cmd, ctx.sessionObjectIds, null, null, ctx.quota);
+        return executeCommand(cmd, ctx.sessionObjectIds, ctx.sessionCallbackIds, null, ctx.quota);
+      case Action.UnregisterCallback:
+        unregisterCallback(cmd.targetId(), ctx.sessionCallbackIds);
+        return null;
       default:
         byte action = cmd.action();
         throw new UnsupportedOperationException(

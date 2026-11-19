@@ -11,7 +11,8 @@ import pyarrow as pa
 import pytest
 
 import gatun.client
-from gatun import JavaException, aconnect, connect
+from gatun import DeadConnectionError, JavaException, aconnect, connect
+from gatun.callback_channel import AsyncChannelCall
 from gatun.client import GatunClient
 
 
@@ -682,6 +683,44 @@ public class OtherThread {
     Thread.sleep(ms);
   }
 
+  /** Sleep, then make an object: a call that outlasts whatever the test does meanwhile. */
+  public static Object makeSlowly(long ms) throws InterruptedException {
+    Thread.sleep(ms);
+    return new StringBuilder("made slowly");
+  }
+
+  private static volatile CountDownLatch ready = new CountDownLatch(1);
+
+  /** Tell interrupt() that its task has got as far as it should before the interrupt. */
+  public static void ready() {
+    ready.countDown();
+  }
+
+  /** As pause(), telling interrupt() first: the interrupt then finds this thread in here. */
+  public static void readyThenPause(long ms) throws InterruptedException {
+    ready.countDown();
+    Thread.sleep(ms);
+  }
+
+  /** Run the task on a new thread, interrupt that thread once ready() was called, and wait. */
+  public static void interrupt(Runnable task) throws InterruptedException {
+    lastError = null;
+    CountDownLatch reached = new CountDownLatch(1);
+    ready = reached;
+    Thread thread = new Thread(() -> {
+      try {
+        task.run();
+        lastError = "";
+      } catch (Throwable t) {
+        lastError = String.valueOf(t.getMessage());
+      }
+    });
+    thread.start();
+    reached.await(10, java.util.concurrent.TimeUnit.SECONDS);
+    thread.interrupt();
+    thread.join();
+  }
+
   /** Run the task on a new thread after a delay, without waiting for it. */
   public static void later(Runnable task, long delayMs) {
     lastError = null;
@@ -718,7 +757,7 @@ public class OtherThread {
     }, 0);
   }
 
-  /** Null while the task of later(), repeat() or echo() has not finished; empty if it succeeded. */
+  /** Null while the task given last has not finished; empty if it succeeded. */
   public static String lastError() {
     return lastError;
   }
@@ -1628,38 +1667,85 @@ class TestJavaCallsInsideChannelCallbacks:
             release.set()
             client.close()
 
-    def test_java_call_that_gets_no_answer_in_time(self, other_thread_classes):
-        client = connect(
-            memory="16MB",
-            classpath=[other_thread_classes],
-            allowed_classes=["OtherThread"],
-            socket_timeout=0.5,
-        )
-        try:
-            caught = []
+    def test_java_call_that_gets_no_answer_in_time(self, client):
+        caught = []
+        over = threading.Event()
 
-            def wait_too_long():
+        def wait_too_long():
+            # Only for the calls made in here: the requests around them are
+            # not what is being timed
+            client.socket_timeout = 0.5
+            try:
                 for _ in range(2):
                     try:
                         client.jvm.OtherThread.pause(1500)
                     except Exception as e:  # noqa: BLE001 - its type is the result
-                        caught.append(type(e).__name__)
+                        caught.append((type(e).__name__, time.monotonic()))
+            finally:
+                client.socket_timeout = 10
+                over.set()
 
-            task = client.register_callback(wait_too_long, "java.lang.Runnable")
-            client.jvm.OtherThread.later(task, 0)
+        task = client.register_callback(wait_too_long, "java.lang.Runnable")
+        client.jvm.OtherThread.pause(1)  # so that the callback need not look it up
+        client.jvm.OtherThread.later(task, 0)
 
-            # The second call is refused at once: the answer to the first is
-            # still on its way and would be taken for its own
-            started = time.monotonic()
-            _eventually(lambda: True if len(caught) == 2 else None)
-            assert caught == ["SocketTimeoutError", "SocketTimeoutError"]
-            assert time.monotonic() - started < 1.4
+        assert over.wait(10)
+        assert [name for name, _ in caught] == ["SocketTimeoutError"] * 2
+        # The second call is refused at once: the answer to the first is still
+        # on its way and would be taken for its own
+        assert caught[1][1] - caught[0][1] < 0.4
 
-            # Java finishes the first call and takes the callback's answer
-            assert _eventually(client.jvm.OtherThread.lastError) == ""
-            assert client.jvm.java.lang.Math.max(1, 2) == 2
-        finally:
-            client.close()
+        # Java finishes the first call and takes the callback's answer
+        assert _eventually(client.jvm.OtherThread.lastError) == ""
+        assert client.jvm.java.lang.Math.max(1, 2) == 2
+
+    @pytest.mark.parametrize("callback_still_running", [False, True])
+    def test_objects_in_a_response_nobody_waited_for_are_released(
+        self, client, callback_still_running
+    ):
+        def live_objects():
+            report = client.get_metrics()
+            return int(report.split("current_objects:")[1].split()[0])
+
+        caught = []
+        over = threading.Event()
+
+        def give_up_on_it():
+            client.socket_timeout = 0.4
+            try:
+                client.jvm.OtherThread.makeSlowly(1200)
+            except Exception as e:  # noqa: BLE001 - its type is the result
+                caught.append(type(e).__name__)
+            finally:
+                client.socket_timeout = 10
+            if callback_still_running:
+                time.sleep(1.5)  # the response comes while the call is still open
+            over.set()
+
+        task = client.register_callback(give_up_on_it, "java.lang.Runnable")
+        held = client.jvm.OtherThread.makeSlowly(0)  # looked up before the timeout
+        before = live_objects()
+
+        client.jvm.OtherThread.later(task, 0)
+        assert over.wait(10)
+        assert caught == ["SocketTimeoutError"]
+        assert _eventually(client.jvm.OtherThread.lastError) == ""
+
+        # Java made the object after the call had given up on it
+        assert (
+            _eventually(lambda: live_objects() if live_objects() <= before else None)
+            == before
+        )
+        assert held.toString() == "made slowly"
+
+    def test_unregistering_on_a_closed_client_drops_the_function(self, client):
+        comparator = client.register_callback(lambda a, b: 0, "java.util.Comparator")
+        callback_id = comparator.object_id
+        client.close()
+
+        with pytest.raises(DeadConnectionError):
+            client.unregister_callback(callback_id)
+        assert callback_id not in client._callbacks
 
     def test_client_closes_while_a_callback_waits_for_java(self, client):
         owner = client
@@ -1682,6 +1768,160 @@ class TestJavaCallsInsideChannelCallbacks:
 
         assert _eventually(lambda: caught or None) == ["DeadConnectionError"]
         assert owner.jvm.java.lang.Math.max(1, 2) == 2
+
+    def test_call_still_running_when_its_callback_is_answered(
+        self, other_thread_classes
+    ):
+        """Its response comes after the answer, and must still find the caller."""
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            callback_timeout=0.4,
+            socket_timeout=10,
+        )
+        try:
+            outcome = []
+
+            def outlast_the_timeout():
+                started = time.monotonic()
+                try:
+                    client.jvm.OtherThread.pause(1200)
+                    outcome.append(("returned", time.monotonic() - started))
+                except Exception as e:  # noqa: BLE001 - its type is the result
+                    outcome.append((type(e).__name__, time.monotonic() - started))
+
+            supplier = client.register_callback(
+                outlast_the_timeout, "java.util.function.Supplier"
+            )
+            with pytest.raises(JavaException, match="CallbackTimeoutError"):
+                client.jvm.OtherThread.call(supplier)
+
+            result, took = _eventually(lambda: outcome[0] if outcome else None)
+            assert result == "returned"
+            assert took < 5
+        finally:
+            client.close()
+
+    def test_java_thread_is_interrupted_while_it_waits_for_the_callback(self, client):
+        """Nothing runs the callback's Java calls for it any more, so they take
+        the client's own channel."""
+        entered = threading.Event()
+        proceed = threading.Event()
+        seen = []
+
+        def carry_on():
+            entered.set()
+            client.jvm.OtherThread.ready()
+            proceed.wait(10)
+            started = time.monotonic()
+            seen.append((client.jvm.java.lang.Math.max(3, 4), started))
+
+        task = client.register_callback(carry_on, "java.lang.Runnable")
+        try:
+            client.jvm.OtherThread.interrupt(task)
+            assert entered.is_set()
+            assert "Interrupted" in client.jvm.OtherThread.lastError()
+
+            proceed.set()
+            value, started = _eventually(lambda: seen[0] if seen else None)
+            assert value == 4
+            assert time.monotonic() - started < 5
+        finally:
+            proceed.set()
+
+    def test_java_thread_is_interrupted_while_it_runs_the_callbacks_call(self, client):
+        """The interrupt is for the thread: the call fails, and the thread stops
+        waiting for the callback instead of carrying on as if nothing happened."""
+        caught = []
+        seen = []
+
+        def wait_in_java():
+            try:
+                client.jvm.OtherThread.readyThenPause(20_000)
+            except Exception as e:  # noqa: BLE001 - its type is the result
+                caught.append(type(e).__name__)
+            seen.append(client.jvm.java.lang.Math.max(3, 4))
+
+        task = client.register_callback(wait_in_java, "java.lang.Runnable")
+
+        started = time.monotonic()
+        client.jvm.OtherThread.interrupt(task)
+
+        assert time.monotonic() - started < 5
+        assert "Interrupted" in client.jvm.OtherThread.lastError()
+        assert _eventually(lambda: seen or None) == [4]
+        assert caught == ["CancelledException"]
+
+    def test_callback_unregisters_itself(self, client):
+        registered = []
+
+        def once():
+            client.unregister_callback(registered[0])
+            return "bye"
+
+        supplier = client.register_callback(once, "java.util.function.Supplier")
+        registered.append(supplier.object_id)
+
+        assert client.jvm.OtherThread.call(supplier) == "bye"
+        assert supplier.object_id not in client._callbacks
+        with pytest.raises(JavaException, match="after it was unregistered"):
+            client.jvm.OtherThread.call(supplier)
+
+    def test_objects_made_by_a_call_that_outlives_its_session_are_dropped(self, client):
+        owner = client
+
+        def live_objects():
+            report = owner.get_metrics()
+            return int(report.split("current_objects:")[1].split()[0])
+
+        held = owner.jvm.java.util.ArrayList()
+        baseline = live_objects()
+        assert baseline >= 1, "the server does not count objects"
+
+        victim = GatunClient(owner.socket_path)
+        assert victim.connect()
+        entered = threading.Event()
+
+        def make():
+            entered.set()
+            try:
+                victim.jvm.OtherThread.makeSlowly(1200)
+            except Exception:  # noqa: BLE001, S110 - the client closes under it
+                pass
+
+        try:
+            task = victim.register_callback(make, "java.lang.Runnable")
+            victim.jvm.OtherThread.later(task, 0)
+            assert entered.wait(10)
+            time.sleep(0.3)
+        finally:
+            victim.close()
+
+        # The call finishes after its session is gone
+        time.sleep(1.5)
+        assert _eventually(
+            lambda: live_objects() if live_objects() <= baseline else None
+        )
+        assert held.size() == 0
+
+    def test_calls_inside_callbacks_are_counted(self, client):
+        def requests(action):
+            for line in client.get_metrics().splitlines():
+                if line.strip().startswith(f"{action}:"):
+                    return int(line.split("count=")[1].split()[0])
+            return 0
+
+        supplier = client.register_callback(
+            lambda: client.jvm.java.lang.Math.max(3, 4), "java.util.function.Supplier"
+        )
+        client.jvm.OtherThread.call(supplier)  # the class and method are known now
+        before = requests("InvokeStaticMethod")
+
+        client.jvm.OtherThread.call(supplier)
+
+        # The request itself and the call the callback made
+        assert requests("InvokeStaticMethod") == before + 2
 
 
 class TestAsyncJavaCallsInsideChannelCallbacks:
@@ -1802,3 +2042,153 @@ class TestAsyncJavaCallsInsideChannelCallbacks:
             assert await client.jvm.java.lang.Math.max(1, 2) == 2
         finally:
             await client.close()
+
+    async def test_call_still_running_when_its_callback_is_answered(self, client):
+        started = []
+
+        async def record():
+            return await client.jvm.OtherThread.makeSlowly(500)
+
+        async def start():
+            started.append(asyncio.create_task(record()))
+            await asyncio.sleep(0)  # the task has sent its command by now
+
+        task = await client.register_callback(start, "java.lang.Runnable")
+        await client.jvm.OtherThread.later(task, 0)
+        async with asyncio.timeout(10):
+            while not started:
+                await asyncio.sleep(0.05)
+
+        made = await asyncio.wait_for(started[0], 5)
+        assert await made.toString() == "made slowly"
+
+    async def test_callback_unregisters_itself(self, client):
+        registered = []
+
+        async def once():
+            await client.unregister_callback(registered[0])
+            return "bye"
+
+        supplier = await client.register_callback(once, "java.util.function.Supplier")
+        registered.append(supplier.object_id)
+
+        assert await client.jvm.OtherThread.call(supplier) == "bye"
+        with pytest.raises(JavaException, match="after it was unregistered"):
+            await client.jvm.OtherThread.call(supplier)
+
+    async def test_request_cancelled_while_it_is_being_sent(self):
+        """The command may be on its way, so its response would be taken for
+        the next one's."""
+
+        class Interrupted:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, frame):
+                self.sent.append(frame)
+                raise asyncio.CancelledError
+
+            def _forget(self, call):
+                pass
+
+        channel = Interrupted()
+        call = AsyncChannelCall(channel, 1)
+
+        with pytest.raises(asyncio.CancelledError):
+            await call.request(b"first", 1)
+        with pytest.raises(TimeoutError):
+            await call.request(b"second", 1)
+        assert channel.sent == [b"first"]
+
+    async def test_request_on_a_closed_connection(self):
+        """Nothing was sent, so no response can be taken for the next one's:
+        every request fails the same way."""
+
+        class Closed:
+            async def send(self, frame):
+                raise OSError("The callback connection is closed")
+
+            def _forget(self, call):
+                pass
+
+        call = AsyncChannelCall(Closed(), 1)
+
+        for _ in range(2):
+            with pytest.raises(OSError, match="closed"):
+                await call.request(b"command", 1)
+
+    async def test_objects_in_a_response_nobody_waited_for_are_released(self, client):
+        async def live_objects():
+            report = await client.get_metrics()
+            return int(report.split("current_objects:")[1].split()[0])
+
+        caught = []
+        over = asyncio.Event()
+
+        async def give_up_on_it():
+            client.socket_timeout = 0.4
+            try:
+                await client.jvm.OtherThread.makeSlowly(1200)
+            except Exception as e:  # noqa: BLE001 - its type is the result
+                caught.append(type(e).__name__)
+            finally:
+                client.socket_timeout = 10
+            over.set()
+
+        task = await client.register_callback(give_up_on_it, "java.lang.Runnable")
+        held = await client.jvm.OtherThread.makeSlowly(0)
+        before = await live_objects()
+
+        await client.jvm.OtherThread.later(task, 0)
+        await asyncio.wait_for(over.wait(), 10)
+        assert caught == ["SocketTimeoutError"]
+
+        await asyncio.sleep(1.5)  # Java has made the object by now, and answered
+        async with asyncio.timeout(10):
+            while await live_objects() > before:
+                await asyncio.sleep(0.1)
+        assert await live_objects() == before
+        assert await held.toString() == "made slowly"
+
+    async def test_unregistering_on_a_closed_client_drops_the_function(self, client):
+        comparator = await client.register_callback(
+            lambda a, b: 0, "java.util.Comparator"
+        )
+        callback_id = comparator.object_id
+        await client.close()
+
+        with pytest.raises(DeadConnectionError):
+            await client.unregister_callback(callback_id)
+        assert callback_id not in client._callbacks
+
+
+class TestCallbackOwnership:
+    def test_another_session_cannot_unregister_a_callback(self, client, make_client):
+        comparator = client.register_callback(
+            lambda a, b: (a > b) - (a < b), "java.util.Comparator"
+        )
+        other = make_client()
+
+        other.unregister_callback(comparator.object_id)
+
+        items = client.jvm.java.util.ArrayList([2, 1])
+        client.jvm.java.util.Collections.sort(items, comparator)
+        assert list(items) == [1, 2]
+
+    def test_unregistering_inside_an_in_band_callback_leaves_it_registered(
+        self, client
+    ):
+        """The request is refused, so the callback must stay callable."""
+        registered = []
+
+        def compare(a, b):
+            client.unregister_callback(registered[0])
+            return 0
+
+        comparator = client.register_callback(compare, "java.util.Comparator")
+        registered.append(comparator.object_id)
+        items = client.jvm.java.util.ArrayList([2, 1])
+
+        with pytest.raises(JavaException, match="ReentrancyError"):
+            client.jvm.java.util.Collections.sort(items, comparator)
+        assert comparator.object_id in client._callbacks

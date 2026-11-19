@@ -81,6 +81,12 @@ class ChannelCall:
         self._state_lock = threading.Lock()
         self._answered = False
         self._lost = False
+        # Orders a response's arrival against the moment its request gives up
+        self._reply_lock = threading.Lock()
+        # The connection keeps the route for as long as a reply can come:
+        # until the callback is done and no request is waiting for one
+        self._in_flight = False
+        self._finished = False
 
     @property
     def active(self) -> bool:
@@ -93,14 +99,19 @@ class ChannelCall:
             self._answered = True
             self.channel.send_answer(frame)
 
+    def abandon(self) -> None:
+        """Java has stopped waiting for the callback (its thread was interrupted)."""
+        with self._state_lock:
+            self._answered = True
+
     def request(self, frame: bytes | bytearray, timeout: float | None) -> bytes | None:
         """Send a command for Java to run and wait for its response.
 
-        Returns None, having sent nothing, if the callback has been answered:
-        the caller outlived it (a thread it started, a callback that timed out).
-        Raises TimeoutError if no response came in time, and from then on,
-        since the late response would be taken for the next one; OSError if
-        the connection closed.
+        Returns None, having sent nothing, if Java is no longer waiting for the
+        callback: the caller outlived it (a thread it started, a callback that
+        timed out). Raises TimeoutError if no response came in time, and from
+        then on, since the late response would be taken for the next one;
+        OSError if the connection closed.
         """
         with self._exchange_lock:
             if self._lost:
@@ -108,22 +119,58 @@ class ChannelCall:
             with self._state_lock:
                 if self._answered:
                     return None
-                self.channel.send(frame)
+                self._in_flight = True
+                try:
+                    self.channel.send(frame)
+                except BaseException:
+                    self._in_flight = False
+                    raise
             try:
                 reply = self._replies.get(timeout=timeout)
             except queue.Empty:
-                self._lost = True
+                self._give_up()
                 raise TimeoutError("no response from Java") from None
             except BaseException:
-                self._lost = True
+                self._give_up()
                 raise
+            finally:
+                with self._state_lock:
+                    self._in_flight = False
+                    if self._finished:
+                        self.channel._forget(self)
             if reply is None:
                 raise OSError("The callback connection closed")
             return reply
 
+    def finish(self) -> None:
+        """The callback is done. A request of it that is still waiting for its
+        response, in a thread that outlived it, keeps the route until it has it."""
+        with self._state_lock:
+            self._answered = True
+            self._finished = True
+            if not self._in_flight:
+                self.channel._forget(self)
+
+    def _give_up(self) -> None:
+        """Stop waiting for the response to a request that was sent. It may
+        still come, or be here already, and nobody will read it."""
+        with self._reply_lock:
+            self._lost = True
+            while True:
+                try:
+                    unread = self._replies.get_nowait()
+                except queue.Empty:
+                    break
+                if unread is not None:
+                    self.channel._discard(unread)
+
     def deliver(self, reply: bytes | None) -> None:
         """Called by the connection's reader; None once the connection is gone."""
-        self._replies.put(reply)
+        with self._reply_lock:
+            if self._lost and reply is not None:
+                self.channel._discard(reply)
+            else:
+                self._replies.put(reply)
 
 
 class CallbackChannel:
@@ -180,7 +227,7 @@ class CallbackChannel:
                     if call is not None:
                         call.deliver(data)
                     else:
-                        logger.debug("Dropped a response for a call that is over")
+                        self._discard(data)
                     continue
                 client = self._client()
                 if client is None:
@@ -200,6 +247,14 @@ class CallbackChannel:
                 logger.warning("The callback connection failed: %s", e)
         finally:
             self.close()
+
+    def _discard(self, reply: bytes) -> None:
+        """A response whose request stopped waiting for it (it timed out). The
+        server registered the objects in it for the client all the same."""
+        logger.debug("Dropped a response for a call that is over")
+        client = self._client()
+        if client is not None:
+            client._release_unread_response(reply)
 
     def send(self, data: bytes | bytearray) -> None:
         """Send one frame. Raises OSError once the connection is closed."""
@@ -223,7 +278,7 @@ class CallbackChannel:
                 call.deliver(None)
         return call
 
-    def close_call(self, call: ChannelCall) -> None:
+    def _forget(self, call: ChannelCall) -> None:
         with self._calls_lock:
             self._calls.pop(call.call_id, None)
 
@@ -255,6 +310,8 @@ class AsyncChannelCall:
         self._exchange_lock = asyncio.Lock()
         self._answered = False
         self._lost = False
+        self._in_flight = False
+        self._finished = False
 
     @property
     def active(self) -> bool:
@@ -268,37 +325,72 @@ class AsyncChannelCall:
         self._answered = True
         await self.channel.send_answer(frame)
 
+    def abandon(self) -> None:
+        """Java has stopped waiting for the callback (its thread was interrupted)."""
+        self._answered = True
+
     async def request(
         self, frame: bytes | bytearray, timeout: float | None
     ) -> bytes | None:
         """Send a command for Java to run and wait for its response.
 
-        Returns None, having sent nothing, if the callback has been answered:
-        the caller is a task that outlived it. Raises TimeoutError if no
-        response came in time, and from then on, since the late response would
-        be taken for the next one; OSError if the connection closed.
+        Returns None, having sent nothing, if Java is no longer waiting for the
+        callback: the caller is a task that outlived it. Raises TimeoutError if
+        no response came in time, and from then on, since the late response
+        would be taken for the next one; OSError if the connection closed.
         """
         async with self._exchange_lock:
             if self._lost:
                 raise TimeoutError("an earlier call of this callback was abandoned")
             if self._answered:
                 return None
-            await self.channel.send(frame)
+            self._in_flight = True
             try:
+                # From here on the frame may be on its way, whatever interrupts
+                # this task: a cancellation can land in the middle of the send
+                await self.channel.send(frame)
                 reply = await asyncio.wait_for(self._replies.get(), timeout)
             except TimeoutError:
-                self._lost = True
+                self._give_up()
                 raise TimeoutError("no response from Java") from None
-            except BaseException:
-                self._lost = True
+            except OSError:
+                # The connection is closed: no response is on its way, and the
+                # next request fails the same way
                 raise
+            except BaseException:
+                self._give_up()
+                raise
+            finally:
+                self._in_flight = False
+                if self._finished:
+                    self.channel._forget(self)
             if reply is None:
                 raise OSError("The callback connection closed")
             return reply
 
+    def finish(self) -> None:
+        """The callback is done. A request of it that is still waiting for its
+        response, in a task that outlived it, keeps the route until it has it."""
+        self._answered = True
+        self._finished = True
+        if not self._in_flight:
+            self.channel._forget(self)
+
+    def _give_up(self) -> None:
+        """Stop waiting for the response to a request that was sent. It may
+        still come, or be here already, and nobody will read it."""
+        self._lost = True
+        while not self._replies.empty():
+            unread = self._replies.get_nowait()
+            if unread is not None:
+                self.channel._discard(unread)
+
     def deliver(self, reply: bytes | None) -> None:
         """Called by the connection's reader; None once the connection is gone."""
-        self._replies.put_nowait(reply)
+        if self._lost and reply is not None:
+            self.channel._discard(reply)
+        else:
+            self._replies.put_nowait(reply)
 
 
 class AsyncCallbackChannel:
@@ -354,7 +446,7 @@ class AsyncCallbackChannel:
                     if route is not None:
                         route.deliver(data)
                     else:
-                        logger.debug("Dropped a response for a call that is over")
+                        self._discard(data)
                     continue
                 client = self._client()
                 if client is None:
@@ -373,6 +465,13 @@ class AsyncCallbackChannel:
                 logger.warning("The callback connection failed: %s", e)
         finally:
             self.close()
+
+    def _discard(self, reply: bytes) -> None:
+        """A response whose request stopped waiting for it; see CallbackChannel."""
+        logger.debug("Dropped a response for a call that is over")
+        client = self._client()
+        if client is not None:
+            client._release_unread_response(reply)
 
     async def send(self, data: bytes | bytearray) -> None:
         """Send one frame. Raises OSError once the connection is closed."""
@@ -398,7 +497,7 @@ class AsyncCallbackChannel:
             route.deliver(None)
         return route
 
-    def close_call(self, route: AsyncChannelCall) -> None:
+    def _forget(self, route: AsyncChannelCall) -> None:
         self._routes.pop(route.call_id, None)
 
     def close(self) -> None:

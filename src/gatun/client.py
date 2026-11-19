@@ -1419,6 +1419,31 @@ def _unpack_value_impl(
     return None
 
 
+def _release_unread_response(client: Any, reply: bytes) -> None:
+    """Queue the objects named in a response that nobody will read for release.
+
+    The request that asked for it stopped waiting (it timed out), but Java
+    registered the objects in its result for this client, and only the client
+    can release them before the session ends.
+    """
+    ids: list[int] = []
+    try:
+        resp = Response.Response.GetRootAsResponse(reply, 0)
+        if resp.IsError() or resp.IsCallback():
+            return
+        # No wrappers, which would be Java objects to hash as a map's keys
+        _unpack_value_impl(
+            resp.ReturnValType(),
+            resp.ReturnVal(),
+            client,
+            lambda _client, object_id: ids.append(object_id),
+        )
+    except Exception as e:  # noqa: BLE001 - whatever it is, there is nobody to tell
+        logger.debug("Could not read a response nobody waited for: %s", e)
+    for object_id in ids:
+        client._queue_free(object_id)
+
+
 def _unpack_array_impl(array_val, client: Any, ref_class: Any):
     """Unpack an ArrayVal FlatBuffer to a JavaArray (preserves array semantics).
 
@@ -1739,8 +1764,12 @@ _NESTABLE_ACTIONS = frozenset(
         Act.Action.IsInstanceOf,
         Act.Action.GetStaticField,
         Act.Action.SetStaticField,
+        Act.Action.UnregisterCallback,
     }
 )
+# The error type of the response to a command sent for a call that Java has
+# stopped waiting on. Must match GatunServer.CALL_ENDED.
+_CALL_ENDED = b"org.gatun.server.CallbackCallEnded"
 _ACTION_NAMES = {
     value: name for name, value in vars(Act.Action).items() if isinstance(value, int)
 }
@@ -2560,6 +2589,11 @@ class GatunClient(_ValueEncoder):
         if reply is None:
             return False, None
         resp = Response.Response.GetRootAsResponse(reply, 0)
+        if resp.IsError() and resp.ErrorType() == _CALL_ENDED:
+            # The Java thread gave up on the callback (it was interrupted) and
+            # did not run the command
+            call.abandon()
+            return False, None
         return True, self._parse_response(resp)
 
     def _check_reentrancy(self) -> None:
@@ -2607,6 +2641,9 @@ class GatunClient(_ValueEncoder):
         """
         if not self._dead:
             self._pending_frees.append(object_id)
+
+    def _release_unread_response(self, reply: bytes) -> None:
+        _release_unread_response(self, reply)
 
     def _flush_pending_frees(self) -> None:
         """Send FreeObject for every queued object ID, many IDs per round trip.
@@ -2953,7 +2990,7 @@ class GatunClient(_ValueEncoder):
                     pass
             raise
         finally:
-            channel.close_call(channel_call)
+            channel_call.finish()
             self._release_on_channel(channel)
 
     def _release_on_channel(self, channel: CallbackChannel) -> None:
@@ -3803,9 +3840,6 @@ class GatunClient(_ValueEncoder):
         Args:
             callback_id: The callback ID to unregister
         """
-        # Remove from local registry
-        self._callbacks.pop(callback_id, None)
-
         builder = self._get_builder()
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.UnregisterCallback)
@@ -3813,15 +3847,25 @@ class GatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        self._send_raw(builder.Output())
+        try:
+            self._send_raw(builder.Output())
+        except BaseException:
+            # A request that was refused must not leave Java calling a function
+            # that is gone. On a client that is closed or dead the session is
+            # over, and its callbacks with it.
+            if self._closed or self._dead:
+                self._callbacks.pop(callback_id, None)
+            raise
+        self._callbacks.pop(callback_id, None)
 
     def free_object(self, object_id):
         """Release a Java object.
 
         Sent to the server straight away, except inside a callback made by the
         thread that runs the client's request, where it goes out with the next
-        request. The server ignores an unknown or already-freed ID. JavaObject wrappers release themselves when garbage collected, so this
-        is only needed for objects that were detach()ed.
+        request. The server ignores an unknown or already-freed ID. JavaObject
+        wrappers release themselves when garbage collected, so this is only
+        needed for objects that were detach()ed.
         """
         if self._dead or self.sock is None or self.sock.fileno() == -1:
             return
