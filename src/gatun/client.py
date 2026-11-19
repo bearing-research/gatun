@@ -1419,6 +1419,31 @@ def _unpack_value_impl(
     return None
 
 
+def _release_unread_response(client: Any, reply: bytes) -> None:
+    """Queue the objects named in a response that nobody will read for release.
+
+    The request that asked for it stopped waiting (it timed out), but Java
+    registered the objects in its result for this client, and only the client
+    can release them before the session ends.
+    """
+    ids: list[int] = []
+    try:
+        resp = Response.Response.GetRootAsResponse(reply, 0)
+        if resp.IsError() or resp.IsCallback():
+            return
+        # No wrappers, which would be Java objects to hash as a map's keys
+        _unpack_value_impl(
+            resp.ReturnValType(),
+            resp.ReturnVal(),
+            client,
+            lambda _client, object_id: ids.append(object_id),
+        )
+    except Exception as e:  # noqa: BLE001 - whatever it is, there is nobody to tell
+        logger.debug("Could not read a response nobody waited for: %s", e)
+    for object_id in ids:
+        client._queue_free(object_id)
+
+
 def _unpack_array_impl(array_val, client: Any, ref_class: Any):
     """Unpack an ArrayVal FlatBuffer to a JavaArray (preserves array semantics).
 
@@ -2616,6 +2641,9 @@ class GatunClient(_ValueEncoder):
         """
         if not self._dead:
             self._pending_frees.append(object_id)
+
+    def _release_unread_response(self, reply: bytes) -> None:
+        _release_unread_response(self, reply)
 
     def _flush_pending_frees(self) -> None:
         """Send FreeObject for every queued object ID, many IDs per round trip.
@@ -3819,9 +3847,15 @@ class GatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        self._send_raw(builder.Output())
-        # Only once the server has dropped it: a request that could not be
-        # sent must not leave Java calling a function that is gone
+        try:
+            self._send_raw(builder.Output())
+        except BaseException:
+            # A request that was refused must not leave Java calling a function
+            # that is gone. On a client that is closed or dead the session is
+            # over, and its callbacks with it.
+            if self._closed or self._dead:
+                self._callbacks.pop(callback_id, None)
+            raise
         self._callbacks.pop(callback_id, None)
 
     def free_object(self, object_id):

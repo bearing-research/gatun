@@ -68,6 +68,7 @@ from gatun.client import (
     _nested_command,
     _raise_java_exception_impl,
     _read_arrow_stream,
+    _release_unread_response,
     _remember_reflection,
     _take_free_chunk,
     _unpack_value_impl,
@@ -405,6 +406,9 @@ class AsyncGatunClient(_ValueEncoder):
             logger.error("Connection failed: %s", e)
             self.connect_error = e
             return False
+
+    def _release_unread_response(self, reply: bytes) -> None:
+        _release_unread_response(self, reply)
 
     def _queue_free(self, object_id: int) -> None:
         """Queue a Java object for release. Called by AsyncJavaObject finalizers."""
@@ -1342,9 +1346,15 @@ class AsyncGatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        await self._send_raw(builder.Output())
-        # Only once the server has dropped it: a request that could not be
-        # sent must not leave Java calling a function that is gone
+        try:
+            await self._send_raw(builder.Output())
+        except BaseException:
+            # A request that was refused must not leave Java calling a function
+            # that is gone. On a client that is closed or dead the session is
+            # over, and its callbacks with it.
+            if self._closed or self._dead:
+                self._callbacks.pop(callback_id, None)
+            raise
         self._callbacks.pop(callback_id, None)
 
     async def reflect(self, full_name: str) -> str:
