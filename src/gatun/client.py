@@ -2946,6 +2946,7 @@ class GatunClient(_ValueEncoder):
         resp,
         reply: Callable[[Any, bool, str | None], None] | None = None,
         channel_call: ChannelCall | None = None,
+        handler: Any = None,
     ):
         """Handle a callback invocation request from Java.
 
@@ -2973,7 +2974,9 @@ class GatunClient(_ValueEncoder):
             else:
                 reply(result, is_error, error_msg)
 
-        callback_fn = self._callbacks.get(callback_id)
+        callback_fn = (
+            handler if handler is not None else self._callbacks.get(callback_id)
+        )
 
         def call() -> Any:
             # Unpacked even when the callback is gone (unregistered while Java
@@ -3062,10 +3065,13 @@ class GatunClient(_ValueEncoder):
             answer(None, True, f"{type(e).__name__}: {e}")
             raise
 
-    def _serve_channel_callback(self, channel: CallbackChannel, resp) -> None:
+    def _serve_channel_callback(
+        self, channel: CallbackChannel, resp, handler: Any = None
+    ) -> None:
         """Run one callback that arrived on the callback connection.
 
-        Runs on a thread of its own, started by the connection's reader.
+        Runs on a thread of its own, started by the connection's reader, which
+        has looked up the callback's `handler`.
         """
         callback_id = resp.CallbackId()
         call_id = resp.CallId()
@@ -3082,7 +3088,7 @@ class GatunClient(_ValueEncoder):
             )
 
         try:
-            self._handle_callback(resp, reply, channel_call)
+            self._handle_callback(resp, reply, channel_call, handler)
         except OSError as e:
             # The connection closed under the callback; Java was told by that
             logger.debug("Callback %d could not be answered: %s", callback_id, e)
@@ -3904,6 +3910,9 @@ class GatunClient(_ValueEncoder):
 
         Returns:
             A JavaObject representing the proxy that implements the interface.
+            The callback lasts until unregister_callback(), or until neither
+            this handle nor any Java code refers to the proxy: keep the handle
+            when what you give the proxy to holds it only weakly.
 
         Example:
             # Create a Comparator for sorting

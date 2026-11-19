@@ -6,6 +6,8 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.lang.ref.Cleaner;
+import java.lang.ref.Reference;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -118,7 +120,8 @@ public class GatunServer {
   private final Set<Path> sessionFiles = ConcurrentHashMap.newKeySet();
 
   // --- CALLBACK REGISTRY ---
-  // Maps callback ID -> CallbackInfo (interface name + proxy object + session context)
+  // Maps callback ID -> CallbackInfo (interface name + session context). Not the proxy: held
+  // here it would never be garbage collected, and a callback nothing can call would stay
   // Note: callback IDs are allocated from objectIdCounter to ensure uniqueness
   private final Map<Long, CallbackInfo> callbackRegistry = new ConcurrentHashMap<>();
 
@@ -309,16 +312,18 @@ public class GatunServer {
   private static class CallbackInfo {
     final long id;
     final String interfaceName;
-    final Object proxyInstance;
     final SessionContext sessionContext; // Captured for cross-thread callback invocations
 
-    CallbackInfo(long id, String interfaceName, Object proxyInstance, SessionContext ctx) {
+    // Not the proxy: an entry here must not be what keeps it alive (see proxyCollected)
+    CallbackInfo(long id, String interfaceName, SessionContext ctx) {
       this.id = id;
       this.interfaceName = interfaceName;
-      this.proxyInstance = proxyInstance;
       this.sessionContext = ctx;
     }
   }
+
+  // Tells when a callback's proxy has been garbage collected
+  private static final Cleaner PROXY_CLEANER = Cleaner.create();
 
   public GatunServer(String socketPathStr, long memorySize) {
     this.socketPath = Path.of(socketPathStr);
@@ -2649,15 +2654,22 @@ public class GatunServer {
             return InvocationHandler.invokeDefault(proxy, method, args);
           }
 
-          Object result =
-              invokeCallback(
-                  callbackId, method.getName(), args == null ? new Object[0] : args, ctx);
-          // A cancel that arrived during the round trip, when it could not interrupt. It is
-          // aimed at the request's thread; another thread's call carries on.
-          if (ctx.control.isSessionThread() && ctx.control.isCancelled()) {
-            throw new InterruptedException("Request was cancelled");
+          try {
+            Object result =
+                invokeCallback(
+                    callbackId, method.getName(), args == null ? new Object[0] : args, ctx);
+            // A cancel that arrived during the round trip, when it could not interrupt. It is
+            // aimed at the request's thread; another thread's call carries on.
+            if (ctx.control.isSessionThread() && ctx.control.isCancelled()) {
+              throw new InterruptedException("Request was cancelled");
+            }
+            return callbackResult(result, method);
+          } finally {
+            // The caller may hold the proxy for this call only, and nothing above uses it: without
+            // this the collector could take it, and unregister the callback, with the call under
+            // way (see proxyCollected)
+            Reference.reachabilityFence(proxy);
           }
-          return callbackResult(result, method);
         };
 
     return Proxy.newProxyInstance(
@@ -3320,6 +3332,33 @@ public class GatunServer {
   }
 
   /**
+   * A callback's proxy has been garbage collected: the client released its handle on it and no Java
+   * code holds it any more, so nothing can call it again. The callback is unregistered and the
+   * client is told, so that it can drop the Python function. Runs on the cleaner's thread.
+   */
+  private void proxyCollected(long callbackId, SessionContext ctx) {
+    if (!ctx.sessionCallbackIds.remove(callbackId)) {
+      return; // unregistered already
+    }
+    callbackRegistry.remove(callbackId);
+    LOG.fine("Unregistered callback ID " + callbackId + ": its proxy was garbage collected");
+    CallbackChannel channel = ctx.callbackChannel;
+    if (ctx.closed || channel == null) {
+      return;
+    }
+    FlatBufferBuilder builder = new FlatBufferBuilder(64);
+    Response.startResponse(builder);
+    Response.addCallbackId(builder, callbackId);
+    Response.addCallbackReleased(builder, true);
+    builder.finish(Response.endResponse(builder));
+    try {
+      channel.send(builder.dataBuffer());
+    } catch (IOException e) {
+      // The client is gone, and its callbacks with it
+    }
+  }
+
+  /**
    * Make a proxy for a Python callback and register it, as callback and as object, for {@code ctx}.
    */
   private ObjectRefT registerCallback(Command cmd, SessionContext ctx) throws Exception {
@@ -3335,11 +3374,13 @@ public class GatunServer {
     Object proxy = createCallbackProxy(callbackId, interfaceName, ownMethods(cmd), ctx);
     ctx.quota.allocateObject();
 
-    callbackRegistry.put(callbackId, new CallbackInfo(callbackId, interfaceName, proxy, ctx));
+    callbackRegistry.put(callbackId, new CallbackInfo(callbackId, interfaceName, ctx));
     ctx.sessionCallbackIds.add(callbackId);
 
     putObject(callbackId, proxy);
     ctx.sessionObjectIds.add(callbackId);
+    // The action must not refer to the proxy, or it would never run
+    PROXY_CLEANER.register(proxy, () -> proxyCollected(callbackId, ctx));
 
     LOG.fine("Registered callback ID " + callbackId + " for interface " + interfaceName);
     return new ObjectRefT(callbackId);

@@ -252,7 +252,8 @@ table CreateObjectsRequest {
 // interrupted), the command is not run and the Response is an error of type
 // "org.gatun.server.CallbackCallEnded"; the client then uses its own channel.
 // A frame with no call_id belongs to no call: Python releasing
-// objects (FreeObject).
+// objects (FreeObject), or Java reporting a callback whose proxy is gone
+// (Response.callback_released).
 //
 // Arrow tables do not travel in frames. A callback that moves one (ArrowToObject,
 // ArrowFromObject) first sends OpenCallMemory: Java creates a shared memory file for that
@@ -343,6 +344,10 @@ table Response {
 
   // On the callback connection: which call this frame belongs to
   call_id: long;
+
+  // On the callback connection, with callback_id and nothing else: the callback's proxy was
+  // garbage collected, so Java will not call it again and the client may drop its function
+  callback_released: bool;
 }
 
 // Batch of responses (one per command in BatchCommand)

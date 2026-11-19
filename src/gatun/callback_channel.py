@@ -9,7 +9,9 @@ The connection carries no shared memory. Each frame is a four-byte
 little-endian length followed by a FlatBuffer: a Response with is_callback set
 from Java, a CallbackResponse command from Python. Calls from several threads
 are in flight at once and are answered in any order; the call_id in both frames
-pairs them.
+pairs them. Java also sends a Response with callback_released and no call_id,
+when its garbage collector has taken a callback's proxy and nothing can call
+the callback again.
 
 Until a callback answers, the Java thread that called it is waiting, and it is
 the one thread that is certain to be free: the client's own channel may be busy
@@ -267,6 +269,9 @@ class CallbackChannel:
                 if data is None:
                     return
                 resp = Response.Response.GetRootAsResponse(data, 0)
+                if resp.CallbackReleased():
+                    self._callback_released(resp.CallbackId())
+                    continue
                 if not resp.IsCallback():
                     # The response to a command a callback sent
                     with self._calls_lock:
@@ -279,21 +284,53 @@ class CallbackChannel:
                 client = self._client()
                 if client is None:
                     return
+                # Looked up before the next frame is read: that one may say
+                # that Java has let go of this callback (the caller was
+                # interrupted and held the only reference to the proxy)
+                handler = client._callbacks.get(resp.CallbackId())
                 # A thread per call: calls overlap, one may run for hours, and
                 # one may be what another is waiting for
                 threading.Thread(
                     target=client._serve_channel_callback,
-                    args=(self, resp),
+                    args=(self, resp, handler),
                     name="gatun-callback",
                     daemon=True,
                 ).start()
                 # Not held while waiting for the next frame
-                del client
+                del client, handler
         except OSError as e:
             if not self._closed:
                 logger.warning("The callback connection failed: %s", e)
         finally:
             self.close()
+
+    def _callback_released(self, callback_id: int) -> None:
+        """Java's garbage collector took a callback's proxy: the client let go
+        of its handle and no Java code holds it, so nothing calls it again."""
+        client = self._client()
+        if client is None:
+            return
+        handler = client._callbacks.pop(callback_id, None)
+        if handler is None:
+            return
+        logger.debug("Callback %d dropped: Java no longer holds its proxy", callback_id)
+        # The function's last reference ends on a thread of its own. A
+        # finalizer of it, or of something only it kept alive, may call Java
+        # and wait for the client's channel, which a request that is waiting
+        # for a callback may hold: this thread has to go on reading.
+        held = [handler]
+        del handler
+        threading.Thread(
+            target=self._let_go, args=(held,), name="gatun-callback-drop", daemon=True
+        ).start()
+
+    def _let_go(self, held: list[Any]) -> None:
+        held.clear()
+        # Java objects the function kept alive are queued for release now, and
+        # the client may not make a request for a long time
+        client = self._client()
+        if client is not None:
+            client._release_on_channel(self)
 
     def _discard(self, reply: bytes) -> None:
         """A response whose request stopped waiting for it (it timed out). The
@@ -492,6 +529,9 @@ class AsyncCallbackChannel:
                 header = await self._reader.readexactly(_LENGTH.size)
                 data = await self._reader.readexactly(_checked_size(header))
                 resp = Response.Response.GetRootAsResponse(data, 0)
+                if resp.CallbackReleased():
+                    self._callback_released(resp.CallbackId())
+                    continue
                 if not resp.IsCallback():
                     # The response to a command a callback sent
                     route = self._routes.get(resp.CallId())
@@ -503,13 +543,17 @@ class AsyncCallbackChannel:
                 client = self._client()
                 if client is None:
                     return
+                # Looked up before the next frame is read; see CallbackChannel
+                handler = client._callbacks.get(resp.CallbackId())
                 # A task per call: calls overlap, and one may be what another
                 # is waiting for
-                call = asyncio.create_task(client._serve_channel_callback(self, resp))
+                call = asyncio.create_task(
+                    client._serve_channel_callback(self, resp, handler)
+                )
                 self._calls.add(call)
                 call.add_done_callback(self._calls.discard)
                 # Not held while waiting for the next frame
-                del client
+                del client, handler
         except asyncio.IncompleteReadError:
             pass  # the connection ended
         except OSError as e:
@@ -517,6 +561,18 @@ class AsyncCallbackChannel:
                 logger.warning("The callback connection failed: %s", e)
         finally:
             self.close()
+
+    def _callback_released(self, callback_id: int) -> None:
+        """Java's garbage collector took a callback's proxy; see CallbackChannel."""
+        client = self._client()
+        if client is None or client._callbacks.pop(callback_id, None) is None:
+            return
+        logger.debug("Callback %d dropped: Java no longer holds its proxy", callback_id)
+        # Java objects the function kept alive are queued for release now, and
+        # the client may not make a request for a long time
+        release = asyncio.create_task(client._release_on_channel(self))
+        self._calls.add(release)
+        release.add_done_callback(self._calls.discard)
 
     def _discard(self, reply: bytes) -> None:
         """A response whose request stopped waiting for it; see CallbackChannel."""

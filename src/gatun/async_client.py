@@ -685,6 +685,7 @@ class AsyncGatunClient(_ValueEncoder):
         resp,
         reply: Callable[[Any, bool, str | None], Awaitable[None]] | None = None,
         channel_call: AsyncChannelCall | None = None,
+        handler: Any = None,
     ):
         """Handle a callback invocation request from Java.
 
@@ -726,7 +727,8 @@ class AsyncGatunClient(_ValueEncoder):
                 arg = resp.CallbackArgs(i)
                 args.append(self._unpack_value(arg.ValType(), arg.Val()))
 
-            handler = self._callbacks.get(callback_id)
+            if handler is None:
+                handler = self._callbacks.get(callback_id)
             if handler is None:
                 raise LookupError(f"Callback {callback_id} not found")
             callback_fn = _callback_target(handler, resp.CallbackMethod())
@@ -760,7 +762,7 @@ class AsyncGatunClient(_ValueEncoder):
                 self._callback_tasks.discard(task)
 
     async def _serve_channel_callback(
-        self, channel: AsyncCallbackChannel, resp
+        self, channel: AsyncCallbackChannel, resp, handler: Any = None
     ) -> None:
         """Run one callback that arrived on the callback connection.
 
@@ -781,7 +783,7 @@ class AsyncGatunClient(_ValueEncoder):
             )
 
         try:
-            await self._handle_callback(resp, reply, channel_call)
+            await self._handle_callback(resp, reply, channel_call, handler)
         except OSError as e:
             # The connection closed under the callback; Java was told by that
             logger.debug("Callback %d could not be answered: %s", callback_id, e)
