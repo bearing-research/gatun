@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `benchmarks/benchmark_transport.py` measures Arrow transfer through shared memory against a Unix socket and a file, in both directions
 - Java can call a Python callback from any thread and at any time, not only from the thread running the client's request: listeners, timers, executors and parallel streams work, several calls at once. These calls travel on a second connection that the client opens with its first `register_callback`. Both clients
 - A callback that arrives on that connection can call Java (object creation, method calls, field access), also while the client's own channel is busy with a long request or with the request that is waiting for the callback: its calls travel on the callback connection and are run by the Java thread that waits for it. Arrow transfers, batches and vectorized calls are refused there with `ReentrancyError`
+- `arrow_to_java()` and `arrow_from_java()` work inside a callback that Java made from another thread (a Spark `foreachBatch` function fetching its batch as Arrow, for example), on both clients. The table goes through shared memory that belongs to that one call, so it does not wait for the request the client is running, and callbacks running at the same time do not share it
 - `allowed_classes` and `allowed_prefixes` arguments to `connect()`, `aconnect()`, `launch_gateway()` and `GatunAdapter`, also settable in `pyproject.toml` and through `GATUN_ALLOWED_CLASSES` / `GATUN_ALLOWED_PREFIXES`. Using a library outside the built-in allowlist no longer needs a source edit and a rebuild
 - `socket_timeout` and `callback_timeout` arguments to `connect()`, `aconnect()` and `GatunAdapter`; the handshake uses the configured `connect_timeout`
 - `gatun.limits.max_sessions` caps the sessions a server serves at once (default: unlimited). A connection that arrives while every slot is taken waits up to two seconds for one before it is refused
@@ -27,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `memory` accepts `K` / `M` / `G` suffixes, fractions (`"1.5GB"`), a byte count, or an int
 
 ### Changed
-- Protocol version is now 4: `Action.OpenCallbackChannel`, `Action.NestedCommand` and a `call_id` on commands and responses, for the callback connection. Client and server must be upgraded together
+- Protocol version is now 4: `Action.OpenCallbackChannel`, `Action.NestedCommand`, `Action.OpenCallMemory` and a `call_id` on commands and responses, for the callback connection. Client and server must be upgraded together
 - A Java object that a callback returns is no longer released before Java has read the callback's answer
 - A session can unregister only its own callbacks, and `unregister_callback()` keeps the Python function until the server has dropped the callback
 - A callback's arguments that could not be sent (more than 64KB of them) no longer leave their objects registered for the session
@@ -57,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Connecting checks that the filesystem has room for the whole shared memory file and refuses the session if not, with the reason in the error. The file is still sparse, so this is a check and not a reservation: it catches a disk that cannot hold the file, not several sessions that later fill it between them
 
 ### Fixed
+- An Arrow transfer attempted inside a callback made by the request's own thread raises `ReentrancyError` at once. With a callback timeout set it used to wait for the channel the waiting request held, and failed only when the callback timed out
 - `pytest` no longer collects tests from an extracted Spark distribution (`testpaths`)
 - `spotlessCheck` no longer fails on generated FlatBuffers code
 - CI now runs the Python 3.14 job on Python 3.14

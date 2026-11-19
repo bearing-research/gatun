@@ -416,17 +416,32 @@ public class GatunServer {
    * connection pay for its full size.
    */
   private FileChannel createSharedMemoryFile(Path path) throws IOException {
+    return createSharedMemoryFile(path, callMemoryBytes.get(), "the session's shared memory");
+  }
+
+  /**
+   * @param promised the bytes of free space that other files of this kind may still come to use,
+   *     which this one must leave them
+   * @param purpose what the file is for, as the error for a full disk names it
+   */
+  private FileChannel createSharedMemoryFile(Path path, long promised, String purpose)
+      throws IOException {
     // The file is sparse, so a full disk would not show until a page is first written, and
     // then as a fault that takes the whole JVM down. Refuse the session instead.
     long usable = Files.getFileStore(path.toAbsolutePath().getParent()).getUsableSpace();
-    if (usable < this.memorySize) {
+    if (usable - promised < this.memorySize) {
       throw new IOException(
-          "Not enough free space for the session's shared memory: "
+          "Not enough free space for "
+              + purpose
+              + ": "
               + this.memorySize
               + " bytes needed, "
               + usable
               + " available in "
-              + path.toAbsolutePath().getParent());
+              + path.toAbsolutePath().getParent()
+              + (promised > 0
+                  ? ", " + promised + " of them set aside for tables that callbacks are moving"
+                  : ""));
     }
     Files.deleteIfExists(path); // removes a link itself, never what it points at
     FileChannel channel =
@@ -1134,80 +1149,27 @@ public class GatunServer {
           }
           // --- ARROW TABLE AS A JAVA OBJECT (Python -> Java) ---
           else if (cmd.action() == Action.ArrowToObject) {
-            BufferDescriptor stream = cmd.arrowStream();
-            if (stream == null) {
-              throw new IllegalArgumentException("ArrowToObject requires arrow_stream");
-            }
             long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
-            long offset = stream.offset();
-            long length = stream.length();
-            // The values are unsigned on the wire; negative here means larger than any zone
-            if (offset < 0
-                || length <= 0
-                || offset > payloadSize
-                || length > payloadSize - offset) {
-              throw new IllegalArgumentException(
-                  String.format(
-                      "Arrow stream is outside the payload zone: offset=%s length=%s, zone is %d"
-                          + " bytes",
-                      Long.toUnsignedString(offset), Long.toUnsignedString(length), payloadSize));
-            }
-            if (offset < arrowHandler.getLoadedEnd()) {
-              throw new IllegalStateException(
-                  String.format(
-                      "Arrow stream at offset %d overlaps the batch loaded by send_arrow_buffers,"
-                          + " which ends at offset %d. Reset the payload arena first.",
-                      offset, arrowHandler.getLoadedEnd()));
-            }
-
-            // Refuse before reading; both are taken only once the table exists
-            quota.checkObjectLimit();
-            quota.holdArrowBytes(length);
-            VectorSchemaRoot table;
-            try {
-              table = arrowHandler.readIpcTable(sharedMem.asSlice(PAYLOAD_OFFSET + offset, length));
-            } catch (Throwable t) {
-              quota.releaseHeldArrowBytes(length);
-              throw t;
-            }
-            try {
-              quota.allocateObject();
-            } catch (RuntimeException e) {
-              // A callback on another thread took the last slot since the check above
-              quota.releaseHeldArrowBytes(length);
-              table.close();
-              throw e;
-            }
-            synchronized (ownedTables) {
-              ownedTables.put(table, new OwnedTable(length, quota));
-            }
-            long newId = objectIdCounter.getAndIncrement();
-            putObject(newId, table);
-            sessionObjectIds.add(newId);
-            observer.onArrowTransfer("python_to_java", table.getRowCount(), length, false);
-            result = new ObjectRefT(newId);
+            result =
+                arrowToObject(
+                    cmd.arrowStream(),
+                    sharedMem.asSlice(PAYLOAD_OFFSET, payloadSize),
+                    arrowHandler,
+                    sessionObjectIds,
+                    quota);
           }
           // --- ARROW TABLE HELD BY A JAVA OBJECT (Java -> Python) ---
           else if (cmd.action() == Action.ArrowFromObject) {
-            long targetId = cmd.targetId();
-            Object target = sessionObject(targetId);
-            if (target == null) throw new RuntimeException("Object " + targetId + " not found");
-            if (!(target instanceof VectorSchemaRoot table)) {
-              throw new IllegalArgumentException(
-                  "Object "
-                      + targetId
-                      + " is a "
-                      + target.getClass().getName()
-                      + ", not an org.apache.arrow.vector.VectorSchemaRoot");
-            }
             // Everything past the batch loaded by send_arrow_buffers (if any) is free to use
             long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
             long start = Math.min(arrowHandler.getLoadedEnd(), payloadSize);
             long length =
-                arrowHandler.writeIpcTable(
-                    table, sharedMem.asSlice(PAYLOAD_OFFSET + start, payloadSize - start));
-            observer.onArrowTransfer("java_to_python", table.getRowCount(), length, false);
-            responseOffset = packArrowStreamResponse(builder, start, length);
+                arrowFromObject(
+                    cmd.targetId(),
+                    sharedMem.asSlice(PAYLOAD_OFFSET + start, payloadSize - start),
+                    arrowHandler,
+                    quota.getSessionId());
+            responseOffset = packArrowStreamResponse(builder, start, length, 0);
             responsePacked = true;
           }
           // --- CALLBACK BLOCK ---
@@ -3111,6 +3073,7 @@ public class GatunServer {
     SessionContext previous = sessionContext.get();
     sessionContext.set(ctx);
     long callId = channel.begin();
+    CallMemory memory = new CallMemory(ctx.quota.getSessionId(), callId);
     // Until Python answers, the session is in use: the idle reaper must leave it alone
     ctx.channelCalls.incrementAndGet();
     ctx.quota.touchActivity();
@@ -3146,7 +3109,7 @@ public class GatunServer {
         // The callback is calling Java. This thread is the one waiting for the callback, so
         // it runs the call: the session's own thread may be busy with a request, possibly
         // the very request that is waiting for this thread.
-        channel.send(runNested(frame, callId, ctx));
+        channel.send(runNested(frame, callId, ctx, memory));
       }
     } catch (IOException e) {
       // Nobody will free the arguments' objects if the request never went out, or if the
@@ -3165,6 +3128,7 @@ public class GatunServer {
           "Interrupted while Python callback " + methodName + " was running", e);
     } finally {
       channel.end(callId);
+      memory.close();
       ctx.channelCalls.decrementAndGet();
       ctx.quota.touchActivity();
       if (previous == null) {
@@ -3179,9 +3143,11 @@ public class GatunServer {
    * Run a command that a callback sent on the callback connection, and build its response.
    *
    * <p>Runs on the thread that called the callback, never the session's own, so nothing here may
-   * touch the session's shared memory: it is confined to the session's thread.
+   * touch the session's shared memory: it is confined to the session's thread. Arrow tables go
+   * through the call's own memory instead.
    */
-  private ByteBuffer runNested(Command envelope, long callId, SessionContext ctx) {
+  private ByteBuffer runNested(
+      Command envelope, long callId, SessionContext ctx, CallMemory memory) {
     FlatBufferBuilder builder = new FlatBufferBuilder(256);
     List<Long> registered = new ArrayList<>();
     RequestContext request = null;
@@ -3200,8 +3166,11 @@ public class GatunServer {
       if (ctx.closed) {
         throw new IllegalStateException("The client has disconnected");
       }
-      result = executeNested(cmd, ctx);
-      response = packResult(builder, result, ctx.sessionObjectIds, ctx.quota, registered, callId);
+      result = executeNested(cmd, ctx, memory);
+      response =
+          result instanceof ArrowStreamLocation stream
+              ? packArrowStreamResponse(builder, stream.offset(), stream.length(), callId)
+              : packResult(builder, result, ctx.sessionObjectIds, ctx.quota, registered, callId);
     } catch (Throwable t) {
       Throwable cause = unwrap(t);
       if (cause instanceof InterruptedException) {
@@ -3249,7 +3218,8 @@ public class GatunServer {
   }
 
   /** The commands a callback may send on the callback connection. */
-  private Object executeNested(Command cmd, SessionContext ctx) throws Throwable {
+  private Object executeNested(Command cmd, SessionContext ctx, CallMemory memory)
+      throws Throwable {
     switch (cmd.action()) {
       case Action.Ping:
         return true;
@@ -3269,6 +3239,17 @@ public class GatunServer {
       case Action.UnregisterCallback:
         unregisterCallback(cmd.targetId(), ctx.sessionCallbackIds);
         return null;
+      case Action.OpenCallMemory:
+        return memory.open();
+      case Action.ArrowToObject:
+        return arrowToObject(
+            cmd.arrowStream(), memory.segment(), memory.arrow(), ctx.sessionObjectIds, ctx.quota);
+      case Action.ArrowFromObject:
+        // The call moves one table at a time, so each starts at the front
+        return new ArrowStreamLocation(
+            0,
+            arrowFromObject(
+                cmd.targetId(), memory.segment(), memory.arrow(), ctx.quota.getSessionId()));
       default:
         byte action = cmd.action();
         throw new UnsupportedOperationException(
@@ -3392,12 +3373,205 @@ public class GatunServer {
 
   /** Pack an Arrow write result into a response with ArrowBatchDescriptor. */
   /** A response that says where in the payload zone an Arrow IPC stream was written. */
-  private int packArrowStreamResponse(FlatBufferBuilder builder, long offset, long length) {
+  private int packArrowStreamResponse(
+      FlatBufferBuilder builder, long offset, long length, long callId) {
     int stream = BufferDescriptor.createBufferDescriptor(builder, offset, length);
     Response.startResponse(builder);
     Response.addIsError(builder, false);
     Response.addArrowStream(builder, stream);
+    if (callId != 0) {
+      Response.addCallId(builder, callId);
+    }
     return Response.endResponse(builder);
+  }
+
+  /**
+   * Read the Arrow IPC stream a client wrote into {@code zone} into a table that owns its memory,
+   * and register the table for the session.
+   *
+   * @param zone the memory the stream's offset counts from: the session's payload zone, or a call's
+   *     own memory
+   * @param arrow reads the stream. A batch it holds in place in the zone must not be overlapped.
+   */
+  private ObjectRefT arrowToObject(
+      BufferDescriptor stream,
+      MemorySegment zone,
+      ArrowMemoryHandler arrow,
+      Set<Long> sessionObjectIds,
+      SessionQuota quota)
+      throws IOException {
+    if (stream == null) {
+      throw new IllegalArgumentException("ArrowToObject requires arrow_stream");
+    }
+    long zoneSize = zone.byteSize();
+    long offset = stream.offset();
+    long length = stream.length();
+    // The values are unsigned on the wire; negative here means larger than any zone
+    if (offset < 0 || length <= 0 || offset > zoneSize || length > zoneSize - offset) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Arrow stream is outside the payload zone: offset=%s length=%s, zone is %d bytes",
+              Long.toUnsignedString(offset), Long.toUnsignedString(length), zoneSize));
+    }
+    if (offset < arrow.getLoadedEnd()) {
+      throw new IllegalStateException(
+          String.format(
+              "Arrow stream at offset %d overlaps the batch loaded by send_arrow_buffers,"
+                  + " which ends at offset %d. Reset the payload arena first.",
+              offset, arrow.getLoadedEnd()));
+    }
+
+    // Refuse before reading; both are taken only once the table exists
+    quota.checkObjectLimit();
+    quota.holdArrowBytes(length);
+    VectorSchemaRoot table;
+    try {
+      table = arrow.readIpcTable(zone.asSlice(offset, length));
+    } catch (Throwable t) {
+      quota.releaseHeldArrowBytes(length);
+      throw t;
+    }
+    try {
+      quota.allocateObject();
+    } catch (RuntimeException e) {
+      // Another thread of the session took the last slot since the check above
+      quota.releaseHeldArrowBytes(length);
+      table.close();
+      throw e;
+    }
+    synchronized (ownedTables) {
+      ownedTables.put(table, new OwnedTable(length, quota));
+    }
+    long newId = objectIdCounter.getAndIncrement();
+    putObject(newId, table);
+    sessionObjectIds.add(newId);
+    SessionObserver.recordArrowTransfer(
+        quota.getSessionId(), "python_to_java", table.getRowCount(), length, false);
+    return new ObjectRefT(newId);
+  }
+
+  /**
+   * Write the session's table {@code targetId} as an Arrow IPC stream at the start of {@code free}.
+   *
+   * @return the stream's length
+   */
+  private long arrowFromObject(
+      long targetId, MemorySegment free, ArrowMemoryHandler arrow, long sessionId)
+      throws IOException {
+    Object target = sessionObject(targetId);
+    if (target == null) throw new RuntimeException("Object " + targetId + " not found");
+    if (!(target instanceof VectorSchemaRoot table)) {
+      throw new IllegalArgumentException(
+          "Object "
+              + targetId
+              + " is a "
+              + target.getClass().getName()
+              + ", not an org.apache.arrow.vector.VectorSchemaRoot");
+    }
+    long length = arrow.writeIpcTable(table, free);
+    SessionObserver.recordArrowTransfer(
+        sessionId, "java_to_python", table.getRowCount(), length, false);
+    return length;
+  }
+
+  /** Where in a call's memory {@link #arrowFromObject} left a stream for a nested command. */
+  private record ArrowStreamLocation(long offset, long length) {}
+
+  // The sizes of the call memories that exist, across sessions (see CallMemory.open)
+  private final AtomicLong callMemoryBytes = new AtomicLong();
+
+  /**
+   * Shared memory of one call on the callback connection, for the Arrow tables its callback moves.
+   *
+   * <p>The session's own memory is confined to the session's thread and may be in use by the
+   * request that is waiting for this very callback. This one is confined to the thread that waits
+   * for the callback, which is the thread that runs the callback's commands, and nothing else
+   * shares it: calls in flight at the same time each have their own. It is created by the call's
+   * first transfer (most callbacks move no table) and removed when the call ends. The client's
+   * mapping of it outlives that, for as long as a table read in place there is alive.
+   */
+  private final class CallMemory implements AutoCloseable {
+    private final Path path;
+    private boolean counted;
+    private Arena arena;
+    private MemorySegment segment;
+    private ArrowMemoryHandler arrow;
+
+    CallMemory(long sessionId, long callId) {
+      this.path = Path.of(socketPath.toString() + "." + sessionId + ".call" + callId + ".shm");
+    }
+
+    /** Create and map the file, unless that is done already. Returns its path for the client. */
+    String open() throws IOException {
+      if (segment == null) {
+        sessionFiles.add(path);
+        // Callbacks at once each get a file, every one of them empty when the next checks for
+        // free space. Each therefore leaves the others their whole size. That counts what they
+        // have written twice, which errs towards refusing a transfer; the other way is a fault
+        // when the disk fills up.
+        long others = callMemoryBytes.getAndAdd(memorySize);
+        counted = true;
+        // The mapping does not need the file to stay open
+        try (FileChannel file =
+            createSharedMemoryFile(path, others, "the shared memory of a callback's tables")) {
+          Arena confined = Arena.ofConfined();
+          try {
+            segment = file.map(FileChannel.MapMode.READ_WRITE, 0, memorySize, confined);
+          } catch (IOException | RuntimeException e) {
+            confined.close();
+            throw e;
+          }
+          arena = confined;
+          arrow = new ArrowMemoryHandler(allocator);
+        } catch (IOException | RuntimeException e) {
+          // The callback may run for hours yet, and try again: space this call does not use
+          // must not stay set aside, least of all against its own next attempt
+          release();
+          throw e;
+        }
+      }
+      return path.toString();
+    }
+
+    MemorySegment segment() {
+      if (segment == null) {
+        throw new IllegalStateException(
+            "The call has no shared memory yet: send OpenCallMemory first");
+      }
+      return segment;
+    }
+
+    ArrowMemoryHandler arrow() {
+      return arrow;
+    }
+
+    /** Give back the free space set aside for this call's file. */
+    private void release() {
+      if (counted) {
+        callMemoryBytes.addAndGet(-memorySize);
+        counted = false;
+      }
+    }
+
+    /** Must run on the thread that opened it: the mapping is confined to that thread. */
+    @Override
+    public void close() {
+      segment = null;
+      if (arena != null) {
+        arena.close();
+        arena = null;
+      }
+      // The file goes first: a client that finds it gone writes nothing more there, and only
+      // then is its space anyone else's
+      if (sessionFiles.remove(path)) {
+        try {
+          Files.deleteIfExists(path);
+        } catch (IOException e) {
+          LOG.log(Level.FINE, "Could not remove " + path, e);
+        }
+      }
+      release();
+    }
   }
 
   private int packArrowResponse(

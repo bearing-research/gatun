@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mmap
+import os
 import queue
 import socket
 import struct
@@ -66,6 +68,43 @@ def _checked_size(header: bytes) -> int:
     return int(size)
 
 
+class CallMemory:
+    """A call's own shared memory, which its callback's Arrow tables go through.
+
+    The client's payload zone belongs to its channel, which may be busy with
+    the very request that is waiting for the callback. Java creates this file
+    for the call's first transfer and removes it when the call ends. The
+    mapping here lives for as long as anything refers to it, a table read in
+    place for example, and nothing writes there once the call is over.
+
+    It has the attributes of a client that the Arrow helpers and
+    ArrowTableView use, so they treat it like a client's payload zone.
+    """
+
+    def __init__(self, path: str, lock: Any = None):
+        self.path = path
+        with open(path, "r+b") as file:
+            self.shm: mmap.mmap | None = mmap.mmap(file.fileno(), 0)
+        # All of it is payload
+        self.payload_offset = 0
+        self.response_offset = len(self.shm)
+        self._arena_epoch = 0
+        # Every transfer starts at the front, so each one ends the views of
+        # the one before
+        self._payload_writes = 0
+        self._payload_generation = 0
+        # Held for a whole transfer, and by a view while it copies
+        self._exchange_lock = lock if lock is not None else threading.RLock()
+
+    def removed(self) -> bool:
+        """Whether Java has removed the file, which it does when the call ends.
+
+        From then on the server keeps no free space for it, so a page written
+        here for the first time may be one the disk does not have.
+        """
+        return not os.path.exists(self.path)
+
+
 class ChannelCall:
     """One call Java is waiting on, as the callback's route back to Java."""
 
@@ -87,6 +126,10 @@ class ChannelCall:
         # until the callback is done and no request is waiting for one
         self._in_flight = False
         self._finished = False
+        # An Arrow transfer is several steps on the one memory: writing it,
+        # the request that refers to it, reading the result out of it
+        self.transfer_lock = threading.RLock()
+        self.memory: CallMemory | None = None
 
     @property
     def active(self) -> bool:
@@ -150,6 +193,10 @@ class ChannelCall:
             self._finished = True
             if not self._in_flight:
                 self.channel._forget(self)
+        # A context copied during the callback (a task or thread it started)
+        # keeps this call reachable. What reads the memory in place holds it
+        # itself.
+        self.memory = None
 
     def _give_up(self) -> None:
         """Stop waiting for the response to a request that was sent. It may
@@ -312,6 +359,9 @@ class AsyncChannelCall:
         self._lost = False
         self._in_flight = False
         self._finished = False
+        # One Arrow transfer of this call at a time; see ChannelCall
+        self.transfer_lock = asyncio.Lock()
+        self.memory: CallMemory | None = None
 
     @property
     def active(self) -> bool:
@@ -375,6 +425,8 @@ class AsyncChannelCall:
         self._finished = True
         if not self._in_flight:
             self.channel._forget(self)
+        # See ChannelCall.finish
+        self.memory = None
 
     def _give_up(self) -> None:
         """Stop waiting for the response to a request that was sent. It may

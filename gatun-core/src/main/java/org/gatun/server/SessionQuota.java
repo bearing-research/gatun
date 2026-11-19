@@ -21,6 +21,9 @@ public class SessionQuota {
   // Arrow buffer tracking
   private final AtomicLong arrowBytesAllocated = new AtomicLong(0);
   private final AtomicLong heldArrowBytes = new AtomicLong(0);
+  // Checking the limit and counting the bytes are one step: the session's thread and the
+  // threads that run its callbacks' commands take Arrow memory at the same time
+  private final Object arrowBytesLock = new Object();
   private final AtomicLong peakArrowBytes = new AtomicLong(0);
   private final AtomicLong totalArrowBytesTransferred = new AtomicLong(0);
 
@@ -116,10 +119,12 @@ public class SessionQuota {
    * @throws ResourceLimits.ArrowBufferLimitExceededException if limit would be exceeded
    */
   public void allocateArrowBytes(long bytes) {
-    long current = arrowBytesAllocated.get() + heldArrowBytes.get();
-    ResourceLimits.checkArrowBufferLimit(current + bytes);
-
-    long newTotal = arrowBytesAllocated.addAndGet(bytes);
+    long newTotal;
+    synchronized (arrowBytesLock) {
+      long current = arrowBytesAllocated.get() + heldArrowBytes.get();
+      ResourceLimits.checkArrowBufferLimit(current + bytes);
+      newTotal = arrowBytesAllocated.addAndGet(bytes);
+    }
     totalArrowBytesTransferred.addAndGet(bytes);
 
     // Update peak
@@ -150,8 +155,11 @@ public class SessionQuota {
    * @throws ResourceLimits.ArrowBufferLimitExceededException if limit would be exceeded
    */
   public void holdArrowBytes(long bytes) {
-    ResourceLimits.checkArrowBufferLimit(arrowBytesAllocated.get() + heldArrowBytes.get() + bytes);
-    heldArrowBytes.addAndGet(bytes);
+    synchronized (arrowBytesLock) {
+      ResourceLimits.checkArrowBufferLimit(
+          arrowBytesAllocated.get() + heldArrowBytes.get() + bytes);
+      heldArrowBytes.addAndGet(bytes);
+    }
     totalArrowBytesTransferred.addAndGet(bytes);
     touchActivity();
   }

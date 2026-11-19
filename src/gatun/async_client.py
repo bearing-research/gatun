@@ -37,9 +37,14 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from gatun.arena import AsyncScopedArenaContext
 
-from gatun.callback_channel import AsyncCallbackChannel, AsyncChannelCall
+from gatun.callback_channel import (
+    AsyncCallbackChannel,
+    AsyncChannelCall,
+    CallMemory,
+)
 from gatun.client import (
     _CALL_ENDED,
+    _OPEN_CALL_MEMORY,
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
     HANDSHAKE_TIMEOUT,
@@ -70,6 +75,7 @@ from gatun.client import (
     _read_arrow_stream,
     _release_unread_response,
     _remember_reflection,
+    _require_payload_room,
     _take_free_chunk,
     _unpack_value_impl,
     _usable_timeout,
@@ -453,23 +459,7 @@ class AsyncGatunClient(_ValueEncoder):
         another task's request can run before the lock is taken or after it is
         released, and it uses the same zone.
         """
-        if self._closed:
-            raise DeadConnectionError("Client is closed. Create a new client.")
-        if self._dead:
-            raise DeadConnectionError(
-                "Connection is dead after a timeout, cancellation or protocol "
-                "error. Create a new client."
-            )
-        # A call from a callback would deadlock: from the task running it, or from
-        # a task it started and may be waiting for (gather, create_task)
-        if expects_response and (
-            asyncio.current_task() in self._callback_tasks or _in_callback_of(self)
-        ):
-            raise ReentrancyError(
-                "Cannot call Java from within a callback. "
-                "Nested calls would deadlock because the original request is still waiting. "
-                "Queue work for later or restructure code to avoid nested calls."
-            )
+        self._require_usable(expects_response)
 
         # Inside a callback that came on the callback connection, the call goes
         # back the same way: the Java thread waiting for the callback runs it,
@@ -506,6 +496,53 @@ class AsyncGatunClient(_ValueEncoder):
             response = await self._exchange(data, wait_for_response)
             if wait_for_response:
                 return finish(response) if finish is not None else response
+
+    def _require_usable(self, expects_response: bool = True) -> None:
+        if self._closed:
+            raise DeadConnectionError("Client is closed. Create a new client.")
+        if self._dead:
+            raise DeadConnectionError(
+                "Connection is dead after a timeout, cancellation or protocol "
+                "error. Create a new client."
+            )
+        # A call from a callback would deadlock: from the task running it, or from
+        # a task it started and may be waiting for (gather, create_task)
+        if expects_response and (
+            asyncio.current_task() in self._callback_tasks or _in_callback_of(self)
+        ):
+            raise ReentrancyError(
+                "Cannot call Java from within a callback. "
+                "Nested calls would deadlock because the original request is still waiting. "
+                "Queue work for later or restructure code to avoid nested calls."
+            )
+
+    async def _call_memory(self, call: AsyncChannelCall) -> CallMemory | None:
+        """The call's shared memory, which Java creates when first asked.
+
+        None if Java is no longer waiting for the callback. The caller holds
+        the call's transfer lock.
+        """
+        memory = call.memory
+        if memory is None:
+            routed, path = await self._send_nested(call, _OPEN_CALL_MEMORY)
+            if not routed:
+                return None
+            try:
+                memory = CallMemory(path)
+            except FileNotFoundError:
+                # Java stopped waiting for the callback after it replied, and
+                # removed the file
+                call.abandon()
+                return None
+            if call.active:
+                call.memory = memory
+        elif memory.removed():
+            # Java stopped waiting for the callback (its thread was
+            # interrupted) and this callback has not sent a command since
+            call.abandon()
+            call.memory = None
+            return None
+        return memory
 
     async def _send_nested(
         self, call: AsyncChannelCall, data: bytes
@@ -1456,6 +1493,20 @@ class AsyncGatunClient(_ValueEncoder):
         table = _arrow_table_to_send(table)
         size = _arrow_stream_size(table)
         command = _finish_arrow_to_object(flatbuffers.Builder(256), 0, size)
+        # Inside a callback that Java made from another thread the table goes
+        # through the call's own memory: the payload zone belongs to the
+        # channel, which may be busy with the request waiting for the callback
+        call = _channel_call_of(self)
+        if call is not None:
+            self._require_usable()
+            async with call.transfer_lock:
+                memory = await self._call_memory(call)
+                if memory is not None:
+                    _require_payload_room(memory, size, 0)
+                    _write_arrow_table(memory, table, 0, size)
+                    routed, result = await self._send_nested(call, command)
+                    if routed:
+                        return cast(AsyncJavaObject, result)
         # Written into the payload zone once this request holds the channel
         return cast(
             AsyncJavaObject,
@@ -1481,6 +1532,17 @@ class AsyncGatunClient(_ValueEncoder):
             object_id = table
 
         command = _finish_arrow_from_object(flatbuffers.Builder(256), object_id)
+        # Inside a callback that Java made from another thread, through the
+        # call's own memory; see arrow_to_java
+        call = _channel_call_of(self)
+        if call is not None:
+            self._require_usable()
+            async with call.transfer_lock:
+                memory = await self._call_memory(call)
+                if memory is not None:
+                    routed, location = await self._send_nested(call, command)
+                    if routed:
+                        return _read_arrow_stream(memory, location)
         # Copied out of the payload zone before another request can reuse it
         return cast(
             pa.Table,
