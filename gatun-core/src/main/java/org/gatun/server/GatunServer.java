@@ -21,6 +21,7 @@ import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.attribute.UserPrincipal;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -50,7 +51,8 @@ public class GatunServer {
 
   // Protocol version - increment when making breaking changes to the protocol
   // Version 2: Per-client shared memory (handshake includes SHM path)
-  public static final int PROTOCOL_VERSION = 3;
+  // Version 4: Callback connection (Action.OpenCallbackChannel, call_id)
+  public static final int PROTOCOL_VERSION = 4;
 
   private static final Set<PosixFilePermission> OWNER_ONLY =
       PosixFilePermissions.fromString("rw-------");
@@ -110,8 +112,9 @@ public class GatunServer {
   // Session counter for unique per-client SHM paths
   private final AtomicLong sessionCounter = new AtomicLong(0);
 
-  // SHM files of the sessions that are still open, so that shutdown can remove them
-  private final Set<Path> activeShmPaths = ConcurrentHashMap.newKeySet();
+  // Files of the sessions that are still open (shared memory, a callback listener's socket), so
+  // that shutdown can remove them
+  private final Set<Path> sessionFiles = ConcurrentHashMap.newKeySet();
 
   // --- CALLBACK REGISTRY ---
   // Maps callback ID -> CallbackInfo (interface name + proxy object + session context)
@@ -128,6 +131,16 @@ public class GatunServer {
     final Set<Long> sessionObjectIds; // Track object IDs for cleanup
     final SessionQuota quota;
     final SessionControl control = new SessionControl();
+
+    // The callback connection, for threads other than the session's own. The listener is set
+    // from OpenCallbackChannel until the client has connected to it; the channel from then on.
+    volatile ServerSocketChannel callbackListener;
+    volatile CallbackChannel callbackChannel;
+    // Set when the session ends. Its proxies can outlive it in whatever Java code holds them.
+    volatile boolean closed;
+    // Calls on the callback connection that Python has not answered yet. The session is in use
+    // for as long as there are any, whatever its own channel is doing.
+    final AtomicInteger channelCalls = new AtomicInteger();
 
     SessionContext(
         SocketChannel channel,
@@ -239,6 +252,12 @@ public class GatunServer {
   private static final ThreadLocal<CallbackRef> tempCallbackRef =
       ThreadLocal.withInitial(CallbackRef::new);
 
+  // The IDs of the objects registered by the pack running on this thread, when its caller wants
+  // them: to count them against the quota, and to free them if the client never gets the result.
+  // Counting the session's objects before and after, or taking the range of IDs handed out,
+  // would also pick up what other threads registered for the same session meanwhile.
+  private static final ThreadLocal<List<Long>> packRecorder = new ThreadLocal<>();
+
   private final BufferAllocator allocator = new RootAllocator();
 
   // Delegate to ReflectionCache for all caching operations
@@ -315,7 +334,7 @@ public class GatunServer {
               // Remove the files first: the JVM may exit before the session threads get to
               // their own cleanup, and closing the allocator can throw.
               deleteQuietly(socketPath);
-              for (Path shmPath : activeShmPaths) {
+              for (Path shmPath : sessionFiles) {
                 deleteQuietly(shmPath);
               }
               threadPool.shutdownNow();
@@ -483,7 +502,9 @@ public class GatunServer {
         return;
       }
       for (SessionContext session : sessions.values()) {
-        if (session.quota.isTimedOut() && !session.control.isRequestActive()) {
+        if (session.quota.isTimedOut()
+            && !session.control.isRequestActive()
+            && session.channelCalls.get() == 0) {
           LOG.warning("Closing idle session " + session.quota.getSessionId());
           try {
             session.channel.close();
@@ -503,8 +524,132 @@ public class GatunServer {
     }
   }
 
+  /**
+   * Start listening for the session's callback connection and return the socket's path.
+   *
+   * <p>The connection is asked for on the session's own channel and made to a socket that exists
+   * for this one session and accepts one connection, so it needs no handshake of its own to say
+   * whose it is. It takes no session slot and has no shared memory.
+   */
+  private Path openCallbackListener(SessionContext ctx) throws IOException {
+    if (ctx.callbackListener != null || ctx.callbackChannel != null) {
+      throw new IllegalStateException("The session's callback connection was already opened");
+    }
+    long sessionId = ctx.quota.getSessionId();
+    Path path = Path.of(socketPath.toString() + "." + sessionId + ".cb");
+    Files.deleteIfExists(path);
+    ServerSocketChannel listener = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
+    try {
+      listener.bind(UnixDomainSocketAddress.of(path));
+      Files.setPosixFilePermissions(path, OWNER_ONLY);
+    } catch (IOException | RuntimeException e) {
+      listener.close();
+      deleteQuietly(path);
+      throw e;
+    }
+    sessionFiles.add(path);
+    ctx.callbackListener = listener;
+    Thread.ofVirtual()
+        .name("gatun-callbacks-" + sessionId)
+        .start(() -> serveCallbackConnection(ctx, listener, path));
+    return path;
+  }
+
+  /** Accept the session's callback connection and serve it until it or the session ends. */
+  private void serveCallbackConnection(
+      SessionContext ctx, ServerSocketChannel listener, Path path) {
+    String name = "Callback connection of session " + ctx.quota.getSessionId();
+    SocketChannel peer = null;
+    try {
+      try {
+        while (peer == null) {
+          SocketChannel candidate = listener.accept();
+          if (isSameUser(candidate)) {
+            peer = candidate;
+          } else {
+            LOG.warning(name + ": refused a connection from another user");
+            candidate.close();
+          }
+        }
+      } finally {
+        // One connection is all this socket is for
+        listener.close();
+        ctx.callbackListener = null;
+        deleteQuietly(path);
+        sessionFiles.remove(path);
+      }
+
+      CallbackChannel channel =
+          new CallbackChannel(peer, name, notice -> handleChannelNotice(ctx, notice));
+      ctx.callbackChannel = channel;
+      if (ctx.closed) {
+        // The session ended while the client was connecting, and found no channel to close
+        channel.close();
+        return;
+      }
+
+      // Tells the client that calls will be served from here on
+      ByteBuffer ready = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+      ready.putInt(PROTOCOL_VERSION).flip();
+      while (ready.hasRemaining()) {
+        peer.write(ready);
+      }
+      channel.run();
+    } catch (IOException e) {
+      // The session ended before the client connected, or the client went away
+      LOG.fine(name + " ended: " + e);
+      if (peer != null) {
+        try {
+          peer.close();
+        } catch (IOException closing) {
+          // already gone
+        }
+      }
+    }
+  }
+
+  /**
+   * A frame on the callback connection that belongs to no call: Python releasing objects. A client
+   * that only receives callbacks, or sits in one long request, sends nothing on its own channel
+   * that the release could ride on, and the arguments of every call would pile up.
+   */
+  private void handleChannelNotice(SessionContext ctx, Command notice) {
+    if (notice.action() != Action.FreeObject) {
+      throw new IllegalArgumentException("Unexpected action " + notice.action());
+    }
+    checkArgumentCount(notice.argsLength());
+    // For the session ID in what the registry logs; this is the connection's reader thread
+    sessionContext.set(ctx);
+    try {
+      freeObjects(notice, ctx.sessionObjectIds, ctx.quota);
+    } finally {
+      sessionContext.remove();
+    }
+  }
+
+  /** End a session's callback connection; threads waiting for Python on it fail. */
+  private void closeCallbackConnection(SessionContext ctx) {
+    if (ctx == null) {
+      return;
+    }
+    ctx.closed = true;
+    ServerSocketChannel listener = ctx.callbackListener;
+    if (listener != null) {
+      try {
+        listener.close();
+      } catch (IOException e) {
+        // already closed
+      }
+    }
+    CallbackChannel channel = ctx.callbackChannel;
+    if (channel != null) {
+      channel.close();
+    }
+  }
+
   private void handleClient(SocketChannel client, long sessionId) {
-    Set<Long> sessionObjectIds = new HashSet<>();
+    // Threads calling Python on the callback connection register the objects they pass
+    Set<Long> sessionObjectIds = ConcurrentHashMap.newKeySet();
     Set<Long> sessionCallbackIds = new HashSet<>();
     SessionObserver observer = new SessionObserver(sessionId);
     SessionQuota quota = new SessionQuota(sessionId);
@@ -512,7 +657,7 @@ public class GatunServer {
 
     // Create per-session shared memory file
     Path sessionShmPath = Path.of(socketPath.toString() + "." + sessionId + ".shm");
-    activeShmPaths.add(sessionShmPath);
+    sessionFiles.add(sessionShmPath);
 
     // The Arrow handler is declared last so that it is closed first: the batch it holds points
     // into the mapping that the arena unmaps. The connection is not among these: it is closed
@@ -560,6 +705,7 @@ public class GatunServer {
 
       // Reusable FlatBufferBuilder for responses (avoid allocation per request)
       FlatBufferBuilder responseBuilder = new FlatBufferBuilder(1024);
+      List<Long> packedIds = new ArrayList<>();
 
       while (readFully(client, lengthBuf)) {
         // A request that arrives after the idle timeout is answered with the reason before the
@@ -656,11 +802,8 @@ public class GatunServer {
         String errorType = null;
         String errorMessage = null;
         boolean requestSuccess = true;
-        // Object IDs handed out while packing the result: [packedFromId, packedToId)
-        long packedFromId = 0;
-        long packedToId = 0;
-        // Batch only: IDs handed out while packing sub-result i are [2 * i] up to [2 * i + 1]
-        long[] subPackedIds = null;
+        // The objects registered while packing the result (for a batch, its sub-results)
+        packedIds.clear();
         // Results of a vectorized action, which registers objects as it goes
         java.util.List<Object> vectorResults = null;
         // Set by the actions that build their own response instead of returning a result
@@ -1037,7 +1180,9 @@ public class GatunServer {
             result = null;
           }
           // Note: CallbackResponse is handled directly in invokeCallback(), not here
-          else if (cmd.action() == Action.IsInstanceOf) {
+          else if (cmd.action() == Action.OpenCallbackChannel) {
+            result = openCallbackListener(ctx).toString();
+          } else if (cmd.action() == Action.IsInstanceOf) {
             // Check if an object is an instance of a class
             long targetId = cmd.targetId();
             String className = cmd.targetName();
@@ -1351,7 +1496,6 @@ public class GatunServer {
 
             // Execute each sub-command, collect response offsets
             int[] subResponseOffsets = new int[commandCount];
-            subPackedIds = new long[2 * commandCount];
             int errorIndex = -1;
             int executedCount = 0;
 
@@ -1362,9 +1506,8 @@ public class GatunServer {
                 // Execute sub-command and get result
                 Object subResult =
                     executeCommand(subCmd, sessionObjectIds, sessionCallbackIds, sharedMem, quota);
-                subPackedIds[2 * i] = objectIdCounter.get();
-                subResponseOffsets[i] = packResult(builder, subResult, sessionObjectIds, quota);
-                subPackedIds[2 * i + 1] = objectIdCounter.get();
+                subResponseOffsets[i] =
+                    packResult(builder, subResult, sessionObjectIds, quota, packedIds);
                 executedCount++;
               } catch (Throwable subT) {
                 // Pack error for this sub-command
@@ -1398,9 +1541,7 @@ public class GatunServer {
 
           // 3. Pack Success, unless the action built its own response
           if (!responsePacked) {
-            packedFromId = objectIdCounter.get();
-            responseOffset = packResult(builder, result, sessionObjectIds, quota);
-            packedToId = objectIdCounter.get();
+            responseOffset = packResult(builder, result, sessionObjectIds, quota, packedIds);
           }
 
         } catch (Throwable t) {
@@ -1438,12 +1579,7 @@ public class GatunServer {
         if (resSize > RESPONSE_ZONE_SIZE) {
           // Response too large - send error instead. The client never sees the IDs in the
           // response it was meant to get, so it cannot free them.
-          discardObjects(packedFromId, packedToId, sessionObjectIds, quota);
-          if (subPackedIds != null) {
-            for (int i = 0; i < subPackedIds.length; i += 2) {
-              discardObjects(subPackedIds[i], subPackedIds[i + 1], sessionObjectIds, quota);
-            }
-          }
+          discardObjects(packedIds, sessionObjectIds, quota);
           if (requestSuccess) {
             discardResultRefs(vectorResults, sessionObjectIds, quota);
           }
@@ -1489,6 +1625,7 @@ public class GatunServer {
       } catch (IOException e) {
         // already gone
       }
+      closeCallbackConnection(sessionContext.get());
 
       // Notify observer of session end
       observer.onSessionEnd(quota.getTotalObjectsCreated());
@@ -1511,7 +1648,7 @@ public class GatunServer {
       } catch (IOException e) {
         LOG.warning("Failed to delete session SHM file: " + sessionShmPath);
       }
-      activeShmPaths.remove(sessionShmPath);
+      sessionFiles.remove(sessionShmPath);
     }
   }
 
@@ -1703,14 +1840,9 @@ public class GatunServer {
     }
   }
 
-  /**
-   * Free the session's objects with IDs in [fromId, toId). IDs come from one counter shared by all
-   * sessions, so the range can hold other sessions' IDs; those are not in this session's set and
-   * are left alone.
-   */
-  private void discardObjects(
-      long fromId, long toId, Set<Long> sessionObjectIds, SessionQuota quota) {
-    for (long id = fromId; id < toId; id++) {
+  /** Free objects that were registered for a result the client will not receive. */
+  private void discardObjects(List<Long> ids, Set<Long> sessionObjectIds, SessionQuota quota) {
+    for (long id : ids) {
       freeObject(id, sessionObjectIds, quota);
     }
   }
@@ -1719,21 +1851,32 @@ public class GatunServer {
    * Pack a result for the session. Objects nested in the result (the elements of a returned list,
    * say) are registered while packing; they are counted against the quota here because the client
    * frees them like any other object. If packing fails, the client never learns their IDs, so they
-   * are dropped again.
+   * are dropped again. Otherwise their IDs are added to {@code registered}, for a caller that may
+   * still have to drop them.
    */
   private int packResult(
-      FlatBufferBuilder builder, Object result, Set<Long> sessionObjectIds, SessionQuota quota) {
-    long firstId = objectIdCounter.get();
-    int registeredBefore = sessionObjectIds.size();
+      FlatBufferBuilder builder,
+      Object result,
+      Set<Long> sessionObjectIds,
+      SessionQuota quota,
+      List<Long> registered) {
+    List<Long> ids = new ArrayList<>();
+    // Packing can itself call Python (iterating a collection that a callback implements), and
+    // that call packs its arguments on this thread
+    List<Long> outer = packRecorder.get();
+    packRecorder.set(ids);
     boolean packed = false;
     try {
       int offset = packSuccessWithSession(builder, result, sessionObjectIds);
       packed = true;
       return offset;
     } finally {
-      quota.countRegisteredObjects(sessionObjectIds.size() - registeredBefore);
+      packRecorder.set(outer);
+      quota.countRegisteredObjects(ids.size());
       if (!packed) {
-        discardObjects(firstId, objectIdCounter.get(), sessionObjectIds, quota);
+        discardObjects(ids, sessionObjectIds, quota);
+      } else if (registered != null) {
+        registered.addAll(ids);
       }
     }
   }
@@ -2543,6 +2686,10 @@ public class GatunServer {
       putObject(newId, value);
       if (sessionObjectIds != null) {
         sessionObjectIds.add(newId);
+        List<Long> recorder = packRecorder.get();
+        if (recorder != null) {
+          recorder.add(newId);
+        }
       }
       type = Value.ObjectRef;
       valueOffset = ObjectRef.createObjectRef(builder, newId);
@@ -2656,8 +2803,8 @@ public class GatunServer {
    * Creates a dynamic proxy that implements the specified interface. When any method on the proxy
    * is called, it sends a callback request to Python and waits for the response.
    *
-   * <p>The SessionContext is captured at proxy creation time so callbacks can be invoked from any
-   * thread (e.g., Spark executor threads), not just the handleClient thread.
+   * <p>The SessionContext is captured at proxy creation time: the proxy can be called by any
+   * thread, long after the request that registered it, and has to find its session.
    */
   private Object createCallbackProxy(long callbackId, String interfaceName, SessionContext ctx)
       throws ClassNotFoundException {
@@ -2689,8 +2836,9 @@ public class GatunServer {
           Object result =
               invokeCallback(
                   callbackId, method.getName(), args == null ? new Object[0] : args, ctx);
-          // A cancel that arrived during the round trip, when it could not interrupt
-          if (ctx.control.isCancelled()) {
+          // A cancel that arrived during the round trip, when it could not interrupt. It is
+          // aimed at the request's thread; another thread's call carries on.
+          if (ctx.control.isSessionThread() && ctx.control.isCancelled()) {
             throw new InterruptedException("Request was cancelled");
           }
           return callbackResult(result, method);
@@ -2704,25 +2852,26 @@ public class GatunServer {
    * Sends a callback invocation request to Python and blocks until Python responds. This is called
    * from the dynamic proxy when Java code invokes a method on the callback object.
    *
-   * <p>This works only on the session's own thread, while it runs a request: that is the only time
-   * Python is listening, the channel carries one exchange at a time, and the session's shared
-   * memory is confined to that thread (any other thread touching it gets a WrongThreadException). A
-   * proxy called from any other thread (a parallel stream's worker, a Spark listener, an executor,
-   * a timer) is refused before anything is written.
+   * <p>The thread running the session's request calls Python in band: Python is reading the
+   * session's channel for that request's answer, and the session's shared memory is confined to
+   * that thread. Every other thread (a parallel stream's worker, a Spark listener, an executor, a
+   * timer), at any time, uses the session's callback connection.
    */
   private Object invokeCallback(
       long callbackId, String methodName, Object[] args, SessionContext ctx) throws Exception {
     if (ctx == null || ctx.channel == null || ctx.sharedMem == null) {
       throw new IllegalStateException("Callback invoked with invalid session context");
     }
-    if (!ctx.control.isSessionThread()) {
+    boolean inBand = ctx.control.isSessionThread();
+    if (ctx.closed) {
       throw new IllegalStateException(
-          "Python callback "
-              + methodName
-              + " was called from thread "
-              + Thread.currentThread().getName()
-              + ". Python can only be called back on the thread that is running its request,"
-              + " during that request.");
+          "Python callback " + methodName + " was called after its client disconnected");
+    }
+    // Before anything is packed: the objects among the arguments would be registered for a
+    // client that will not take them
+    if (!callbackRegistry.containsKey(callbackId)) {
+      throw new IllegalStateException(
+          "Python callback " + methodName + " was called after it was unregistered");
     }
 
     GatunEvents.CallbackEvent event =
@@ -2730,7 +2879,10 @@ public class GatunServer {
     boolean success = false;
     String errorMessage = null;
     try {
-      Object returnValue = exchangeCallback(callbackId, methodName, args, ctx);
+      Object returnValue =
+          inBand
+              ? exchangeCallback(callbackId, methodName, args, ctx)
+              : callOnChannel(callbackId, methodName, args, ctx);
       success = true;
       return returnValue;
     } catch (Exception e) {
@@ -2775,23 +2927,26 @@ public class GatunServer {
     return converted;
   }
 
-  /** One callback round-trip: send the request to Python, wait for its CallbackResponse. */
-  private Object exchangeCallback(
-      long callbackId, String methodName, Object[] args, SessionContext ctx) throws Exception {
-
-    SocketChannel channel = ctx.channel;
-    MemorySegment sharedMem = ctx.sharedMem;
-
-    // The round trip uses the socket, so a cancel must not interrupt it
-    ctx.control.beginSocketUse();
+  /**
+   * Build the request that asks Python to run a callback. The objects among the arguments are
+   * registered for the session while packing and counted, because the client frees them like any
+   * other object. Their IDs are added to {@code registered}, for a caller that finds it cannot
+   * deliver the request; if the request cannot be built they are dropped here.
+   *
+   * @param callId the call's ID on the callback connection; 0 in band
+   */
+  private ByteBuffer buildCallbackRequest(
+      long callId,
+      long callbackId,
+      String methodName,
+      Object[] args,
+      SessionContext ctx,
+      List<Long> registered) {
+    FlatBufferBuilder builder = new FlatBufferBuilder(1024);
+    List<Long> outer = packRecorder.get();
+    packRecorder.set(registered);
+    boolean built = false;
     try {
-      // Build the callback request response
-      FlatBufferBuilder builder = new FlatBufferBuilder(1024);
-
-      // Build callback arguments
-      // Objects passed to the callback are registered for the session while packing; count
-      // them, because the client frees them like any other object.
-      int registeredBefore = ctx.sessionObjectIds.size();
       int[] argOffsets = new int[args.length];
       for (int i = 0; i < args.length; i++) {
         int[] packed = packValue(builder, args[i], ctx.sessionObjectIds);
@@ -2800,7 +2955,6 @@ public class GatunServer {
         Argument.addVal(builder, packed[1]);
         argOffsets[i] = Argument.endArgument(builder);
       }
-      ctx.quota.countRegisteredObjects(ctx.sessionObjectIds.size() - registeredBefore);
 
       int argsVec = Response.createCallbackArgsVector(builder, argOffsets);
       int methodOff = builder.createString(methodName);
@@ -2811,21 +2965,72 @@ public class GatunServer {
       Response.addCallbackId(builder, callbackId);
       Response.addCallbackMethod(builder, methodOff);
       Response.addCallbackArgs(builder, argsVec);
-      int responseOffset = Response.endResponse(builder);
+      Response.addCallId(builder, callId);
+      builder.finish(Response.endResponse(builder));
 
-      builder.finish(responseOffset);
-      ByteBuffer resBuf = builder.dataBuffer();
-      int resSize = resBuf.remaining();
-      if (resSize > RESPONSE_ZONE_SIZE) {
+      ByteBuffer request = builder.dataBuffer();
+      // The response zone in band, a frame on the callback connection: the same size
+      if (request.remaining() > RESPONSE_ZONE_SIZE) {
         throw new IllegalArgumentException(
             "Arguments for callback "
                 + methodName
                 + " take "
-                + resSize
+                + request.remaining()
                 + " bytes, more than the "
                 + RESPONSE_ZONE_SIZE
                 + " a callback request can carry");
       }
+      built = true;
+      return request;
+    } finally {
+      packRecorder.set(outer);
+      ctx.quota.countRegisteredObjects(registered.size());
+      if (!built) {
+        discardObjects(registered, ctx.sessionObjectIds, ctx.quota);
+        registered.clear();
+      }
+    }
+  }
+
+  /** What Python answered: the callback's result, or its failure as an exception. */
+  private Object readCallbackResult(Command cmd) {
+    if (cmd.action() != Action.CallbackResponse) {
+      throw new RuntimeException("Expected CallbackResponse but got action: " + cmd.action());
+    }
+
+    Object returnValue = null;
+    if (cmd.argsLength() > 0) {
+      returnValue = convertArgument(cmd.args(0))[0];
+    }
+
+    // The second argument, if present, says whether the callback failed; the message is then
+    // in target_name
+    boolean isError = false;
+    if (cmd.argsLength() > 1) {
+      Object[] converted = convertArgument(cmd.args(1));
+      if (converted[0] instanceof Boolean) {
+        isError = (Boolean) converted[0];
+      }
+    }
+    if (isError) {
+      throw new RuntimeException("Callback error: " + cmd.targetName());
+    }
+    return returnValue;
+  }
+
+  /** One callback round-trip in band: the request thread sends and reads on its own channel. */
+  private Object exchangeCallback(
+      long callbackId, String methodName, Object[] args, SessionContext ctx) throws Exception {
+
+    SocketChannel channel = ctx.channel;
+    MemorySegment sharedMem = ctx.sharedMem;
+
+    // The round trip uses the socket, so a cancel must not interrupt it
+    ctx.control.beginSocketUse();
+    try {
+      ByteBuffer resBuf =
+          buildCallbackRequest(0, callbackId, methodName, args, ctx, new ArrayList<>());
+      int resSize = resBuf.remaining();
 
       // Write to response zone
       MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
@@ -2859,41 +3064,77 @@ public class GatunServer {
       ByteBuffer cmdBuf = cmdSlice.asByteBuffer();
       cmdBuf.order(ByteOrder.LITTLE_ENDIAN);
 
-      Command cmd = Command.getRootAsCommand(cmdBuf);
-      if (cmd.action() != Action.CallbackResponse) {
-        throw new RuntimeException("Expected CallbackResponse but got action: " + cmd.action());
-      }
-
-      // Extract the result from the callback response
-      Object returnValue = null;
-      boolean isError = false;
-      String errorMsg = null;
-
-      if (cmd.argsLength() > 0) {
-        returnValue = convertArgument(cmd.args(0))[0];
-      }
-
-      // Check if there's an error flag (second arg if present)
-      if (cmd.argsLength() > 1) {
-        Argument errorArg = cmd.args(1);
-        Object[] converted = convertArgument(errorArg);
-        if (converted[0] instanceof Boolean) {
-          isError = (Boolean) converted[0];
-        }
-      }
-
-      // Error message is in target_name for error responses
-      if (isError) {
-        errorMsg = cmd.targetName();
-      }
-
-      if (isError) {
-        throw new RuntimeException("Callback error: " + errorMsg);
-      }
-
-      return returnValue;
+      return readCallbackResult(Command.getRootAsCommand(cmdBuf));
     } finally {
       ctx.control.endSocketUse();
+    }
+  }
+
+  /**
+   * One callback round-trip on the session's callback connection, for a thread that is not running
+   * the session's request.
+   */
+  private Object callOnChannel(
+      long callbackId, String methodName, Object[] args, SessionContext ctx) {
+    CallbackChannel channel = ctx.callbackChannel;
+    if (channel == null || channel.isClosed()) {
+      throw new IllegalStateException(
+          "Python callback "
+              + methodName
+              + " was called from thread "
+              + Thread.currentThread().getName()
+              + ", which is not the thread running its client's request, and the client's"
+              + " callback connection is "
+              + (channel == null ? "not open" : "closed"));
+    }
+
+    // Packing the arguments and reading the result register and look up the session's objects.
+    // This thread may have no session, in which case ownership would go unchecked, or be
+    // running another session's request.
+    SessionContext previous = sessionContext.get();
+    sessionContext.set(ctx);
+    long callId = channel.begin();
+    // Until Python answers, the session is in use: the idle reaper must leave it alone
+    ctx.channelCalls.incrementAndGet();
+    ctx.quota.touchActivity();
+    List<Long> registered = new ArrayList<>();
+    boolean sent = false;
+    try {
+      ByteBuffer request =
+          buildCallbackRequest(callId, callbackId, methodName, args, ctx, registered);
+      if (ctx.closed) {
+        // The session ended while the arguments were being packed, and its cleanup may
+        // already have gone past the objects registered just now
+        throw new IOException("its client disconnected");
+      }
+      channel.send(request);
+      sent = true;
+      ByteBuffer answer = channel.await(callId);
+      return readCallbackResult(Command.getRootAsCommand(answer));
+    } catch (IOException e) {
+      // Nobody will free the arguments' objects if the request never went out, or if the
+      // session is over. Otherwise Python may hold them: it frees them, or the session's end
+      // does.
+      if (!sent || ctx.closed) {
+        discardObjects(registered, ctx.sessionObjectIds, ctx.quota);
+      }
+      // Unchecked: the interface method the caller invoked declares no such exception, and a
+      // proxy wraps what its method does not declare in one without a message
+      throw new IllegalStateException(
+          "Python callback " + methodName + " could not be called: " + e.getMessage(), e);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(
+          "Interrupted while Python callback " + methodName + " was running", e);
+    } finally {
+      channel.end(callId);
+      ctx.channelCalls.decrementAndGet();
+      ctx.quota.touchActivity();
+      if (previous == null) {
+        sessionContext.remove();
+      } else {
+        sessionContext.set(previous);
+      }
     }
   }
 

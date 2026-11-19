@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `client.arrow_to_java(table)` and `client.arrow_from_java(obj)`, on both clients. A sent table becomes an `org.apache.arrow.vector.VectorSchemaRoot` object that any Java method can receive, and any `VectorSchemaRoot` the JVM holds, including one Java code produced, can be fetched as a `pyarrow.Table`. Before this, sent Arrow data could only be read back by the client that sent it
 - `client.arrow_from_java(obj, copy=False)` (sync client) reads a table where Java wrote it in shared memory instead of copying it out. It returns an `ArrowTableView` that is good until the client's next Arrow transfer and raises `StaleArenaError` after it
 - `benchmarks/benchmark_transport.py` measures Arrow transfer through shared memory against a Unix socket and a file, in both directions
+- Java can call a Python callback from any thread and at any time, not only from the thread running the client's request: listeners, timers, executors and parallel streams work, several calls at once. These calls travel on a second connection that the client opens with its first `register_callback`, and a callback that arrives on it may call Java. Both clients
 - `allowed_classes` and `allowed_prefixes` arguments to `connect()`, `aconnect()`, `launch_gateway()` and `GatunAdapter`, also settable in `pyproject.toml` and through `GATUN_ALLOWED_CLASSES` / `GATUN_ALLOWED_PREFIXES`. Using a library outside the built-in allowlist no longer needs a source edit and a rebuild
 - `socket_timeout` and `callback_timeout` arguments to `connect()`, `aconnect()` and `GatunAdapter`; the handshake uses the configured `connect_timeout`
 - `gatun.limits.max_sessions` caps the sessions a server serves at once (default: unlimited). A connection that arrives while every slot is taken waits up to two seconds for one before it is refused
@@ -25,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `memory` accepts `K` / `M` / `G` suffixes, fractions (`"1.5GB"`), a byte count, or an int
 
 ### Changed
-- Protocol version is now 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together
+- Protocol version is now 4: `Action.OpenCallbackChannel` and a `call_id` on commands and responses, for the callback connection. Client and server must be upgraded together
+- A callback's arguments that could not be sent (more than 64KB of them) no longer leave their objects registered for the session
+- Calling a callback after `unregister_callback` throws `IllegalStateException` in Java before its arguments are sent. The client used to answer "not found", and in the sync client the objects among the arguments stayed registered for the rest of the session
+- Protocol version 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together
 - The async client accepts `datetime` / `date` / `time` arguments
 - Executing a batch from inside a callback raises `ReentrancyError`, like any other call
 - `arrow_to_java()` and `send_arrow_table()` serialize the table straight into shared memory instead of building the stream in a buffer and copying that across: about half the time for a 128 MiB table in `arrow_to_java()`, and no buffer the size of the stream. A table that does not fit is refused before its stream is written

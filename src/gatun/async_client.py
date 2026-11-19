@@ -26,7 +26,7 @@ import os
 import struct
 import weakref
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
@@ -37,6 +37,7 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from gatun.arena import AsyncScopedArenaContext
 
+from gatun.callback_channel import AsyncCallbackChannel
 from gatun.client import (
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
@@ -306,6 +307,12 @@ class AsyncGatunClient(_ValueEncoder):
         self._jvm: AsyncJVMView | None = None
         self._callbacks: dict[int, Callable[..., Any]] = {}
 
+        # Where Java threads other than the one running a request call Python.
+        # Opened with the first register_callback; see _ensure_callback_channel
+        self._callback_channel: AsyncCallbackChannel | None = None
+        self._callback_channel_tried = False
+        self._callback_channel_lock = asyncio.Lock()
+
         # Tasks that are running a callback. A Java call from one of them would
         # wait for a channel that is waiting for it. Other tasks are unaffected:
         # they queue on the lock like any other request.
@@ -407,6 +414,9 @@ class AsyncGatunClient(_ValueEncoder):
             return
         self._dead = True
         self._pending_frees.clear()
+        channel, self._callback_channel = self._callback_channel, None
+        if channel is not None:
+            channel.close()
         writer, self._writer = self._writer, None
         self._reader = None
         if writer is not None:
@@ -570,34 +580,52 @@ class AsyncGatunClient(_ValueEncoder):
             # Unpack the return value
             return self._unpack_value(resp.ReturnValType(), resp.ReturnVal())
 
-    async def _handle_callback(self, resp):
+    async def _handle_callback(
+        self,
+        resp,
+        reply: Callable[[Any, bool, str | None], Awaitable[None]] | None = None,
+    ):
         """Handle a callback invocation request from Java.
 
-        The task is recorded while its callback runs, so that a Java call made
+        Without `reply` the request came in band: the client's own request is
+        waiting on this callback, and the answer goes back on its channel. The
+        task is recorded while its callback runs, so that a Java call made
         from it is refused instead of deadlocking.
+
+        With `reply` (result, is_error, error message) the request came on the
+        callback connection, from some other Java thread. Only that thread
+        waits for it, so the callback may call Java like any other code.
         """
         callback_id = resp.CallbackId()
+        in_band = reply is None
 
-        # Unpack callback arguments
-        args = []
-        for i in range(resp.CallbackArgsLength()):
-            arg = resp.CallbackArgs(i)
-            args.append(self._unpack_value(arg.ValType(), arg.Val()))
+        async def answer(result: Any, is_error: bool, error_msg: str | None) -> None:
+            if reply is None:
+                await self._send_callback_response(
+                    callback_id, result, is_error, error_msg
+                )
+            else:
+                await reply(result, is_error, error_msg)
 
-        # Look up the callback function
-        callback_fn = self._callbacks.get(callback_id)
-        if callback_fn is None:
-            await self._send_callback_response(
-                callback_id, None, True, f"Callback {callback_id} not found"
-            )
-            return
-
-        # Execute the callback with reentrancy guard and timeout
-        task = asyncio.current_task()
+        # Execute the callback with timeout and, in band, the reentrancy guard
+        task = asyncio.current_task() if in_band else None
         if task is not None:
             self._callback_tasks.add(task)
-        scope, token = _enter_callback(self)
+        scope_token = _enter_callback(self) if in_band else None
         try:
+            # Unpacked even when the callback is gone (unregistered while Java
+            # was calling it): the server registered the objects among the
+            # arguments for this client, and their wrappers are what frees
+            # them. Inside the try, because Java is waiting for an answer
+            # whatever goes wrong here.
+            args = []
+            for i in range(resp.CallbackArgsLength()):
+                arg = resp.CallbackArgs(i)
+                args.append(self._unpack_value(arg.ValType(), arg.Val()))
+
+            callback_fn = self._callbacks.get(callback_id)
+            if callback_fn is None:
+                raise LookupError(f"Callback {callback_id} not found")
             if inspect.iscoroutinefunction(callback_fn):
                 pending = callback_fn(*args)
             else:
@@ -615,27 +643,140 @@ class AsyncGatunClient(_ValueEncoder):
                     )
             else:
                 result = await pending
-            await self._send_callback_response(callback_id, result, False, None)
+            await answer(result, False, None)
         except ReentrancyError:
             # Propagate reentrancy error with clear message
-            await self._send_callback_response(
-                callback_id,
+            await answer(
                 None,
                 True,
                 "ReentrancyError: Cannot call Java from within a callback",
             )
         except Exception as e:  # noqa: BLE001 - any callback failure is forwarded to Java
-            await self._send_callback_response(callback_id, None, True, str(e))
+            await answer(None, True, str(e))
         finally:
-            _exit_callback(scope, token)
+            if scope_token is not None:
+                _exit_callback(*scope_token)
             if task is not None:
                 self._callback_tasks.discard(task)
+
+    async def _serve_channel_callback(
+        self, channel: AsyncCallbackChannel, resp
+    ) -> None:
+        """Run one callback that arrived on the callback connection.
+
+        Runs in a task of its own, started by the connection's reader.
+        """
+        callback_id = resp.CallbackId()
+        call_id = resp.CallId()
+        answered = False
+
+        async def reply(result: Any, is_error: bool, error_msg: str | None) -> None:
+            nonlocal answered
+            answered = True
+            await channel.send(
+                self._build_callback_response(
+                    callback_id, result, is_error, error_msg, call_id
+                )
+            )
+
+        try:
+            await self._handle_callback(resp, reply)
+        except OSError as e:
+            # The connection closed under the callback; Java was told by that
+            logger.debug("Callback %d could not be answered: %s", callback_id, e)
+        except Exception as e:
+            # A Java thread is waiting for this call and nothing else ends its wait
+            if not answered:
+                try:
+                    await reply(None, True, f"{type(e).__name__}: {e}")
+                except OSError:
+                    pass
+            raise
+        finally:
+            await self._release_on_channel(channel)
+
+    async def _release_on_channel(self, channel: AsyncCallbackChannel) -> None:
+        """Send the queued object releases on the callback connection.
+
+        They normally ride ahead of the client's next request. A client that
+        only receives callbacks, or sits in one long request, makes none, and
+        the arguments of every call would stay registered on the server.
+        """
+        frees = self._pending_frees
+        while frees:
+            ids = _take_free_chunk(frees)
+            if not ids:
+                return
+            try:
+                await channel.send(_build_free_command(flatbuffers.Builder(64), ids))
+            except OSError:
+                # The connection is gone; the next request can still send them
+                frees.extend(ids)
+                return
+
+    async def _ensure_callback_channel(self) -> None:
+        """Open the callback connection, the first time a callback is registered.
+
+        The server opens a socket for this session and says where; whoever
+        connects to it is this session's callback connection. Without it
+        callbacks still work on the thread that runs the request, so a failure
+        to open it is logged and not raised: the server tells any other thread
+        that calls a callback why it cannot.
+        """
+        # Tasks registering callbacks at the same time open it once
+        async with self._callback_channel_lock:
+            if self._callback_channel_tried:
+                return
+            builder = flatbuffers.Builder(64)
+            Cmd.CommandStart(builder)
+            Cmd.CommandAddAction(builder, Act.Action.OpenCallbackChannel)
+            builder.Finish(Cmd.CommandEnd(builder))
+
+            # Only after the request went out: one that could not be sent at
+            # all (a call from inside a callback) is worth trying again
+            path: str | None = None
+            try:
+                path = cast(str, await self._send_raw(builder.Output()))
+                self._callback_channel_tried = True
+                self._callback_channel = await AsyncCallbackChannel.open(
+                    self, path, self.handshake_timeout
+                )
+            except (JavaException, OSError) as e:
+                self._callback_channel_tried = True
+                logger.warning(
+                    "Could not open the callback connection%s: %s. Callbacks will "
+                    "work only on the Java thread that runs the request.",
+                    f" at {path}" if path else "",
+                    e,
+                )
 
     async def _send_callback_response(
         self, callback_id: int, result, is_error: bool, error_msg: str | None
     ):
-        """Send the result of a callback execution back to Java."""
+        """Send the result of an in-band callback back to Java, on the channel of
+        the request that is waiting for it."""
+        data = self._build_callback_response(callback_id, result, is_error, error_msg)
 
+        # Write to command zone
+        self.shm.seek(self.command_offset)
+        self.shm.write(data)
+
+        # Signal Java
+        self._writer.write(struct.pack("<I", len(data)))
+        await self._writer.drain()
+
+    def _build_callback_response(
+        self,
+        callback_id: int,
+        result,
+        is_error: bool,
+        error_msg: str | None,
+        call_id: int = 0,
+    ) -> bytes:
+        """Build the CallbackResponse command that answers a callback.
+
+        call_id is the call's ID on the callback connection; 0 in band.
+        """
         builder = flatbuffers.Builder(1024)
 
         # Build arguments: [result, is_error]
@@ -669,27 +810,23 @@ class AsyncGatunClient(_ValueEncoder):
         Cmd.CommandAddArgs(builder, args_vec)
         if error_name_off:
             Cmd.CommandAddTargetName(builder, error_name_off)
+        Cmd.CommandAddCallId(builder, call_id)
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        data = builder.Output()
+        # The command zone in band, a frame on the callback connection: the
+        # same size
+        data = bytes(builder.Output())
         if len(data) > self.payload_offset and not is_error:
-            await self._send_callback_response(
+            return self._build_callback_response(
                 callback_id,
                 None,
                 True,
                 f"Callback result is too large to return: {len(data):,} bytes "
-                f"exceeds the {self.payload_offset:,} byte command zone",
+                f"exceeds the {self.payload_offset:,} bytes an answer can take",
+                call_id,
             )
-            return
-
-        # Write to command zone
-        self.shm.seek(self.command_offset)
-        self.shm.write(bytes(data))
-
-        # Signal Java
-        self._writer.write(struct.pack("<I", len(data)))
-        await self._writer.drain()
+        return data
 
     def _unpack_value(self, val_type: int, val_table: Any) -> Any:
         """Unpack a FlatBuffer Value union to a Python object."""
@@ -1116,6 +1253,9 @@ class AsyncGatunClient(_ValueEncoder):
 
         The callback can be either a sync function or an async coroutine.
         """
+        # Java may call this callback from any thread from here on
+        await self._ensure_callback_channel()
+
         builder = flatbuffers.Builder(256)
         interface_off = builder.CreateString(interface_name)
 
@@ -1307,6 +1447,9 @@ class AsyncGatunClient(_ValueEncoder):
                     await writer.wait_closed()
                 except OSError:
                     pass
+            channel, self._callback_channel = self._callback_channel, None
+            if channel is not None:
+                channel.close()
             _close_shared_memory(self)
         finally:
             # A server started for this client by aconnect() goes away with it

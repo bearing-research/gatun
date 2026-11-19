@@ -24,6 +24,7 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from gatun.arena import PayloadArena, ScopedArenaContext
 
+from gatun.callback_channel import CallbackChannel
 from gatun.generated.org.gatun.protocol import Action as Act
 from gatun.generated.org.gatun.protocol import (
     Argument,
@@ -160,7 +161,7 @@ def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int)
 
 # Protocol version - must match the server version
 # Version 2: Per-client shared memory (handshake includes SHM path)
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # Memory zone sizes - must match GatunServer.java constants
 COMMAND_ZONE_SIZE = 65536  # 64KB for commands
@@ -2171,6 +2172,11 @@ class GatunClient(_ValueEncoder):
         # Callback registry: callback_id -> callable
         self._callbacks: dict[int, Callable[..., Any]] = {}
 
+        # Where Java threads other than the one running a request call Python.
+        # Opened with the first register_callback; see _ensure_callback_channel
+        self._callback_channel: CallbackChannel | None = None
+        self._callback_channel_tried = False
+
         # Arrow schema cache for Java -> Python transfers: hash -> Schema
         self._arrow_schema_cache: dict[int, pa.Schema] = {}
 
@@ -2520,6 +2526,9 @@ class GatunClient(_ValueEncoder):
 
         self._dead = True
         self._pending_frees.clear()
+        channel, self._callback_channel = self._callback_channel, None
+        if channel is not None:
+            channel.close()
 
         # Shutdown socket to unblock any pending reads, then close
         try:
@@ -2658,27 +2667,53 @@ class GatunClient(_ValueEncoder):
         """Raise the appropriate Python exception for a Java error."""
         _raise_java_exception_impl(error_type, error_msg)
 
-    def _handle_callback(self, resp):
+    def _handle_callback(
+        self,
+        resp,
+        reply: Callable[[Any, bool, str | None], None] | None = None,
+    ):
         """Handle a callback invocation request from Java.
 
-        The thread that runs the callback is recorded for as long as it runs, so
+        Without `reply` the request came in band: the client's own request is
+        waiting on this callback, and the answer goes back on its channel. The
+        thread that runs the callback is recorded for as long as it runs, so
         that a Java call made from it is refused instead of deadlocking.
+
+        With `reply` (result, is_error, error message) the request came on the
+        callback connection, from some other Java thread. Only that thread
+        waits for it, so the callback may call Java like any other code.
 
         If callback_timeout is set, the callback is executed in a separate thread
         with a timeout to prevent hung callbacks from deadlocking the protocol.
         """
         callback_id = resp.CallbackId()
+        in_band = reply is None
 
-        # Look up the callback function
+        def answer(result: Any, is_error: bool, error_msg: str | None) -> None:
+            if reply is None:
+                self._send_callback_response(callback_id, result, is_error, error_msg)
+            else:
+                reply(result, is_error, error_msg)
+
         callback_fn = self._callbacks.get(callback_id)
-        if callback_fn is None:
-            # Send error response
-            self._send_callback_response(
-                callback_id, None, True, f"Callback {callback_id} not found"
-            )
-            return
+
+        def call() -> Any:
+            # Unpacked even when the callback is gone (unregistered while Java
+            # was calling it): the server registered the objects among the
+            # arguments for this client, and their wrappers are what frees them
+            args = [
+                self._unpack_value(arg.ValType(), arg.Val())
+                for arg in (
+                    resp.CallbackArgs(i) for i in range(resp.CallbackArgsLength())
+                )
+            ]
+            if callback_fn is None:
+                raise LookupError(f"Callback {callback_id} not found")
+            return callback_fn(*args)
 
         def run() -> Any:
+            if not in_band:
+                return call()
             # Everything from unpacking the arguments on counts as "inside the
             # callback": unpacking a map keyed by Java objects hashes them, which
             # is a Java call, and Java is already waiting on this callback.
@@ -2686,13 +2721,7 @@ class GatunClient(_ValueEncoder):
             self._callback_threads.add(ident)
             scope, token = _enter_callback(self)
             try:
-                args = [
-                    self._unpack_value(arg.ValType(), arg.Val())
-                    for arg in (
-                        resp.CallbackArgs(i) for i in range(resp.CallbackArgsLength())
-                    )
-                ]
-                return callback_fn(*args)
+                return call()
             finally:
                 _exit_callback(scope, token)
                 self._callback_threads.discard(ident)
@@ -2727,8 +2756,7 @@ class GatunClient(_ValueEncoder):
                 if not result_holder["done"]:
                     # Timeout - callback is still running (possibly hung)
                     # We can't kill the thread, but we must respond to Java
-                    self._send_callback_response(
-                        callback_id,
+                    answer(
                         None,
                         True,
                         f"CallbackTimeoutError: Callback execution exceeded {self.callback_timeout}s timeout",
@@ -2737,24 +2765,114 @@ class GatunClient(_ValueEncoder):
                 if result_holder["error"] is not None:
                     raise cast(BaseException, result_holder["error"])
                 result = result_holder["result"]
-            self._send_callback_response(callback_id, result, False, None)
+            answer(result, False, None)
         except ReentrancyError:
             # Propagate reentrancy error with clear message
-            self._send_callback_response(
-                callback_id,
+            answer(
                 None,
                 True,
                 "ReentrancyError: Cannot call Java from within a callback",
             )
         except Exception as e:  # noqa: BLE001 - any callback failure is forwarded to Java
-            self._send_callback_response(callback_id, None, True, str(e))
+            answer(None, True, str(e))
         except BaseException as e:
             # Ctrl-C or sys.exit() inside the callback. Java gets an answer so it
             # stops waiting, and the exception carries on in this thread.
-            self._send_callback_response(
-                callback_id, None, True, f"{type(e).__name__}: {e}"
-            )
+            answer(None, True, f"{type(e).__name__}: {e}")
             raise
+
+    def _serve_channel_callback(self, channel: CallbackChannel, resp) -> None:
+        """Run one callback that arrived on the callback connection.
+
+        Runs on a thread of its own, started by the connection's reader.
+        """
+        callback_id = resp.CallbackId()
+        call_id = resp.CallId()
+        answered = False
+
+        def reply(result: Any, is_error: bool, error_msg: str | None) -> None:
+            nonlocal answered
+            answered = True
+            channel.send(
+                self._build_callback_response(
+                    callback_id, result, is_error, error_msg, call_id
+                )
+            )
+
+        try:
+            self._handle_callback(resp, reply)
+        except OSError as e:
+            # The connection closed under the callback; Java was told by that
+            logger.debug("Callback %d could not be answered: %s", callback_id, e)
+        except BaseException as e:
+            # A Java thread is waiting for this call and nothing else ends its wait
+            if not answered:
+                try:
+                    reply(None, True, f"{type(e).__name__}: {e}")
+                except OSError:
+                    pass
+            raise
+        finally:
+            self._release_on_channel(channel)
+
+    def _release_on_channel(self, channel: CallbackChannel) -> None:
+        """Send the queued object releases on the callback connection.
+
+        They normally ride ahead of the client's next request. A client that
+        only receives callbacks, or sits in one long request, makes none, and
+        the arguments of every call would stay registered on the server.
+        """
+        frees = self._pending_frees
+        while frees:
+            ids = _take_free_chunk(frees)
+            if not ids:
+                return
+            try:
+                channel.send(_build_free_command(flatbuffers.Builder(64), ids))
+            except OSError:
+                # The connection is gone; the next request can still send them
+                frees.extend(ids)
+                return
+
+    def _ensure_callback_channel(self) -> None:
+        """Open the callback connection, the first time a callback is registered.
+
+        The server opens a socket for this session and says where; whoever
+        connects to it is this session's callback connection. Without it
+        callbacks still work on the thread that runs the request, so a failure
+        to open it is logged and not raised: the server tells any other thread
+        that calls a callback why it cannot.
+        """
+        # Before waiting for the channel: inside a callback the request that is
+        # waiting for it holds the channel
+        self._check_reentrancy()
+        # Under the lock: threads registering callbacks at the same time open
+        # it once
+        with self._exchange_lock:
+            if self._callback_channel_tried:
+                return
+            builder = self._get_builder()
+            Cmd.CommandStart(builder)
+            Cmd.CommandAddAction(builder, Act.Action.OpenCallbackChannel)
+            builder.Finish(Cmd.CommandEnd(builder))
+            command = builder.Output()
+            # Only after this point: a request that could not be sent at all
+            # (a call from inside a callback) is worth trying again
+            path: str | None = None
+            try:
+                path = cast(str, self._send_raw(command))
+                self._callback_channel_tried = True
+                self._callback_channel = CallbackChannel(
+                    self, path, self.handshake_timeout
+                )
+            except (JavaException, OSError) as e:
+                self._callback_channel_tried = True
+                logger.warning(
+                    "Could not open the callback connection%s: %s. Callbacks will "
+                    "work only on the Java thread that runs the request.",
+                    f" at {path}" if path else "",
+                    e,
+                )
 
     def _unpack_arrow_batch(self, arrow_batch) -> ArrowTableView:
         """Unpack an ArrowBatchDescriptor from Java into an ArrowTableView.
@@ -2856,7 +2974,24 @@ class GatunClient(_ValueEncoder):
     def _send_callback_response(
         self, callback_id: int, result, is_error: bool, error_msg: str | None
     ):
-        """Send the result of a callback execution back to Java."""
+        """Send the result of an in-band callback back to Java, on the channel of
+        the request that is waiting for it."""
+        data = self._build_callback_response(callback_id, result, is_error, error_msg)
+        # Java reads this as the answer it is waiting for and sends nothing back
+        self._send_raw(data, expects_response=False)
+
+    def _build_callback_response(
+        self,
+        callback_id: int,
+        result,
+        is_error: bool,
+        error_msg: str | None,
+        call_id: int = 0,
+    ) -> bytes:
+        """Build the CallbackResponse command that answers a callback.
+
+        call_id is the call's ID on the callback connection; 0 in band.
+        """
         builder = self._get_builder(large=True)
 
         # Build arguments: [result, is_error]
@@ -2879,7 +3014,7 @@ class GatunClient(_ValueEncoder):
         # Build target_name (error message if error)
         # Truncate large error messages to prevent exceeding command zone size.
         # During fuzzing, callback exceptions can have huge repr() or stack traces.
-        # If we don't truncate, _send_raw will raise PayloadTooLargeError and
+        # If we don't truncate, the answer cannot be sent and
         # Java will be stuck waiting for a CallbackResponse that never arrives.
         target_name_off = None
         if error_msg:
@@ -2893,23 +3028,24 @@ class GatunClient(_ValueEncoder):
         if target_name_off:
             Cmd.CommandAddTargetName(builder, target_name_off)
         Cmd.CommandAddArgs(builder, args_vec)
+        Cmd.CommandAddCallId(builder, call_id)
         cmd_offset = Cmd.CommandEnd(builder)
         builder.Finish(cmd_offset)
 
-        # Send it (don't wait for response - Java is waiting for this)
-        # Java doesn't send a response for CallbackResponse, so expects_response=False
-        data = builder.Output()
+        # The command zone in band, a frame on the callback connection: the
+        # same size
+        data = bytes(builder.Output())
         if len(data) > self.payload_offset and not is_error:
             # Java is waiting; it has to hear something that fits
-            self._send_callback_response(
+            return self._build_callback_response(
                 callback_id,
                 None,
                 True,
                 f"Callback result is too large to return: {len(data):,} bytes "
-                f"exceeds the {self.payload_offset:,} byte command zone",
+                f"exceeds the {self.payload_offset:,} bytes an answer can take",
+                call_id,
             )
-            return
-        self._send_raw(data, expects_response=False)
+        return data
 
     def create_object(self, class_name, *args):
         builder = self._get_builder(large=True)
@@ -3493,6 +3629,9 @@ class GatunClient(_ValueEncoder):
             arr.add(2)
             client.invoke_static_method("java.util.Collections", "sort", arr, comparator)
         """
+        # Java may call this callback from any thread from here on
+        self._ensure_callback_channel()
+
         builder = self._get_builder()
         interface_off = self._create_string(builder, interface_name)
 
@@ -4095,6 +4234,9 @@ class GatunClient(_ValueEncoder):
                     sock.close()
                 except OSError:
                     pass
+            channel, self._callback_channel = self._callback_channel, None
+            if channel is not None:
+                channel.close()
             _close_shared_memory(self)
         finally:
             # A server started for this client by connect() goes away with it

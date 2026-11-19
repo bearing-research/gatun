@@ -235,6 +235,7 @@ public class Metrics {
       case Action.GetMetrics -> "GetMetrics";
       case Action.ArrowToObject -> "ArrowToObject";
       case Action.ArrowFromObject -> "ArrowFromObject";
+      case Action.OpenCallbackChannel -> "OpenCallbackChannel";
       default -> "Unknown(" + action + ")";
     };
   }
