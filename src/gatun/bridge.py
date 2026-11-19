@@ -190,7 +190,8 @@ class BridgeAdapter(ABC):
         Returns:
             Reference to an object that implements the interface. Pass it to
             any JVM method that takes one. The JVM may call it from any thread,
-            and at any time, until unregister_callback() or close().
+            and at any time, until unregister_callback() or close(), or until
+            nothing refers to the object any more, in Python or in the JVM.
         """
         ...
 

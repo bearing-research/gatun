@@ -2888,6 +2888,133 @@ class TestAsyncVectorizedCallsInsideChannelCallbacks:
         assert await client.jvm.OtherThread.call(supplier) == "from the inner one"
 
 
+class TestCallbackProxyCollected:
+    """Once the client has let go of a callback's handle and no Java code
+    holds its proxy, nothing can call it again: Java's garbage collector says
+    so and the client drops the function."""
+
+    def test_function_is_dropped_once_java_lets_go(self, client):
+        class Answer:
+            def __call__(self):
+                return 42
+
+        answer = Answer()
+        gone = weakref.ref(answer)
+        supplier = client.register_callback(answer, "java.util.function.Supplier")
+        callback_id = supplier.object_id
+        holder = client.jvm.java.util.ArrayList()
+        holder.add(supplier)
+        del supplier, answer
+        gc.collect()
+
+        # Java still holds the proxy, so the callback must stay
+        for _ in range(3):
+            client.jvm.java.lang.System.gc()
+            time.sleep(0.1)
+        assert callback_id in client._callbacks
+        assert gone() is not None
+
+        holder.clear()
+
+        def dropped():
+            gc.collect()
+            client.jvm.java.lang.System.gc()  # and the request releases the handle
+            return True if callback_id not in client._callbacks else None
+
+        assert _eventually(dropped)
+        # Its last reference ends on another thread, a moment later
+        assert _eventually(lambda: True if gone() is None else None)
+
+    @pytest.fixture
+    def threaded(self, other_thread_classes):
+        """A client whose server has other threads to call callbacks from."""
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            socket_timeout=10,
+        )
+        yield client
+        client.close()
+
+    def test_finalizer_of_a_dropped_function_may_call_java(self, threaded):
+        """It waits for the client's channel, which the request waiting for a
+        callback holds. The connection goes on serving that callback."""
+        client = threaded
+        finalized = []
+
+        class Answer:
+            def __call__(self):
+                return 42
+
+            def __del__(self):
+                finalized.append(client.jvm.java.lang.Integer.parseInt("7"))
+
+        supplier = client.register_callback(Answer(), "java.util.function.Supplier")
+        callback_id = supplier.object_id
+        del supplier
+        gc.collect()
+
+        def until_dropped():
+            for _ in range(100):
+                if callback_id not in client._callbacks:
+                    # The reader must still deliver this call's response
+                    time.sleep(0.2)
+                    return client.jvm.java.lang.Integer.parseInt("8")
+                client.jvm.java.lang.System.gc()
+                time.sleep(0.05)
+            return "still registered"
+
+        waiter = client.register_callback(until_dropped, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(waiter) == 8
+        assert _eventually(lambda: finalized or None) == [7]
+
+    def test_call_delivered_before_java_let_go_still_runs(self, threaded, monkeypatch):
+        """The Java caller was interrupted, held the only reference to the
+        proxy, and the collector's report follows the call on the connection."""
+        client = threaded
+        serve = client._serve_channel_callback
+
+        def report_arrives_first(channel, resp, handler=None):
+            client._callbacks.pop(resp.CallbackId(), None)
+            serve(channel, resp, handler)
+
+        monkeypatch.setattr(client, "_serve_channel_callback", report_arrives_first)
+        supplier = client.register_callback(lambda: 42, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(supplier) == 42
+
+    def test_callback_whose_handle_python_keeps_stays(self, client):
+        comparator = client.register_callback(
+            lambda a, b: (a > b) - (a < b), "java.util.Comparator"
+        )
+
+        for _ in range(3):
+            client.jvm.java.lang.System.gc()
+            time.sleep(0.1)
+
+        assert comparator.object_id in client._callbacks
+        numbers = client.jvm.java.util.ArrayList([2, 1])
+        client.jvm.java.util.Collections.sort(numbers, comparator)
+        assert list(numbers) == [1, 2]
+
+    async def test_async_client(self, java_gateway):
+        async with AsyncGatunClient(java_gateway.socket_path) as client:
+            supplier = await client.register_callback(
+                lambda: 42, "java.util.function.Supplier"
+            )
+            callback_id = supplier.object_id
+            del supplier
+            gc.collect()
+
+            async with asyncio.timeout(10):
+                while callback_id in client._callbacks:
+                    gc.collect()
+                    await client.jvm.java.lang.System.gc()
+                    await asyncio.sleep(0.1)
+
+
 class TestCallbackObjects:
     """An object that is not callable implements an interface with several
     methods: each call goes to its method of the same name."""

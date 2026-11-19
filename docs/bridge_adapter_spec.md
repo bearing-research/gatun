@@ -225,9 +225,12 @@ listener, a comparator. The rules an implementation must keep:
   `callback_timeout` seconds (30 by default) the JVM caller gets an exception while the
   handler is still running. Pass `callback_timeout=None` when handlers run long, as a
   foreachBatch function does.
-- The handler stays registered, and referenced, until `unregister_callback` or `close()`:
-  JVM code may hold the object indefinitely. After `unregister_callback` a call fails in the
-  JVM with an exception and does not reach Python.
+- The handler stays registered, and referenced, for as long as the JVM can call it: until
+  `unregister_callback` or `close()`, or until nothing refers to the callback object any
+  more, in Python or in the JVM. JVM code may hold the object indefinitely, but an
+  implementation may let go of a handler whose object the JVM has garbage collected (Gatun
+  does), so keep the returned reference if the JVM holds the object only weakly. After
+  `unregister_callback` a call fails in the JVM with an exception and does not reach Python.
 - `unregister_callback` takes any reference to the callback object: the one
   `register_callback` returned, or one that came back from the JVM later (read out of a
   collection of listeners, for example).
