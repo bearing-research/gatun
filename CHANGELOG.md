@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Direction field on Arrow batch descriptors
 - Arrow memory architecture documentation
 - `client.arrow_to_java(table)` and `client.arrow_from_java(obj)`, on both clients. A sent table becomes an `org.apache.arrow.vector.VectorSchemaRoot` object that any Java method can receive, and any `VectorSchemaRoot` the JVM holds, including one Java code produced, can be fetched as a `pyarrow.Table`. Before this, sent Arrow data could only be read back by the client that sent it
+- `client.arrow_from_java(obj, copy=False)` (sync client) reads a table where Java wrote it in shared memory instead of copying it out. It returns an `ArrowTableView` that is good until the client's next Arrow transfer and raises `StaleArenaError` after it
+- `benchmarks/benchmark_transport.py` measures Arrow transfer through shared memory against a Unix socket and a file, in both directions
 - `allowed_classes` and `allowed_prefixes` arguments to `connect()`, `aconnect()`, `launch_gateway()` and `GatunAdapter`, also settable in `pyproject.toml` and through `GATUN_ALLOWED_CLASSES` / `GATUN_ALLOWED_PREFIXES`. Using a library outside the built-in allowlist no longer needs a source edit and a rebuild
 - `socket_timeout` and `callback_timeout` arguments to `connect()`, `aconnect()` and `GatunAdapter`; the handshake uses the configured `connect_timeout`
 - `gatun.limits.max_sessions` caps the sessions a server serves at once (default: unlimited). A connection that arrives while every slot is taken waits up to two seconds for one before it is refused
@@ -26,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protocol version is now 3: `datetime` / `date` / `time` arguments travel as a new `TemporalVal` value instead of being built with extra Java calls, and `FreeObject` accepts several object IDs. Client and server must be upgraded together
 - The async client accepts `datetime` / `date` / `time` arguments
 - Executing a batch from inside a callback raises `ReentrancyError`, like any other call
+- `arrow_to_java()` and `send_arrow_table()` serialize the table straight into shared memory instead of building the stream in a buffer and copying that across: about half the time for a 128 MiB table in `arrow_to_java()`, and no buffer the size of the stream. A table that does not fit is refused before its stream is written
+- `ArrowTableView.to_pandas()` / `to_pydict()` / `to_pylist()` hold the client's channel while they copy, so a transfer on another thread cannot change the data under them. A view also ends when the transfer that overwrites it starts, not when it succeeds, and when the client's arena allocates over it
 - Connecting no longer writes zeros over the whole shared memory file: about 7 ms instead of 260 ms at 64MB, and no longer proportional to the memory size. Disk (or tmpfs) pages are now allocated as they are first used rather than all at connect time
 - **`client.cancel()` takes no arguments and interrupts the session's running request** from another thread. The old `cancel(request_id)` could not work: it queued behind the request it was meant to stop. `_get_request_id()` is gone. A cancelled request raises `CancelledException`, and the session stays usable
 - Objects belong to the session that created them. Another session that guesses an object ID gets "not found", whether it uses the ID as a target or as an argument

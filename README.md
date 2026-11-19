@@ -559,11 +559,16 @@ root.getVector("x").get(2)         # 3
 produced = root.slice(1, 2)        # a new table, made on the Java side
 result = client.arrow_from_java(produced)
 result.to_pydict()                 # {'x': [2, 3], 'name': ['b', 'c']}
+
+# Read a result once without copying it out of shared memory
+view = client.arrow_from_java(produced, copy=False)
+view.to_pydict()                   # good until the next Arrow transfer
 produced.close()                   # Java-made tables are yours to close
 ```
 
 - A table made by `arrow_to_java()` owns its memory in the JVM and is released when its handle is garbage collected or the connection closes. Java code that keeps it for longer must copy it. Handles from the async client are not garbage collected: free them with `async with await client.arrow_to_java(table) as root:` or `await client.free_object(root.object_id)`.
 - `arrow_from_java()` returns a `pyarrow.Table` that owns its data, so it stays valid after later transfers and after `close()`.
+- `arrow_from_java(obj, copy=False)` skips that copy (sync client only). It returns an `ArrowTableView` over the bytes Java wrote into shared memory, which is good until the client's next Arrow transfer of any kind and raises `StaleArenaError` after it. Use it to read a result once (aggregate it, call `to_pandas()`); keep the default for a table you hold on to. A `pyarrow.Table` taken out of the view with `view.table` is not checked.
 - Each transfer must fit in the shared memory payload zone (`PayloadTooLargeError` otherwise). Connect with more memory, or move a large table in pieces with `table.slice()` / `root.slice(start, length)`.
 - Dictionary-encoded columns are not supported; decode them first.
 
