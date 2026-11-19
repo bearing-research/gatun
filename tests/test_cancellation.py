@@ -53,6 +53,22 @@ class TestCancellation:
         items.add("after")
         assert items.size() == 1
 
+    def test_cancel_ends_a_batch(self, sleeper):
+        """Not only the command that was running: the ones after it never run,
+        and the batch fails as a whole instead of reporting them done."""
+        numbers = sleeper.jvm.java.util.ArrayList()
+        thread, outcome = _cancel_soon(sleeper)
+
+        with pytest.raises(CancelledException), sleeper.batch() as b:
+            b.call_static("java.lang.Thread", "sleep", 20_000)
+            added = b.call(numbers, "add", 1)
+
+        thread.join()
+        assert outcome == [True]
+        assert numbers.size() == 0
+        with pytest.raises(RuntimeError, match="The request was cancelled"):
+            added.get()
+
     def test_cancel_with_nothing_running(self, client):
         assert client.cancel() is False
         assert client.ping() is True

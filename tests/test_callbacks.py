@@ -1666,30 +1666,108 @@ class TestJavaCallsInsideChannelCallbacks:
         # Outside the callback it works as ever
         assert client.send_arrow_table(table) == "Received 3 rows"
 
-    def test_batch_is_refused_with_the_reason(self, client):
+    def test_batch(self, client):
         def batch():
+            numbers = client.jvm.java.util.ArrayList()
             with client.batch() as b:
-                b.call_static("java.lang.Math", "max", 1, 2)
+                for n in (3, 1, 2):
+                    b.call(numbers, "add", n)
+                size = b.call(numbers, "size")
+                bad = b.call_static("java.lang.Integer", "parseInt", "nope")
+                made = b.create("java.lang.StringBuilder", "kept")
+            return [size.get(), bad.is_error, made.get().toString()]
 
         supplier = client.register_callback(batch, "java.util.function.Supplier")
 
-        with pytest.raises(
-            JavaException,
-            match="ReentrancyError: Batch cannot be used inside a callback",
-        ):
-            client.jvm.OtherThread.call(supplier)
-        assert client.jvm.java.lang.Math.max(1, 2) == 2
+        assert client.jvm.OtherThread.call(supplier) == [3, True, "kept"]
 
-    def test_registering_a_callback_is_refused_with_the_reason(self, client):
+    def test_batch_whose_response_is_too_large_keeps_nothing(self, client):
+        def live_objects():
+            report = client.get_metrics()
+            return int(report.split("current_objects:")[1].split()[0])
+
+        text = client.create_object("java.lang.String", "ab")
+
+        def too_large():
+            try:
+                with client.batch() as b:
+                    for _ in range(5):
+                        b.create("java.util.ArrayList")
+                    b.call(text, "repeat", 40_000)
+            except PayloadTooLargeError as e:
+                return type(e).__name__
+            return "delivered"
+
+        supplier = client.register_callback(too_large, "java.util.function.Supplier")
+        before = live_objects()
+
+        assert client.jvm.OtherThread.call(supplier) == "PayloadTooLargeError"
+        assert live_objects() == before
+
+    def test_vectorized_calls(self, client):
+        def vectorized():
+            text, numbers = client.create_objects(
+                [("java.lang.StringBuilder", ("ab",)), ("java.util.ArrayList", ())]
+            )
+            added = client.invoke_methods(
+                numbers, [("add", (1,)), ("add", (2,)), ("size", ())]
+            )
+            kept = client.invoke_methods(
+                numbers, [("subList", (0, 1))], return_object_refs=True
+            )[0]
+            return [added, kept.size(), client.get_fields(text, ["count"])]
+
+        supplier = client.register_callback(vectorized, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(supplier) == [[True, True, 2], 1, [2]]
+
+    def test_vectorized_call_that_fails_part_way_keeps_nothing(self, client):
+        def live_objects():
+            report = client.get_metrics()
+            return int(report.split("current_objects:")[1].split()[0])
+
+        def fail_part_way():
+            try:
+                client.create_objects(
+                    [("java.util.ArrayList", ()), ("java.util.ArrayList", (-1,))]
+                )
+            except JavaException as e:
+                return type(e).__name__
+            return "created"
+
         supplier = client.register_callback(
-            lambda: client.register_callback(lambda: None, "java.lang.Runnable"),
+            fail_part_way, "java.util.function.Supplier"
+        )
+        before = live_objects()
+
+        assert client.jvm.OtherThread.call(supplier) == "JavaIllegalArgumentException"
+        assert live_objects() == before
+
+    def test_metrics(self, client):
+        supplier = client.register_callback(
+            lambda: client.get_metrics().splitlines()[0],
             "java.util.function.Supplier",
         )
 
-        started = time.monotonic()
-        with pytest.raises(JavaException, match="RegisterCallback cannot be used"):
-            client.jvm.OtherThread.call(supplier)
-        assert time.monotonic() - started < 5
+        assert client.jvm.OtherThread.call(supplier) == "=== Gatun Server Metrics ==="
+
+    def test_callback_registers_another(self, client):
+        """A listener that installs a listener."""
+        made = []
+
+        def register():
+            inner = client.register_callback(
+                lambda: "from the inner one", "java.util.function.Supplier"
+            )
+            made.append(inner)
+            # Called by the thread that is running this very callback
+            return client.jvm.OtherThread.call(inner)
+
+        supplier = client.register_callback(register, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(supplier) == "from the inner one"
+        # And it stays registered
+        assert client.jvm.OtherThread.call(made[0]) == "from the inner one"
 
     def test_command_and_response_too_large_for_the_connection(self, client):
         def too_large():
@@ -1810,6 +1888,41 @@ class TestJavaCallsInsideChannelCallbacks:
         )
         assert held.toString() == "made slowly"
 
+    def test_objects_in_a_batch_response_nobody_waited_for_are_released(self, client):
+        def live_objects():
+            report = client.get_metrics()
+            return int(report.split("current_objects:")[1].split()[0])
+
+        caught = []
+        over = threading.Event()
+
+        def give_up_on_it():
+            client.socket_timeout = 0.4
+            try:
+                with client.batch() as b:
+                    b.create("java.lang.StringBuilder", "made at once")
+                    b.call_static("OtherThread", "makeSlowly", 1200)
+            except Exception as e:  # noqa: BLE001 - its type is the result
+                caught.append(type(e).__name__)
+            finally:
+                client.socket_timeout = 10
+            over.set()
+
+        task = client.register_callback(give_up_on_it, "java.lang.Runnable")
+        held = client.jvm.OtherThread.makeSlowly(0)  # looked up before the timeout
+        before = live_objects()
+
+        client.jvm.OtherThread.later(task, 0)
+        assert over.wait(10)
+        assert caught == ["SocketTimeoutError"]
+        assert _eventually(client.jvm.OtherThread.lastError) == ""
+
+        assert (
+            _eventually(lambda: live_objects() if live_objects() <= before else None)
+            == before
+        )
+        assert held.toString() == "made slowly"
+
     def test_unregistering_on_a_closed_client_drops_the_function(self, client):
         comparator = client.register_callback(lambda a, b: 0, "java.util.Comparator")
         callback_id = comparator.object_id
@@ -1924,6 +2037,70 @@ class TestJavaCallsInsideChannelCallbacks:
         assert "Interrupted" in client.jvm.OtherThread.lastError()
         assert _eventually(lambda: seen or None) == [4]
         assert caught == ["CancelledException"]
+
+    def test_java_thread_is_interrupted_while_it_runs_the_callbacks_batch(self, client):
+        """The batch ends with the command that was interrupted, whatever
+        stop_on_error says, and so does the thread's wait for the callback.
+        The batch fails as a whole: results would report the commands that
+        never ran as done."""
+        numbers = client.jvm.java.util.ArrayList()
+        outcome = []
+
+        def wait_in_a_batch():
+            try:
+                with client.batch() as b:
+                    b.call_static("OtherThread", "readyThenPause", 20_000)
+                    added = b.call(numbers, "add", 1)
+            except Exception as e:  # noqa: BLE001 - its type is the result
+                outcome.append(type(e).__name__)
+            try:
+                added.get()
+            except Exception as e:  # noqa: BLE001 - its type is the result
+                outcome.append(type(e).__name__)
+
+        task = client.register_callback(wait_in_a_batch, "java.lang.Runnable")
+
+        started = time.monotonic()
+        client.jvm.OtherThread.interrupt(task)
+
+        assert time.monotonic() - started < 5
+        assert "Interrupted" in client.jvm.OtherThread.lastError()
+        assert _eventually(lambda: outcome if len(outcome) == 2 else None) == [
+            "CancelledException",
+            "RuntimeError",
+        ]
+        assert numbers.size() == 0
+
+    def test_batch_too_large_for_the_callback_connection_was_not_executed(self, client):
+        """A command travels there wrapped, in a frame with a limit of its
+        own. Refused for that, the batch can still be executed."""
+        numbers = client.jvm.java.util.ArrayList()
+        kept = []
+
+        def batch_with(length):
+            batch = client.batch()
+            batch.call(numbers, "add", "x" * length)
+            return batch
+
+        def run():
+            try:
+                batch_with(70_000).execute()
+            except PayloadTooLargeError as e:
+                around_the_text = e.payload_size - 70_000
+            # Fits the client's command zone, and not the frame once wrapped
+            batch = batch_with(65_536 - around_the_text - 8)
+            kept.append(batch)
+            try:
+                batch.execute()
+            except PayloadTooLargeError as e:
+                return f"{e.max_size} {numbers.size()}"
+            return "executed"
+
+        supplier = client.register_callback(run, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(supplier) == "65536 0"
+        assert kept[0].execute() == [True]
+        assert numbers.size() == 1
 
     def test_callback_unregisters_itself(self, client):
         registered = []
@@ -2660,6 +2837,55 @@ class TestAsyncArrowInsideChannelCallbacks:
         release.set()
 
         assert (await asyncio.wait_for(started[0], 5)).equals(table)
+
+
+class TestAsyncVectorizedCallsInsideChannelCallbacks:
+    @pytest.fixture
+    async def client(self, other_thread_classes):
+        client = await aconnect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            socket_timeout=10,
+        )
+        yield client
+        await client.close()
+
+    async def test_vectorized_calls_and_metrics(self, client):
+        async def vectorized():
+            text, numbers = await client.create_objects(
+                [("java.lang.StringBuilder", ("ab",)), ("java.util.ArrayList", ())]
+            )
+            added = await client.invoke_methods(
+                numbers, [("add", (1,)), ("add", (2,)), ("size", ())]
+            )
+            count = await client.get_fields(text, ["count"])
+            title = (await client.get_metrics()).splitlines()[0]
+            return [added, count, title]
+
+        supplier = await client.register_callback(
+            vectorized, "java.util.function.Supplier"
+        )
+
+        assert await client.jvm.OtherThread.call(supplier) == [
+            [True, True, 2],
+            [2],
+            "=== Gatun Server Metrics ===",
+        ]
+
+    async def test_callback_registers_another(self, client):
+        async def inner():
+            return "from the inner one"
+
+        async def register():
+            proxy = await client.register_callback(inner, "java.util.function.Supplier")
+            return await client.jvm.OtherThread.call(proxy)
+
+        supplier = await client.register_callback(
+            register, "java.util.function.Supplier"
+        )
+
+        assert await client.jvm.OtherThread.call(supplier) == "from the inner one"
 
 
 class TestCallbackObjects:

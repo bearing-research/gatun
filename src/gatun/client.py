@@ -1437,13 +1437,22 @@ def _release_unread_response(client: Any, reply: bytes) -> None:
         resp = Response.Response.GetRootAsResponse(reply, 0)
         if resp.IsError() or resp.IsCallback():
             return
-        # No wrappers, which would be Java objects to hash as a map's keys
-        _unpack_value_impl(
-            resp.ReturnValType(),
-            resp.ReturnVal(),
-            client,
-            lambda _client, object_id: ids.append(object_id),
+        batch = resp.Batch()
+        results = (
+            [resp]
+            if batch is None
+            else [batch.Responses(i) for i in range(batch.ResponsesLength())]
         )
+        for result in results:
+            if result.IsError():
+                continue
+            # No wrappers, which would be Java objects to hash as a map's keys
+            _unpack_value_impl(
+                result.ReturnValType(),
+                result.ReturnVal(),
+                client,
+                lambda _client, object_id: ids.append(object_id),
+            )
     except Exception as e:  # noqa: BLE001 - whatever it is, there is nobody to tell
         logger.debug("Could not read a response nobody waited for: %s", e)
     for object_id in ids:
@@ -1755,9 +1764,8 @@ def _channel_call_of(client: Any) -> Any:
 
 
 # What a callback may send on the callback connection. The rest needs the
-# client's shared memory (responses larger than a frame, and every Arrow
-# transfer but the two that go through the call's own memory) or is simply not
-# served there.
+# client's shared memory: every Arrow transfer but the two that go through the
+# call's own memory.
 _NESTABLE_ACTIONS = frozenset(
     {
         Act.Action.Ping,
@@ -1771,7 +1779,13 @@ _NESTABLE_ACTIONS = frozenset(
         Act.Action.IsInstanceOf,
         Act.Action.GetStaticField,
         Act.Action.SetStaticField,
+        Act.Action.RegisterCallback,
         Act.Action.UnregisterCallback,
+        Act.Action.GetFields,
+        Act.Action.InvokeMethods,
+        Act.Action.CreateObjects,
+        Act.Action.Batch,
+        Act.Action.GetMetrics,
         Act.Action.OpenCallMemory,
         Act.Action.ArrowToObject,
         Act.Action.ArrowFromObject,
@@ -1789,8 +1803,9 @@ def _not_inside_channel_callback(what: str) -> ReentrancyError:
     return ReentrancyError(
         f"{what} cannot be used inside a callback that Java made from another "
         "thread. Such a callback reaches Java over the callback connection, "
-        "which carries object creation, method calls, field access and tables "
-        "moved with arrow_to_java() or arrow_from_java() only. Do it after the "
+        "and this goes through the client's own shared memory, which the "
+        "request waiting for the callback may be using. Move tables with "
+        "arrow_to_java() or arrow_from_java() there, or do it after the "
         "callback has returned."
     )
 
@@ -4907,6 +4922,11 @@ class BatchContext:
             raise PayloadTooLargeError(
                 len(data), self._client.payload_offset, "Command"
             )
+        call = _channel_call_of(self._client)
+        if call is not None:
+            # On the callback connection the command travels wrapped, in a
+            # frame with a limit of its own: refused here, it was not sent
+            _nested_command(call.call_id, data)
 
         self._executed = True
         try:
