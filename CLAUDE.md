@@ -37,6 +37,7 @@ The protocol is implemented several times over, so a wire-level change usually t
 - `GatunServer.handleClient` — top-level dispatch (an `if/else if` chain on `cmd.action()`); new actions also need a name in `Metrics.getActionName`
 - `GatunServer.executeCommand` — a second, separate dispatch used only for sub-commands inside `Action.Batch`; an action missing here works standalone but fails in `client.batch()`
 - `src/gatun/client.py` — sync client, plus `BatchContext` if the action should be batchable
+- `src/gatun/callback_channel.py` and `CallbackChannel.java` — the callback connection, for a change to how callbacks travel (see Python Callbacks)
 - `src/gatun/async_client.py` — shares value encoding and decoding with the sync client (the `_ValueEncoder` mixin and `_unpack_value_impl` in `client.py`) but has its own `_read_response`, and implements only a subset of the sync API (no `batch`, `cancel`, `send_arrow_buffers` / `get_arrow_data` or `arrow_from_java(copy=False)`; it does have `reflect`, `get_static_field` and `arrow_to_java` / `arrow_from_java`)
 - `PROTOCOL_VERSION` in both `GatunServer.java` and `client.py` for breaking changes
 
@@ -46,7 +47,7 @@ On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which
 
 ### Protocol Handshake
 Format: `[4 bytes: version][4 bytes: arena_epoch][8 bytes: memory size][2 bytes: shm_path_len][N bytes: shm_path]`
-- Protocol version (currently 3) is verified on connect
+- Protocol version (currently 4) is verified on connect
 - Version mismatch raises RuntimeError with upgrade instructions
 - SHM path is the per-client shared memory file path (e.g., `/tmp/gatun.sock.1.shm`)
 
@@ -301,7 +302,17 @@ Workarounds:
 - Use pure Python logic in callbacks (no Java calls)
 - Pre-create any Java objects you need before the callback is invoked
 
-Java may invoke a callback only on the thread running the request, during that request; `GatunServer.invokeCallback` refuses any other thread with `IllegalStateException`. Serving other threads would take more than a lock: each session maps its shared memory with `Arena.ofConfined()`, so no other thread can touch it. Default methods of the interface (`Comparator.reversed()`) run in Java and never reach Python.
+The policy above is for callbacks made by the thread that is running the request, which travel in band. Default methods of the interface (`Comparator.reversed()`) run in Java and never reach Python.
+
+**Callbacks from other threads: the callback connection**
+
+Any other Java thread (a Spark listener, a timer, an executor's worker, a parallel stream), at any time, calls Python on the session's callback connection. `GatunServer.invokeCallback` chooses by `SessionControl.isSessionThread()`: `exchangeCallback` in band, `callOnChannel` otherwise.
+- It is a second Unix socket with no shared memory: each session maps its memory with `Arena.ofConfined()`, so no other thread can touch it. Frames are `[4 bytes length][FlatBuffer]`, at most 64KB: a `Response` with `is_callback` from Java, a `CallbackResponse` command from Python, paired by `call_id`. Calls from many threads are in flight at once.
+- It is opened lazily, by the first `register_callback` (`_ensure_callback_channel`): `Action.OpenCallbackChannel` on the main channel makes the server listen on `<socket>.<session id>.cb`, a socket that accepts one connection and is then removed. The connection takes no session slot. If it cannot be opened, the client logs a warning and in-band callbacks still work.
+- Server: `CallbackChannel` has one reader and one writer thread; callers only use queues. Callers are threads the server does not own, and interrupting a thread that is blocked on a channel closes the channel. `callOnChannel` sets the `sessionContext` thread-local to the proxy's session while it packs and decodes, because `sessionObject` skips its ownership check on a thread with no session.
+- Python: `CallbackChannel` (a daemon reader thread, one thread per call) and `AsyncCallbackChannel` (a reader task, one task per call) hand each request to the client's `_serve_channel_callback`. They hold the client weakly, so a client dropped without `close()` is still collected. These callbacks are not recorded as running "inside a request" (`_callback_threads`, `_callback_scopes`), so they may call Java; the call takes its turn on the main channel.
+- Because several threads now register objects for one session, `sessionObjectIds` is a concurrent set and the server tracks exactly which IDs each pack registered (`packRecorder`). Do not go back to counting the set before and after, or to ranges of the ID counter: both pick up what another thread registered meanwhile.
+- A proxy outlives its session in whatever Java code holds it; called then, it throws `IllegalStateException` (`SessionContext.closed`). The Python side keeps a callback until `unregister_callback`.
 
 ### Request Cancellation
 Cancel the request running on a client, from another thread:

@@ -309,7 +309,12 @@ async def main():
 asyncio.run(main())
 ```
 
-Java may call a callback only on the thread that is running your request, while that request is running. A callback handed to another Java thread (an executor, `CompletableFuture.runAsync`) fails there with an `IllegalStateException`: the client has one channel, and it is busy with the request. A callback cannot call Java either (`ReentrancyError`), and neither can a task it awaits. In the sync client, do not make a callback wait for another *thread* that calls Java on the same client: that thread waits for the request to finish, and the request is waiting for the callback. The callback timeout ends the wait with `CallbackTimeoutError`; with `callback_timeout=None` nothing does. Work queued by a callback and run after the request is fine.
+Java can call a callback from any thread and at any time, including when the client is doing nothing: a listener, a timer, an executor's worker, a parallel stream. How the call reaches Python depends on the thread that makes it:
+
+- **The thread running your request** (a comparator passed to `Collections.sort`) calls back on the request's own channel. Such a callback cannot call Java (`ReentrancyError`), and neither can a task it awaits: the request is waiting for it on the only channel the call could use. In the sync client, do not make it wait for another *thread* that calls Java on the same client either: that thread waits for the request to finish, and the request is waiting for the callback. The callback timeout ends the wait with `CallbackTimeoutError`; with `callback_timeout=None` nothing does. Work queued by a callback and run after the request is fine.
+- **Any other thread** calls on a second connection, which the client opens with its first `register_callback`. Each of these calls runs on a thread of its own (a task of its own in the async client), so several run at the same time, alongside your own code; what they touch has to be safe for that. These callbacks may call Java. The call takes its turn on the client's channel, so it waits for a request that is running. If that request is itself waiting for the callback (`executor.submit(callback).get()`), the two wait for each other until the callback timeout.
+
+A callback stays registered, and its function alive, until `unregister_callback` or the end of the session, because Java code may still hold the proxy. A proxy called after its client disconnected throws `IllegalStateException` in the calling Java thread.
 
 ### Cancelling a Request
 

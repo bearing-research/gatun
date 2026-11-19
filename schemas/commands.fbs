@@ -33,7 +33,9 @@ enum Action : byte {
   CreateObjects = 23,      // Create multiple objects: class_names + args per object
   GetMetrics = 24,         // Get server metrics (request counts, latencies, object counts, etc.)
   ArrowToObject = 25,      // Turn the IPC stream at arrow_stream into a VectorSchemaRoot object
-  ArrowFromObject = 26     // Write the VectorSchemaRoot target_id as an IPC stream; see Response.arrow_stream
+  ArrowFromObject = 26,    // Write the VectorSchemaRoot target_id as an IPC stream; see Response.arrow_stream
+  OpenCallbackChannel = 27 // Open the session's callback connection; returns the path of a socket
+                           // that accepts exactly one connection (see "Callback connection" below)
 }
 
 // Element types for arrays
@@ -226,6 +228,21 @@ table CreateObjectsRequest {
 // Forward declaration needed for BatchCommand
 // Note: FlatBuffers allows forward references within the same file
 
+// --- Callback connection ---
+// A callback made by the thread that is running the session's request travels in band: Java
+// writes a Response with is_callback set into the response zone and reads a CallbackResponse
+// command from the command zone. Every other thread uses the session's callback connection, a
+// second socket that carries no shared memory:
+//
+//   frame = [4 bytes: length, little endian][that many bytes: a FlatBuffer]
+//
+//   Java -> Python: a Response with is_callback set and a call_id of Java's choosing
+//   Python -> Java: a Command with action = CallbackResponse and the same call_id
+//
+// Calls from several threads are in flight at once and are answered in any order; call_id is
+// what pairs an answer with its call. A frame is at most 64KB, the size of the zones the
+// in-band path uses.
+
 // Request from Python -> Java
 table Command {
   action: Action;
@@ -242,6 +259,8 @@ table Command {
   create_objects: CreateObjectsRequest;
   // For Action.ArrowToObject: where in the payload zone the Arrow IPC stream is
   arrow_stream: BufferDescriptor;
+  // On the callback connection: which call this frame belongs to
+  call_id: long;
 }
 
 // Batch of commands to execute sequentially
@@ -287,6 +306,9 @@ table Response {
 
   // For Action.ArrowFromObject: where in the payload zone the Arrow IPC stream was written
   arrow_stream: BufferDescriptor;
+
+  // On the callback connection: which call this frame belongs to
+  call_id: long;
 }
 
 // Batch of responses (one per command in BatchCommand)

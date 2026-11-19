@@ -1,8 +1,17 @@
 """Tests for Python callback support (Java calling back into Python)."""
 
+import asyncio
+import gc
+import glob
+import threading
+import time
+import weakref
+
 import pytest
 
-from gatun import JavaException
+import gatun.client
+from gatun import JavaException, aconnect, connect
+from gatun.client import GatunClient
 
 
 class TestCallbackBasics:
@@ -604,6 +613,10 @@ class TestCallbacksDuringMultiCommandRequests:
 
 
 OTHER_THREAD_JAVA = """
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 public class OtherThread {
@@ -628,6 +641,41 @@ public class OtherThread {
     return out[0];
   }
 
+  /** Apply the function to the argument on a new thread and wait for it. */
+  public static Object apply(Function<Object, Object> function, Object argument)
+      throws Exception {
+    return call(() -> function.apply(argument));
+  }
+
+  /** Apply the function to 0..count-1, each on its own thread, all released together. */
+  public static List<Object> applyAll(Function<Object, Object> function, int count)
+      throws Exception {
+    Object[] out = new Object[count];
+    Throwable[] failure = new Throwable[1];
+    CountDownLatch go = new CountDownLatch(1);
+    Thread[] threads = new Thread[count];
+    for (int i = 0; i < count; i++) {
+      int index = i;
+      threads[i] = new Thread(() -> {
+        try {
+          go.await();
+          out[index] = function.apply(index);
+        } catch (Throwable t) {
+          failure[0] = t;
+        }
+      });
+      threads[i].start();
+    }
+    go.countDown();
+    for (Thread thread : threads) {
+      thread.join();
+    }
+    if (failure[0] != null) {
+      throw new RuntimeException(failure[0]);
+    }
+    return new ArrayList<>(List.of(out));
+  }
+
   /** Run the task on a new thread after a delay, without waiting for it. */
   public static void later(Runnable task, long delayMs) {
     lastError = null;
@@ -644,6 +692,16 @@ public class OtherThread {
     thread.start();
   }
 
+  /** Apply the function to the argument `count` times on a new thread, without waiting. */
+  public static void repeat(Function<Object, Object> function, Object argument, int count) {
+    later(() -> {
+      for (int i = 0; i < count; i++) {
+        function.apply(argument);
+      }
+    }, 0);
+  }
+
+  /** Null while the task of later() or repeat() has not finished; empty if it succeeded. */
   public static String lastError() {
     return lastError;
   }
@@ -651,50 +709,194 @@ public class OtherThread {
 """
 
 
+def _eventually(read, timeout=10.0):
+    """The first value `read` returns that is not None."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = read()
+        if value is not None:
+            return value
+        time.sleep(0.05)
+    raise AssertionError("nothing was reported in time")
+
+
+@pytest.fixture
+def other_thread_classes(compile_java):
+    return compile_java("OtherThread", OTHER_THREAD_JAVA)
+
+
 class TestCallbacksFromOtherThreads:
-    """Only the thread running the request has the channel and its memory."""
+    """A thread that is not running the client's request calls Python on the
+    client's callback connection."""
 
     @pytest.fixture
-    def other_thread(self, compile_java):
-        from gatun import connect
-
-        classes = compile_java("OtherThread", OTHER_THREAD_JAVA)
+    def other_thread(self, other_thread_classes):
         client = connect(
-            memory="16MB", classpath=[classes], allowed_classes=["OtherThread"]
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
         )
         yield client
         client.close()
 
-    def test_callback_on_another_thread_is_refused(self, other_thread):
-        """Even during the request: the refusal names the thread and the rule."""
+    def test_callback_on_another_thread_during_a_request(self, other_thread):
         client = other_thread
-        calls = []
-        supplier = client.register_callback(
-            lambda: calls.append(1), "java.util.function.Supplier"
+        supplier = client.register_callback(lambda: 42, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(supplier) == 42
+        assert client.jvm.java.lang.Math.max(1, 2) == 2
+
+    def test_callback_with_no_request_running(self, other_thread):
+        client = other_thread
+        fired = threading.Event()
+        task = client.register_callback(fired.set, "java.lang.Runnable")
+
+        client.jvm.OtherThread.later(task, 200)
+
+        # Nothing is asked of the client while the task fires
+        assert fired.wait(10)
+        assert _eventually(client.jvm.OtherThread.lastError) == ""
+
+    def test_callbacks_from_several_threads_run_at_the_same_time(self, other_thread):
+        client = other_thread
+        together = threading.Barrier(4, timeout=10)
+
+        def double(value):
+            together.wait()  # passes only once all four are in Python
+            return value * 2
+
+        function = client.register_callback(double, "java.util.function.Function")
+
+        assert client.jvm.OtherThread.applyAll(function, 4) == [0, 2, 4, 6]
+
+    def test_callback_fails(self, other_thread):
+        client = other_thread
+
+        def fail():
+            raise ValueError("no such luck")
+
+        supplier = client.register_callback(fail, "java.util.function.Supplier")
+
+        with pytest.raises(JavaException, match="no such luck"):
+            client.jvm.OtherThread.call(supplier)
+        assert client.jvm.java.lang.Math.max(1, 2) == 2
+
+    def test_callback_times_out(self, other_thread_classes):
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            callback_timeout=0.3,
+        )
+        release = threading.Event()
+        try:
+            supplier = client.register_callback(
+                lambda: release.wait(30), "java.util.function.Supplier"
+            )
+
+            with pytest.raises(JavaException, match="CallbackTimeoutError"):
+                client.jvm.OtherThread.call(supplier)
+            assert client.jvm.java.lang.Math.max(1, 2) == 2
+        finally:
+            release.set()
+            client.close()
+
+    def test_callback_may_call_java(self, other_thread):
+        """Only the thread that called it waits for it; the client is free."""
+        client = other_thread
+        seen = []
+        task = client.register_callback(
+            lambda: seen.append(client.jvm.java.lang.Math.max(3, 4)),
+            "java.lang.Runnable",
         )
 
-        with pytest.raises(JavaException, match="called from thread") as exc_info:
-            client.jvm.OtherThread.call(supplier)
+        client.jvm.OtherThread.later(task, 100)
 
-        assert "thread that is running its request" in str(exc_info.value)
-        assert calls == []
-        assert client.jvm.java.lang.Math.max(1, 2) == 2
+        assert _eventually(client.jvm.OtherThread.lastError) == ""
+        assert seen == [4]
 
-    def test_callback_with_no_request_running_is_refused(self, other_thread):
-        """Nobody is reading the channel then; the call must not be written into
-        whatever request comes next."""
-        import time
-
+    def test_java_object_passed_from_another_thread(self, other_thread):
+        """It is registered for the session by a thread that has none of its own."""
         client = other_thread
-        calls = []
-        task = client.register_callback(lambda: calls.append(1), "java.lang.Runnable")
+        received = []
+        function = client.register_callback(
+            lambda obj: received.append(obj), "java.util.function.Function"
+        )
+        text = client.jvm.java.lang.StringBuilder("abc")
 
-        client.jvm.OtherThread.later(task, 300)
-        time.sleep(1.0)  # the task fires while this client is idle
+        client.jvm.OtherThread.apply(function, text)
 
-        assert "called from thread" in client.jvm.OtherThread.lastError()
-        assert calls == []
-        assert client.jvm.java.lang.Math.max(1, 2) == 2
+        assert received[0].toString() == "abc"
+        received[0].append("d")
+        assert text.toString() == "abcd"
+
+    def test_objects_passed_from_other_threads_are_counted_and_released(
+        self, other_thread_classes
+    ):
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            extra_jvm_flags=["-Dgatun.limits.max_objects=4"],
+        )
+        try:
+            received = []
+            function = client.register_callback(
+                lambda obj: received.append(obj), "java.util.function.Function"
+            )
+            text = client.jvm.java.lang.StringBuilder("abc")  # two objects so far
+
+            # Each call hands Python one more reference, released before the next
+            for _ in range(10):
+                client.jvm.OtherThread.apply(function, text)
+                received.clear()
+
+            # Held, they take the session's remaining slots
+            client.jvm.OtherThread.apply(function, text)
+            client.jvm.OtherThread.apply(function, text)
+            with pytest.raises(JavaException, match="limit"):
+                client.jvm.java.util.ArrayList()
+
+            received.clear()
+            assert client.jvm.java.util.ArrayList().size() == 0
+        finally:
+            client.close()
+
+    def test_object_count_is_exact_when_threads_register_at_the_same_time(
+        self, other_thread_classes
+    ):
+        """The request's thread hands out objects in its results while another
+        thread hands them out as callback arguments."""
+        limit = 40
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            extra_jvm_flags=[f"-Dgatun.limits.max_objects={limit}"],
+        )
+        try:
+            function = client.register_callback(
+                lambda obj: None, "java.util.function.Function"
+            )
+            text = client.jvm.java.lang.StringBuilder("abc")
+            held = 2  # the callback's proxy and the StringBuilder
+
+            client.jvm.OtherThread.repeat(function, text, 300)
+            singleton = client.jvm.java.util.Collections.singletonList
+            while client.jvm.OtherThread.lastError() is None:
+                # A list holding the StringBuilder: packing it registers an object
+                assert len(singleton(text)) == 1
+            assert client.jvm.OtherThread.lastError() == ""
+
+            # Every reference handed out above has been dropped again
+            gc.collect()
+            created = []
+            with pytest.raises(JavaException, match="limit"):
+                for _ in range(limit):
+                    created.append(client.jvm.java.util.ArrayList())
+            assert len(created) == limit - held
+        finally:
+            client.close()
 
     def test_callback_on_the_request_thread_still_works(self, other_thread):
         client = other_thread
@@ -704,6 +906,203 @@ class TestCallbacksFromOtherThreads:
         items = client.jvm.java.util.ArrayList(list(range(50)))
 
         assert items.stream().map(doubled).toList() == [2 * i for i in range(50)]
+
+    def test_callback_on_the_request_thread_still_cannot_call_java(self, other_thread):
+        """The request is waiting for it on the channel the call would need."""
+        client = other_thread
+        function = client.register_callback(
+            lambda value: client.jvm.java.lang.Math.abs(value),
+            "java.util.function.Function",
+        )
+        items = client.jvm.java.util.ArrayList([1])
+
+        with pytest.raises(JavaException, match="ReentrancyError"):
+            items.stream().map(function).toList()
+
+    def test_connection_takes_no_session_slot(self, other_thread_classes):
+        client = connect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            extra_jvm_flags=["-Dgatun.limits.max_sessions=1"],
+        )
+        try:
+            supplier = client.register_callback(
+                lambda: "served", "java.util.function.Supplier"
+            )
+            assert client.jvm.OtherThread.call(supplier) == "served"
+        finally:
+            client.close()
+
+    def test_socket_it_was_made_to_is_gone(self, other_thread):
+        client = other_thread
+        client.register_callback(lambda: None, "java.lang.Runnable")
+        client.register_callback(lambda: None, "java.lang.Runnable")
+
+        assert client._callback_channel is not None
+        assert glob.glob(f"{glob.escape(client.socket_path)}.*.cb") == []
+
+    def test_no_connection_until_a_callback_is_registered(self, other_thread):
+        client = other_thread
+        assert client.jvm.java.lang.Math.max(1, 2) == 2
+        assert client._callback_channel is None
+
+    def test_unclosed_client_is_still_collected(self, other_thread):
+        """The thread reading the connection must not be what keeps it alive."""
+        owner = other_thread
+        dropped = GatunClient(owner.socket_path)
+        assert dropped.connect()
+        dropped.register_callback(lambda: None, "java.lang.Runnable")
+        gone = weakref.ref(dropped)
+
+        del dropped
+        gc.collect()
+
+        assert gone() is None
+
+    def test_client_closes_while_java_waits(self, other_thread):
+        """The waiting thread gets an exception; nothing else is disturbed."""
+        owner = other_thread
+        victim = GatunClient(owner.socket_path)
+        assert victim.connect()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def block():
+            entered.set()
+            release.wait(30)
+
+        try:
+            task = victim.register_callback(block, "java.lang.Runnable")
+            victim.jvm.OtherThread.later(task, 0)
+            assert entered.wait(10)
+        finally:
+            victim.close()
+
+        try:
+            error = _eventually(owner.jvm.OtherThread.lastError)
+            assert "connection closed while Python was being called" in error
+            assert owner.jvm.java.lang.Math.max(1, 2) == 2
+        finally:
+            release.set()
+
+    def test_callback_of_a_client_that_is_gone(self, other_thread):
+        """Java code can hold on to a proxy for longer than its client lives."""
+        owner = other_thread
+        gone = GatunClient(owner.socket_path)
+        assert gone.connect()
+        task = gone.register_callback(lambda: None, "java.lang.Runnable")
+        gone.jvm.OtherThread.later(task, 1000)
+        gone.close()
+
+        error = _eventually(owner.jvm.OtherThread.lastError)
+        assert "after its client disconnected" in error
+
+    def test_connection_that_cannot_be_opened(self, other_thread, monkeypatch, caplog):
+        """Callbacks then work as before it existed, and the reason is given."""
+        client = other_thread
+
+        def refuse(*args, **kwargs):
+            raise OSError("no connection for you")
+
+        monkeypatch.setattr(gatun.client, "CallbackChannel", refuse)
+        with caplog.at_level("WARNING", logger="gatun.client"):
+            supplier = client.register_callback(
+                lambda: 42, "java.util.function.Supplier"
+            )
+        assert "no connection for you" in caplog.text
+
+        with pytest.raises(JavaException, match="callback connection is not open"):
+            client.jvm.OtherThread.call(supplier)
+        items = client.jvm.java.util.ArrayList([1, 2])
+        doubled = client.register_callback(
+            lambda value: value * 2, "java.util.function.Function"
+        )
+        assert items.stream().map(doubled).toList() == [2, 4]
+
+
+class TestAsyncCallbacksFromOtherThreads:
+    @pytest.fixture
+    async def client(self, other_thread_classes):
+        client = await aconnect(
+            memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+        )
+        yield client
+        await client.close()
+
+    async def test_sync_callback_on_another_thread_during_a_request(self, client):
+        supplier = await client.register_callback(
+            lambda: 42, "java.util.function.Supplier"
+        )
+
+        assert await client.jvm.OtherThread.call(supplier) == 42
+
+    async def test_async_callback_with_no_request_running(self, client):
+        fired = asyncio.Event()
+
+        async def fire():
+            fired.set()
+
+        task = await client.register_callback(fire, "java.lang.Runnable")
+        await client.jvm.OtherThread.later(task, 200)
+
+        await asyncio.wait_for(fired.wait(), 10)
+
+    async def test_callbacks_from_several_threads_run_at_the_same_time(self, client):
+        together = asyncio.Barrier(4)
+
+        async def double(value):
+            await asyncio.wait_for(together.wait(), 10)
+            return value * 2
+
+        function = await client.register_callback(double, "java.util.function.Function")
+
+        assert await client.jvm.OtherThread.applyAll(function, 4) == [0, 2, 4, 6]
+
+    async def test_callback_may_call_java(self, client):
+        seen = []
+        done = asyncio.Event()
+
+        async def ask():
+            seen.append(await client.jvm.java.lang.Math.max(3, 4))
+            done.set()
+
+        task = await client.register_callback(ask, "java.lang.Runnable")
+        await client.jvm.OtherThread.later(task, 100)
+
+        await asyncio.wait_for(done.wait(), 10)
+        assert seen == [4]
+
+    async def test_callback_fails(self, client):
+        async def fail():
+            raise ValueError("no such luck")
+
+        supplier = await client.register_callback(fail, "java.util.function.Supplier")
+
+        with pytest.raises(JavaException, match="no such luck"):
+            await client.jvm.OtherThread.call(supplier)
+        assert await client.jvm.java.lang.Math.max(1, 2) == 2
+
+    async def test_callbacks_registered_at_once_open_one_connection(self, client):
+        first, second = await asyncio.gather(
+            client.register_callback(lambda: 1, "java.util.function.Supplier"),
+            client.register_callback(lambda: 2, "java.util.function.Supplier"),
+        )
+
+        assert await client.jvm.OtherThread.call(first) == 1
+        assert await client.jvm.OtherThread.call(second) == 2
+
+    async def test_close_ends_the_connection(self, client):
+        await client.register_callback(lambda: None, "java.lang.Runnable")
+        channel = client._callback_channel
+        assert channel is not None
+
+        await client.close()
+        await asyncio.sleep(0)
+
+        assert channel._task.done() or channel._task.cancelling()
 
 
 class TestLongExceptionChains:
