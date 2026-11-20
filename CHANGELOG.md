@@ -66,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The server no longer runs with Arrow's debug allocator (`-Darrow.memory.debug.allocator=true`), which records a stack trace for every buffer operation: a small `arrow_to_java()` took more than twice as long with it. A leaked buffer is still reported, without the place it was allocated; pass the flag in `extra_jvm_flags` or `jvm_flags` to get that back
 
 ### Fixed
+- Project links pointed at the repository's old location
+- README: the async client's handles are garbage collected like the sync client's; the static field example used a call that raises; `StaleArenaError` has no `view_epoch` attribute; the payload zone's halves belong to `send_arrow_buffers` / `get_arrow_data` only
+- `docs/bridge_adapter_spec.md` described `BridgeAdapter` as a protocol with optional parts and carried a copy of the contract tests that had drifted from `tests/test_bridge_contract.py`
+- The performance numbers in the README and `docs/benchmarks.md` dated from 0.1.0 and a different machine. They are measured again, on Linux, with the corrected scripts: a single call through Gatun takes about twice as long as one through Py4J, where the README said a third to a half as long; Gatun is ahead for collections as arguments, large return values and bulk data
+- Benchmark scripts: the Py4J comparison timed Gatun on a cold JVM with a default heap against a warm Py4J JVM with a fixed one, resolved the class path on every Gatun call only, and filled the heap in the byte-array sweep; the other scripts timed their set-up with the case and warmed up for ten calls. `benchmark_comparison.py --json` wrote nothing
 - `client.cancel()` during a batch ends the batch. It used to cancel only the command that was running: with `stop_on_error=False` the rest of the batch still ran. The batch now raises `CancelledException`
 - An Arrow transfer attempted inside a callback made by the request's own thread raises `ReentrancyError` at once. With a callback timeout set it used to wait for the channel the waiting request held, and failed only when the callback timed out
 - `pytest` no longer collects tests from an extracted Spark distribution (`testpaths`)
@@ -162,7 +167,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared memory communication with per-client SHM files
 - Basic object creation and method invocation
 
-[Unreleased]: https://github.com/forge-labs-dev/gatun/compare/v0.2.1...HEAD
-[0.2.1]: https://github.com/forge-labs-dev/gatun/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/forge-labs-dev/gatun/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/forge-labs-dev/gatun/releases/tag/v0.1.0
+[Unreleased]: https://github.com/bearing-research/gatun/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/bearing-research/gatun/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/bearing-research/gatun/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/bearing-research/gatun/releases/tag/v0.1.0

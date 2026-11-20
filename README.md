@@ -17,73 +17,77 @@ High-performance Python-to-Java bridge using shared memory and Unix domain socke
 - **Python Callbacks**: Register Python functions as Java interfaces
 - **Request Cancellation**: Cancel long-running operations
 - **JVM View API**: Pythonic package-style navigation (`client.jvm.java.util.ArrayList`)
-- **PySpark Integration**: Use as backend for PySpark via BridgeAdapter
+- **Spark from Python**: Load Spark's JARs and drive its JVM classes directly; a `BridgeAdapter` interface for porting PySpark
 - **Pythonic JavaObjects**: Iteration, indexing, and len() support on Java collections
-- **Batch API**: Execute multiple commands in a single round-trip (6x speedup for bulk ops)
-- **Vectorized APIs**: invoke_methods, create_objects, get_fields for 2-5x additional speedup
+- **Batch API**: Execute multiple commands in a single round-trip
+- **Vectorized APIs**: `invoke_methods`, `create_objects`, `get_fields` for several operations on one target in one round-trip
 - **Observability**: Server metrics, structured logging, and JFR events for debugging and monitoring
 
 ## Performance
 
-Gatun uses shared memory IPC which provides different trade-offs vs Py4J (PySpark's default TCP-based bridge):
+Measured on Linux (8 vCPUs of a shared AMD EPYC 7713, OpenJDK 22.0.2, Python 3.13.12); every figure is a median. [docs/benchmarks.md](docs/benchmarks.md) has all the cases, the method, and the commands to run them. Times depend on the machine, and so may the comparison with Py4J.
 
-### Latency (Single Operations)
+### Single Calls
 
-Gatun has **2-3x lower latency** for individual operations:
+A call is a round trip, and on this machine a round trip through Py4J (PySpark's bridge) takes about half the time of one through Gatun. Gatun is ahead where a call carries a collection or returns something large:
 
-| Operation | Gatun | Py4J | Speedup |
-|-----------|------:|-----:|--------:|
-| Method call (no args) | 120 μs | 350 μs | **2.9x** |
-| Method call (with args) | 140 μs | 380 μs | **2.7x** |
-| Object creation | 150 μs | 400 μs | **2.7x** |
-| Static method | 130 μs | 360 μs | **2.8x** |
+| Operation | Gatun | Py4J | |
+|-----------|------:|-----:|---|
+| Instance method call (`list.size()`) | 149 μs | 77 μs | Py4J 1.9x faster |
+| Static method call (`Math.max(10, 20)`) | 291 μs | 204 μs | Py4J 1.4x faster |
+| Create an object and drop it (`ArrayList()`) | 359 μs | 88 μs | Py4J 4.1x faster |
+| Calls in a loop | 5,500 /s | 9,500 /s | Py4J 1.7x faster |
+| Python list of 100 as an argument | 2.1 ms | 10.8 ms | Gatun 5.2x faster |
+| `is_instance_of` | 145 μs | 519 μs | Gatun 3.6x faster |
+| Return a 16 KB `byte[]` | 193 μs | 42 ms | Gatun 218x faster |
 
-### Throughput (Bulk Operations)
+Both bridges were given the same JVM settings and a warm JVM, with classes bound once (`Math = jvm.java.lang.Math`). Creating an object and dropping it costs Gatun a second round trip, to release it.
 
-For tight loops with **pre-bound methods** (where class/method resolution is cached), Py4J achieves higher ops/sec:
+### Fewer Round Trips
 
-| Operation | Gatun | Py4J | Notes |
-|-----------|------:|-----:|-------|
-| Bulk static calls (10K) | ~45K ops/s | ~60K ops/s | Pre-bound: `fn = Math.abs; fn(i)` |
-| Bulk instance calls (10K) | ~40K ops/s | ~55K ops/s | Pre-bound: `fn = arr.add; fn(i)` |
-| Mixed workload | ~35K ops/s | ~30K ops/s | Gatun faster for varied operations |
+Since the round trip is the cost, sending operations together is what helps most:
 
-**Why the difference?** Latency benchmarks measure full `client.jvm.java.lang.Math.max(10, 20)` calls including package navigation and method resolution (~120μs). Throughput benchmarks pre-bind methods first, measuring only the IPC cost (~22μs for Gatun). Py4J's TCP protocol has lower per-call IPC overhead than Gatun's shared memory protocol for small payloads.
-
-**Recommendation**: Use vectorized APIs or Arrow for bulk data instead of tight loops.
+| Work | One at a Time | `batch()` | Vectorized Call |
+|------|--------------:|----------:|----------------:|
+| 10 method calls on one object | 2.05 ms | 809 μs | 677 μs |
+| 100 method calls on one object | 19.2 ms | 5.14 ms | 4.28 ms |
+| 100 objects created | 16.4 ms | 4.39 ms | 3.85 ms |
 
 ### Arrow Data Transfer
 
-For bulk data, Arrow zero-copy transfer provides massive speedups over per-element transfer:
+Time for the call to return with the table on the other side:
 
-| Data Size | IPC Format | Zero-Copy Buffers | Throughput |
-|-----------|----------:|------------------:|-----------:|
-| 1K rows | 800 μs | 520 μs | 54 MB/s |
-| 10K rows | 890 μs | 570 μs | 509 MB/s |
-| 100K rows | 1.4 ms | 1.0 ms | **1.5 GB/s** |
-| 500K rows | 5.9 ms | 3.6 ms | **2.1 GB/s** |
+| Method | 16 KB | 1.6 MB | 16 MB | |
+|--------|------:|-------:|------:|---|
+| `arrow_to_java` | 466 μs | 572 μs | 2.61 ms | Java gets its own copy |
+| `arrow_to_java(copy=False)` | 498 μs | 512 μs | 1.29 ms | Java reads in place |
+| `send_arrow_buffers` | 466 μs | 499 μs | 1.34 ms | Loaded in place, not visible to Java code |
+| `arrow_from_java` | 212 μs | 323 μs | 2.18 ms | Python gets its own copy |
+| `arrow_from_java(copy=False)` | 204 μs | 260 μs | 1.06 ms | Python reads in place |
 
-### Vectorized APIs
+At 128 MiB, `arrow_to_java` takes 24 ms and `arrow_to_java(copy=False)` 12 ms, where an Arrow IPC stream over a Unix socket takes 106 ms.
 
-Reduce round-trips with batch operations:
+Next to the other ways of getting 500 integers into Java:
 
-| Operation | Individual Calls | Vectorized | Speedup |
-|-----------|----------------:|-----------:|--------:|
-| 3 method calls | 720 μs | 490 μs | **1.5x** |
-| 10 method calls | 1,600 μs | 490 μs | **3.3x** |
-| 10 object creations | 2,400 μs | 1,100 μs | **2.2x** |
+| How | Time |
+|-----|-----:|
+| 500 `add()` calls | 92 ms |
+| 500 `add()` calls in a `batch()` | 24 ms |
+| A Python list as a constructor argument | 6.7 ms |
+| A `pyarrow.Array` argument (arrives as `int[]`) | 0.25 ms |
+
+### Callbacks
+
+A callback made during a request (a Python comparator in `Collections.sort`) costs about 390 μs. With `connect(callback_timeout=None)` it costs 230 μs: a timeout, 30 seconds by default, has each callback run on a thread of its own. Sorting 1,000 elements took about 8,700 of them and 3.4 seconds, so a comparator in Python is for short lists.
 
 ### When to Use Gatun vs Py4J
 
 | Use Case | Recommendation |
 |----------|----------------|
-| Interactive/exploratory work | Gatun (lower latency) |
-| Bulk data transfer | Gatun (Arrow support) |
-| Simple tight loops | Py4J may be faster |
-| Mixed operations | Gatun |
-| PySpark integration | Either (Gatun via BridgeAdapter) |
-
-*Benchmarks run on Apple M1, Java 22, Python 3.13. See [docs/benchmarks.md](docs/benchmarks.md) for full methodology.*
+| Many small calls, one at a time | Py4J: about twice the calls per second |
+| Bulk data | Gatun: Arrow tables through shared memory |
+| Collections as arguments, large return values | Gatun |
+| Many operations that can be sent together | Gatun: `batch()` and the vectorized calls |
 
 ## Installation
 
@@ -418,7 +422,7 @@ client = connect()
 
 arr = client.create_object("java.util.ArrayList")
 
-# Batch 100 operations in one round-trip (6x faster than individual calls)
+# Batch 100 operations in one round-trip
 with client.batch() as b:
     for i in range(100):
         b.call(arr, "add", i)
@@ -444,7 +448,7 @@ with client.batch(stop_on_error=True) as b:
 
 ### Vectorized APIs
 
-For even faster bulk operations on the same target (2-5x speedup over batch):
+For several calls on one object, several objects, or several fields of one object, there are calls that take the whole list:
 
 ```python
 from gatun import connect
@@ -595,7 +599,7 @@ view.to_pydict()                   # good until the next Arrow transfer
 produced.close()                   # Java-made tables are yours to close
 ```
 
-- A table made by `arrow_to_java()` owns its memory in the JVM and is released when its handle is garbage collected or the connection closes. Java code that keeps it for longer must copy it. Handles from the async client are not garbage collected: free them with `async with await client.arrow_to_java(table) as root:` or `await client.free_object(root.object_id)`.
+- A table made by `arrow_to_java()` owns its memory in the JVM and is released when its handle is garbage collected or the connection closes. Java code that keeps it for longer must copy it. To release it at a known point, use `client.free_object(root.object_id)`, or in the async client `async with await client.arrow_to_java(table) as root:`.
 - The memory of a freed table is kept by the server for the next one, because memory that is new from the operating system is slow to touch. It keeps buffers over 4 MiB, at most as many bytes as the `memory` setting, and gives one back after a minute in which nobody asked for it. `extra_jvm_flags=["-Dgatun.arrow.pool.max_bytes=0"]` turns that off, `-Dgatun.arrow.pool.idle_ms=...` changes the minute (0 keeps the memory until the server exits), and `client.get_metrics()` shows what is held. Both take whole numbers (bytes, milliseconds); the server does not start with anything else.
 - `arrow_from_java()` returns a `pyarrow.Table` that owns its data, so it stays valid after later transfers and after `close()`.
 - `arrow_from_java(obj, copy=False)` skips that copy (sync client only). It returns an `ArrowTableView` over the bytes Java wrote into shared memory, which is good until the client's next Arrow transfer of any kind and raises `StaleArenaError` after it. Use it to read a result once (aggregate it, call `to_pandas()`); keep the default for a table you hold on to. A `pyarrow.Table` taken out of the view with `view.table` is not checked.
@@ -682,9 +686,11 @@ Gatun's Arrow integration uses shared memory for high-performance data transfer 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-The payload zone is split in half to enable **bidirectional zero-copy transfer** without data races:
-- **Python → Java**: Writes to first half `[0, size/2)`
-- **Java → Python**: Writes to second half `[size/2, size)`
+The halves are how `send_arrow_buffers()` and `get_arrow_data()` share the zone, so that data can come back while the batch that was sent is still loaded:
+- **Python → Java**: `send_arrow_buffers()` writes from the start of the zone
+- **Java → Python**: `get_arrow_data()` writes to the second half `[size/2, size)`
+
+A batch may be larger than half the zone. Data cannot be returned while such a batch is loaded, and sending one ends the views that `get_arrow_data()` returned earlier. `arrow_to_java()` and `arrow_from_java()` do not use the halves: each writes its stream into the free part of the zone, which is why one table may take all of it.
 
 ### Memory Safety: The Epoch System
 
@@ -702,7 +708,7 @@ table = pa.table({"id": [1, 2, 3]})
 client.send_arrow_buffers(table, arena, {})
 
 # Get data back - view is bound to current epoch
-view = client.get_arrow_data()  # view._epoch = 0
+view = client.get_arrow_data()  # the view belongs to epoch 0
 
 # Reset arena - epoch increments to 1
 arena.reset()
@@ -712,7 +718,7 @@ client.reset_payload_arena()
 try:
     data = view.to_pydict()  # Raises StaleArenaError!
 except StaleArenaError as e:
-    print(f"View epoch {e.view_epoch} != current epoch {e.current_epoch}")
+    print(e)  # Arrow table from epoch 0 is stale (current epoch: 1). ...
 
 arena.close()
 ```
@@ -798,8 +804,11 @@ with client.arrow_context() as ctx:
     for batch in large_table.to_batches(max_chunksize=100_000):
         ctx.send(batch)  # Auto-resets arena between sends
         # Process batch in Java...
+```
 
-# Async version works the same way
+The async client has the same context manager:
+
+```python
 async with client.arrow_context() as ctx:
     await ctx.send(table)
 ```
@@ -851,7 +860,7 @@ client.invoke_method(obj.object_id, "add", "item")
 result = client.invoke_static_method("java.lang.Math", "max", 10, 20)
 
 # Access static fields
-max_int = client.get_field(client.jvm.java.lang.Integer, "MAX_VALUE")
+max_int = client.get_static_field("java.lang.Integer", "MAX_VALUE")
 
 # Vectorized operations (single round-trip for multiple operations)
 client.invoke_methods(obj, [("add", ("a",)), ("add", ("b",)), ("size", ())])
@@ -1018,7 +1027,9 @@ Do not expose a Gatun socket to code or users you do not trust with the JVM.
 | `dict` | `Map` (HashMap) |
 | `bytes` | `byte[]` |
 | `JavaArray` | Primitive arrays (`int[]`, `double[]`, etc.) |
-| `pyarrow.Array` | Typed arrays |
+| `pyarrow.Array` | Typed arrays (`int32` → `int[]`, `int64` → `long[]`, `float64` → `double[]`, `bool` → `boolean[]`, `string` → `String[]`) |
+| `array.array` | `int[]` (`'i'`), `long[]` (`'q'`), `double[]` (`'d'`) |
+| `datetime.datetime`, `date`, `time` | `java.sql.Timestamp`, `Date`, `Time` (as arguments; a naive datetime is local time) |
 | `None` | `null` |
 | `JavaObject` | Object reference (including Object arrays) |
 
@@ -1046,6 +1057,8 @@ try:
 except JavaNumberFormatException as e:
     print(f"Parse error: {e}")
 ```
+
+`JavaNoSuchFieldException` and `JavaRuntimeException` are mapped the same way, a Java `InterruptedException` arrives as `CancelledException` (see [Cancelling a Request](#cancelling-a-request)), and any other Java exception as the base `JavaException`.
 
 ## Architecture
 
@@ -1100,9 +1113,11 @@ Offset 0          64KB                            size-64KB        size
    │ Command Zone  │         Payload Zone             │Response Zone │
    │ (Python→Java) │  [First half]  │  [Second half]  │ (Java→Python)│
    └───────────────┴───────────────┴──────────────────┴──────────────┘
-                    Python→Java     Java→Python
-                    Arrow data      Arrow data
+                    send_arrow_      get_arrow_data
+                    buffers
 ```
+
+The halves belong to `send_arrow_buffers()` and `get_arrow_data()`. The other Arrow transfers write wherever the zone is free.
 
 See [Arrow Memory Architecture](#arrow-memory-architecture) for details on the epoch-based memory safety model.
 
@@ -1124,15 +1139,22 @@ gatun/
 ├── src/gatun/             # Python client library
 │   ├── client.py          # Sync client
 │   ├── async_client.py    # Async client
+│   ├── callback_channel.py# The connection Java calls Python on
 │   ├── launcher.py        # Server process management
-│   └── bridge.py          # BridgeAdapter interface
+│   ├── bridge.py          # BridgeAdapter interface
+│   └── bridge_adapters.py # GatunAdapter
 ├── tests/                 # pytest suite (exercises the Java server too)
+├── benchmarks/            # Benchmark scripts (see docs/benchmarks.md)
+├── docs/                  # Benchmark results, BridgeAdapter specification
 ├── gatun-core/
 │   └── src/main/java/org/gatun/server/
 │       ├── GatunServer.java       # Main server
 │       ├── ReflectionCache.java   # Caching layer
 │       ├── MethodResolver.java    # Method resolution
-│       └── ArrowMemoryHandler.java# Arrow integration
+│       ├── ArrowMemoryHandler.java# Arrow transfer
+│       ├── ArrowLoans.java        # Tables lent in place
+│       ├── ArrowBlockPool.java    # Reuse of large Arrow buffers
+│       └── CallbackChannel.java   # The connection Java calls Python on
 └── schemas/
     └── commands.fbs       # FlatBuffers protocol schema
 ```

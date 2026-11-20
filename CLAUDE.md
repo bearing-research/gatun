@@ -369,7 +369,7 @@ client.is_instance_of(arr, "java.util.Map")        # False
 ```
 
 ### Batch API
-Execute multiple commands in a single round-trip (6x speedup for bulk operations):
+Execute multiple commands in a single round-trip (100 calls take about a quarter of the time; numbers in `docs/benchmarks.md`):
 ```python
 arr = client.create_object("java.util.ArrayList")
 
@@ -400,7 +400,7 @@ print(r2.is_error)   # True
 ```
 
 ### Vectorized APIs
-For even faster bulk operations on the same target, use vectorized APIs (2-5x speedup):
+For several operations on the same target, the vectorized APIs take the whole list in one command (a tenth to a fifth faster than a batch of the same size):
 
 ```python
 # invoke_methods - Multiple method calls on same object in one round-trip
