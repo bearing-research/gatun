@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-20
+
 ### Added
 - `classpath` argument to `connect()`, `aconnect()` and `launch_gateway()` for loading external JARs (e.g. Spark)
 - Spark integration tests (run when a Spark distribution is present in the repo root)
@@ -174,7 +176,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared memory communication with per-client SHM files
 - Basic object creation and method invocation
 
-[Unreleased]: https://github.com/bearing-research/gatun/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/bearing-research/gatun/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bearing-research/gatun/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/bearing-research/gatun/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bearing-research/gatun/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bearing-research/gatun/releases/tag/v0.1.0
