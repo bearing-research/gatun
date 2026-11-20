@@ -595,7 +595,11 @@ public class GatunServer {
     }
     sessionFiles.add(path);
     ctx.callbackListener = listener;
-    Thread.ofVirtual()
+    // Platform threads for the connection's reader (this one) and its writer, as for the
+    // session: each is blocked on a socket or a queue between frames and every callback
+    // waits for both to wake
+    Thread.ofPlatform()
+        .daemon(true)
         .name("gatun-callbacks-" + sessionId)
         .start(() -> serveCallbackConnection(ctx, listener, path));
     return path;
