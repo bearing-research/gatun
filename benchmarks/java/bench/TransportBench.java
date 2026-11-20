@@ -1,8 +1,11 @@
 package bench;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
@@ -94,6 +97,30 @@ public final class TransportBench {
       }
       acc[2] += bytes;
     }
+  }
+
+  private static final VarHandle LONGS =
+      MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+
+  /**
+   * Read every byte of record batches that arrived as byte arrays (arrow_to_java_batches), without
+   * decoding them. Returns {batches, 0, bytes read}.
+   */
+  public static long[] scanBatches(List<byte[]> batches) {
+    long sum = 0;
+    long bytes = 0;
+    for (byte[] batch : batches) {
+      int i = 0;
+      for (; i + 8 <= batch.length; i += 8) {
+        sum += (long) LONGS.get(batch, i);
+      }
+      for (; i < batch.length; i++) {
+        sum += batch[i];
+      }
+      bytes += batch.length;
+    }
+    // The sum is returned so that the loop cannot be optimized away
+    return new long[] {batches.size(), sum, bytes};
   }
 
   // ---- Python -> Java baselines -------------------------------------------------------------

@@ -32,12 +32,23 @@ enum Action : byte {
   InvokeMethods = 22,      // Invoke multiple methods on same target: target_id + method_calls
   CreateObjects = 23,      // Create multiple objects: class_names + args per object
   GetMetrics = 24,         // Get server metrics (request counts, latencies, object counts, etc.)
-  ArrowToObject = 25,      // Turn the IPC stream at arrow_stream into a VectorSchemaRoot object
+  ArrowToObject = 25,      // Turn the IPC stream at arrow_stream into a Java object; see ArrowForm
   ArrowFromObject = 26,    // Write the VectorSchemaRoot target_id as an IPC stream; see Response.arrow_stream
   OpenCallbackChannel = 27, // Open the session's callback connection; returns the path of a socket
                            // that accepts exactly one connection (see "Callback connection" below)
   NestedCommand = 28,      // On the callback connection: a command sent from inside a callback; see Command.nested_command
   OpenCallMemory = 29      // Inside a NestedCommand: create the call's own shared memory; returns the file's path
+}
+
+// For Action.ArrowToObject: what the stream becomes in the JVM
+enum ArrowForm : byte {
+  Table = 0,      // A VectorSchemaRoot that owns a copy of the data
+  LentTable = 1,  // A VectorSchemaRoot that reads the data where the client wrote it. The client
+                  // leaves those bytes alone until it frees the object (or resets the payload
+                  // arena), and the table cannot be read from then on. On the session's own
+                  // channel only.
+  Batches = 2     // A java.util.ArrayList<byte[]>: each record batch of the stream as the bytes
+                  // of its IPC message
 }
 
 // Element types for arrays
@@ -296,6 +307,8 @@ table Command {
   // of its methods. A default method of the interface with one of these names is the
   // handler's to answer; the others run in Java.
   callback_methods: [string];
+  // For Action.ArrowToObject
+  arrow_form: ArrowForm;
 }
 
 // Batch of commands to execute sequentially

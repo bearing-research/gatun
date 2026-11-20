@@ -85,8 +85,8 @@ from gatun.client import (
     _write_arrow_table,
 )
 from gatun.generated.org.gatun.protocol import Action as Act
-from gatun.generated.org.gatun.protocol import Command as Cmd
 from gatun.generated.org.gatun.protocol import (
+    ArrowForm,
     CreateObjectsRequest,
     GetFieldsRequest,
     InvokeMethodsRequest,
@@ -94,6 +94,7 @@ from gatun.generated.org.gatun.protocol import (
     ObjectSpec,
     Response,
 )
+from gatun.generated.org.gatun.protocol import Command as Cmd
 
 logger = logging.getLogger(__name__)
 
@@ -1505,9 +1506,43 @@ class AsyncGatunClient(_ValueEncoder):
             PayloadTooLargeError: If the table does not fit in shared memory.
             UnsupportedArrowTypeError: If a column is dictionary-encoded.
         """
-        table = _arrow_table_to_send(table)
-        size = _arrow_stream_size(table)
-        command = _finish_arrow_to_object(flatbuffers.Builder(256), 0, size)
+        return await self._send_arrow_stream(
+            _arrow_table_to_send(table), ArrowForm.ArrowForm.Table
+        )
+
+    async def arrow_to_java_batches(
+        self,
+        table: pa.Table | pa.RecordBatch,
+        *,
+        max_rows_per_batch: int | None = None,
+    ) -> AsyncJavaObject:
+        """Hand an Arrow table to the JVM as serialized record batches.
+
+        The handle refers to a java.util.ArrayList of byte arrays, one per
+        record batch, each holding the batch's Arrow IPC message: the form
+        Spark takes Arrow data in. Java copies the bytes and decodes nothing.
+
+        Each chunk of the table becomes a batch. A Java array holds less than
+        2 GiB, so a table with larger chunks needs max_rows_per_batch.
+
+        Raises:
+            PayloadTooLargeError: If the table does not fit in shared memory.
+            UnsupportedArrowTypeError: If a column is dictionary-encoded.
+        """
+        if max_rows_per_batch is not None and max_rows_per_batch < 1:
+            raise ValueError("max_rows_per_batch must be at least 1")
+        return await self._send_arrow_stream(
+            _arrow_table_to_send(table, one_batch=False),
+            ArrowForm.ArrowForm.Batches,
+            max_rows_per_batch,
+        )
+
+    async def _send_arrow_stream(
+        self, table: pa.Table, form: int, max_chunksize: int | None = None
+    ) -> AsyncJavaObject:
+        """Write a table into shared memory and have Java make an object of it."""
+        size = _arrow_stream_size(table, max_chunksize)
+        command = _finish_arrow_to_object(flatbuffers.Builder(256), 0, size, form)
         # Inside a callback that Java made from another thread the table goes
         # through the call's own memory: the payload zone belongs to the
         # channel, which may be busy with the request waiting for the callback
@@ -1518,7 +1553,9 @@ class AsyncGatunClient(_ValueEncoder):
                 memory = await self._call_memory(call)
                 if memory is not None:
                     _require_payload_room(memory, size, 0)
-                    _write_arrow_table(memory, table, 0, size)
+                    _write_arrow_table(
+                        memory, table, 0, size, max_chunksize=max_chunksize
+                    )
                     routed, result = await self._send_nested(call, command)
                     if routed:
                         return cast(AsyncJavaObject, result)
@@ -1526,7 +1563,10 @@ class AsyncGatunClient(_ValueEncoder):
         return cast(
             AsyncJavaObject,
             await self._send_raw(
-                command, prepare=lambda: _write_arrow_table(self, table, 0, size)
+                command,
+                prepare=lambda: _write_arrow_table(
+                    self, table, 0, size, max_chunksize=max_chunksize
+                ),
             ),
         )
 

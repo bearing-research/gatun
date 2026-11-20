@@ -108,6 +108,10 @@ public class GatunServer {
     }
   }
 
+  // Tables a client has lent (ArrowForm.LentTable), by the ID each was registered under. Freeing
+  // that ID is how the client takes the table back, whatever else refers to it by then.
+  private final Map<Long, ArrowLoans.Loan> lentTables = new ConcurrentHashMap<>();
+
   // --- THE OBJECT REGISTRY ---
   private final Map<Long, Object> objectRegistry = new ConcurrentHashMap<>();
   private final AtomicLong objectIdCounter = new AtomicLong(1);
@@ -773,6 +777,10 @@ public class GatunServer {
     Path sessionShmPath = Path.of(socketPath.toString() + "." + sessionId + ".shm");
     sessionFiles.add(sessionShmPath);
 
+    // Tables the client lends are read through a mapping of their own, which is made by the
+    // first loan and can outlive the session (see ArrowLoans)
+    ArrowLoans loans = new ArrowLoans(this.memorySize, PAYLOAD_OFFSET, allocator, quota);
+
     // The Arrow handler is declared last so that it is closed first: the batch it holds points
     // into the mapping that the arena unmaps. The connection is not among these: it is closed
     // in the finally block, after the catch blocks have logged why the session ended.
@@ -782,6 +790,7 @@ public class GatunServer {
 
       MemorySegment sharedMem =
           channel.map(FileChannel.MapMode.READ_WRITE, 0, this.memorySize, arena);
+      loans.file(channel);
 
       LOG.fine("Session " + sessionId + " SHM mapped at: " + sessionShmPath);
 
@@ -1125,6 +1134,13 @@ public class GatunServer {
             long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
             MemorySegment payloadSlice = sharedMem.asSlice(PAYLOAD_OFFSET, payloadSize);
             ArrowMemoryHandler.Received received = arrowHandler.processArrowIpcBatch(payloadSlice);
+            // The stream's length is known only once it is read. The client checks before it
+            // writes; this is for one that did not.
+            if (loans.overlaps(0, received.totalBytes())) {
+              throw new IllegalStateException(
+                  "Arrow stream at offset 0 overlaps a table that is lent to Java. End the loan"
+                      + " first.");
+            }
             observer.onArrowTransfer(
                 "python_to_java", received.numRows(), received.totalBytes(), false);
             result = "Received " + received.numRows() + " rows";
@@ -1141,6 +1157,7 @@ public class GatunServer {
             // TODO: Support separate payload shm file
             long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
             MemorySegment payloadSlice = sharedMem.asSlice(PAYLOAD_OFFSET, payloadSize);
+            requireClearOfLoans(batchDesc, loans);
 
             // Loading wraps the buffers in place, so it is cheap to do before the quota check;
             // charging only once the batch is accepted keeps rejected sends from using up quota.
@@ -1160,6 +1177,8 @@ public class GatunServer {
           else if (cmd.action() == Action.ResetPayloadArena) {
             LOG.fine("Payload arena reset requested");
             arrowHandler.reset();
+            // The client is about to reuse the whole zone
+            loans.endAll();
             // Reset Arrow buffer quota when arena is reset
             quota.resetArrowBytes();
             result = true;
@@ -1173,6 +1192,12 @@ public class GatunServer {
             // Write Arrow buffers to payload zone
             long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
             MemorySegment payloadSlice = sharedMem.asSlice(PAYLOAD_OFFSET, payloadSize);
+            if (loans.overlaps(payloadSize / 2, payloadSize)) {
+              throw new IllegalStateException(
+                  "Arrow data cannot be returned while a table lent to Java extends past the first"
+                      + " half of the payload zone, where returned data is written. End the loan"
+                      + " first, or connect with more memory.");
+            }
             ArrowMemoryHandler.ArrowWriteResult writeResult =
                 arrowHandler.writeArrowBuffers(currentRoot, payloadSlice, null);
             responseOffset = packArrowResponse(builder, writeResult);
@@ -1186,16 +1211,22 @@ public class GatunServer {
             result =
                 arrowToObject(
                     cmd.arrowStream(),
+                    cmd.arrowForm(),
                     sharedMem.asSlice(PAYLOAD_OFFSET, payloadSize),
                     arrowHandler,
+                    loans,
                     sessionObjectIds,
                     quota);
           }
           // --- ARROW TABLE HELD BY A JAVA OBJECT (Java -> Python) ---
           else if (cmd.action() == Action.ArrowFromObject) {
-            // Everything past the batch loaded by send_arrow_buffers (if any) is free to use
+            // Everything past the batch loaded by send_arrow_buffers (if any) and the tables
+            // the client has lent is free to use
             long payloadSize = this.responseOffset - PAYLOAD_OFFSET;
-            long start = Math.min(arrowHandler.getLoadedEnd(), payloadSize);
+            long start =
+                Math.min(
+                    Math.max(arrowHandler.getLoadedEnd(), ArrowMemoryHandler.aligned(loans.end())),
+                    payloadSize);
             long length =
                 arrowFromObject(
                     cmd.targetId(),
@@ -1426,6 +1457,8 @@ public class GatunServer {
       // Cleanup orphans: remove session objects and callbacks from global registries
       for (Long id : sessionObjectIds) removeObject(id);
       for (Long id : sessionCallbackIds) callbackRegistry.remove(id);
+      // After the objects: that ended the loans the registry knew of
+      loans.close();
       sessions.remove(sessionShmPath.toString());
       sessionCount.decrementAndGet();
       sessionContext.remove();
@@ -1583,6 +1616,10 @@ public class GatunServer {
     if (removed != null) {
       observeRegistry(objectId, "remove", null, -1);
       releaseOwnedTable(removed);
+      ArrowLoans.Loan loan = lentTables.remove(objectId);
+      if (loan != null) {
+        loan.end();
+      }
     }
   }
 
@@ -3427,8 +3464,15 @@ public class GatunServer {
       case Action.OpenCallMemory:
         return memory.open();
       case Action.ArrowToObject:
+        // No loans: a call's memory is gone when the call ends
         return arrowToObject(
-            cmd.arrowStream(), memory.segment(), memory.arrow(), ctx.sessionObjectIds, ctx.quota);
+            cmd.arrowStream(),
+            cmd.arrowForm(),
+            memory.segment(),
+            memory.arrow(),
+            null,
+            ctx.sessionObjectIds,
+            ctx.quota);
       case Action.ArrowFromObject:
         // The call moves one table at a time, so each starts at the front
         return new ArrowStreamLocation(
@@ -3574,17 +3618,23 @@ public class GatunServer {
   }
 
   /**
-   * Read the Arrow IPC stream a client wrote into {@code zone} into a table that owns its memory,
-   * and register the table for the session.
+   * Turn the Arrow IPC stream a client wrote into {@code zone} into a Java object, registered for
+   * the session: a table that owns a copy of the data, a table that reads it in place, or the
+   * stream's record batches as byte arrays.
    *
+   * @param form an {@link ArrowForm}
    * @param zone the memory the stream's offset counts from: the session's payload zone, or a call's
    *     own memory
    * @param arrow reads the stream. A batch it holds in place in the zone must not be overlapped.
+   * @param loans the session's lent tables, which must not be overlapped either; null for a call's
+   *     memory, where nothing can be lent
    */
   private ObjectRefT arrowToObject(
       BufferDescriptor stream,
+      byte form,
       MemorySegment zone,
       ArrowMemoryHandler arrow,
+      ArrowLoans loans,
       Set<Long> sessionObjectIds,
       SessionQuota quota)
       throws IOException {
@@ -3608,34 +3658,88 @@ public class GatunServer {
                   + " which ends at offset %d. Reset the payload arena first.",
               offset, arrow.getLoadedEnd()));
     }
+    if (loans != null && loans.overlaps(offset, offset + length)) {
+      throw new IllegalStateException(
+          String.format(
+              "Arrow stream at offset %d overlaps a table that is lent to Java. End the loan"
+                  + " first.",
+              offset));
+    }
 
-    // Refuse before reading; both are taken only once the table exists
+    // Refuse before reading; the slot is taken only once the object exists
     quota.checkObjectLimit();
-    quota.holdArrowBytes(length);
-    VectorSchemaRoot table;
-    try {
-      table = arrow.readIpcTable(zone.asSlice(offset, length));
-    } catch (Throwable t) {
-      quota.releaseHeldArrowBytes(length);
-      throw t;
-    }
-    try {
-      quota.allocateObject();
-    } catch (RuntimeException e) {
-      // Another thread of the session took the last slot since the check above
-      quota.releaseHeldArrowBytes(length);
-      table.close();
-      throw e;
-    }
-    synchronized (ownedTables) {
-      ownedTables.put(table, new OwnedTable(length, quota));
-    }
+    Object made;
+    long rows;
     long newId = objectIdCounter.getAndIncrement();
-    putObject(newId, table);
+    switch (form) {
+      case ArrowForm.Table -> {
+        quota.holdArrowBytes(length);
+        VectorSchemaRoot table;
+        try {
+          table = arrow.readIpcTable(zone.asSlice(offset, length));
+        } catch (Throwable t) {
+          quota.releaseHeldArrowBytes(length);
+          throw t;
+        }
+        try {
+          quota.allocateObject();
+        } catch (RuntimeException e) {
+          // Another thread of the session took the last slot since the check above
+          quota.releaseHeldArrowBytes(length);
+          table.close();
+          throw e;
+        }
+        synchronized (ownedTables) {
+          ownedTables.put(table, new OwnedTable(length, quota));
+        }
+        made = table;
+        rows = table.getRowCount();
+      }
+      case ArrowForm.LentTable -> {
+        if (loans == null) {
+          throw new UnsupportedOperationException(
+              "A table can be lent only on the session's own channel");
+        }
+        // The data stays in the client's memory and is not charged to max_arrow_bytes; what
+        // the table allocates beside it is (ArrowLoans.lend)
+        ArrowLoans.Loan loan = loans.lend(offset, length);
+        try {
+          quota.allocateObject();
+        } catch (RuntimeException e) {
+          loan.end();
+          throw e;
+        }
+        lentTables.put(newId, loan);
+        made = loan.table();
+        rows = loan.table().getRowCount();
+      }
+      case ArrowForm.Batches -> {
+        ArrowMemoryHandler.Batches batches =
+            ArrowMemoryHandler.readIpcBatches(zone.asSlice(offset, length));
+        quota.allocateObject();
+        made = batches.batches();
+        rows = batches.rows();
+      }
+      default -> throw new IllegalArgumentException("Unknown arrow_form " + form);
+    }
+    putObject(newId, made);
     sessionObjectIds.add(newId);
     SessionObserver.recordArrowTransfer(
-        quota.getSessionId(), "python_to_java", table.getRowCount(), length, false);
+        quota.getSessionId(), "python_to_java", rows, length, form == ArrowForm.LentTable);
     return new ObjectRefT(newId);
+  }
+
+  /** Refuse a batch whose buffers lie on a table the client has lent and not taken back. */
+  private static void requireClearOfLoans(ArrowBatchDescriptor batch, ArrowLoans loans) {
+    for (int i = 0; i < batch.buffersLength(); i++) {
+      BufferDescriptor buffer = batch.buffers(i);
+      long offset = buffer.offset();
+      long length = buffer.length();
+      if (length > 0 && offset >= 0 && loans.overlaps(offset, offset + length)) {
+        throw new IllegalStateException(
+            "Arrow buffer " + i + " lies on a table that is lent to Java. End the loan first.");
+      }
+    }
   }
 
   /**

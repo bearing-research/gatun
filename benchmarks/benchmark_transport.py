@@ -1,6 +1,6 @@
 """Does gatun's shared memory beat a socket or a tmpfs file for moving Arrow data?
 
-Moves one table between Python and the JVM, in both directions, five ways:
+Moves one table between Python and the JVM, in both directions, seven ways:
 
   arena      gatun's buffer-descriptor path: send_arrow_buffers() / get_arrow_data().
              One copy into the shared region, read in place on the other side.
@@ -9,6 +9,10 @@ Moves one table between Python and the JVM, in both directions, five ways:
              stream written into the shared region and copied out on the other side.
   shm_view   arrow_from_java(copy=False): the same stream, read where Java wrote it.
              Java to Python only.
+  shm_lend   arrow_to_java(copy=False): the same stream, read where Python wrote it.
+             Python to Java only. The time includes ending the loan.
+  shm_bytes  arrow_to_java_batches(): the stream's record batch copied into a byte array
+             on the Java heap, undecoded. Python to Java only; its scan reads the bytes.
   socket     An Arrow IPC stream over a Unix domain socket, stock pyarrow and Arrow Java.
   file       An Arrow IPC stream file in --file-dir (tmpfs by default). Python reads it
              through a memory map (in place); Arrow Java's stock reader copies it.
@@ -47,6 +51,7 @@ import pyarrow.compute as pc
 from gatun import connect
 
 ROW_BYTES = 36  # int64 + float64 + 16 bytes of string data + a 4-byte offset
+BYTES_BATCH_ROWS = (1 << 30) // ROW_BYTES  # rows of the shm_bytes path's 1 GiB batches
 
 
 def make_table(rows: int) -> pa.Table:
@@ -133,6 +138,36 @@ class Bench:
             elapsed = time.perf_counter() - start
         # The handle's finalizer queues the free; it goes out with the next request
         del root
+        return elapsed
+
+    def p2j_shm_lend(self, do_scan: bool) -> float:
+        start = time.perf_counter()
+        with self.client.arrow_to_java(self.table, copy=False) as root:
+            if do_scan:
+                rows, id_sum, _ = self.tb.checksum(root)
+            else:
+                rows, id_sum = root.getRowCount(), None
+        elapsed = time.perf_counter() - start
+        self._check(rows, id_sum)
+        return elapsed
+
+    def p2j_shm_bytes(self, do_scan: bool) -> float:
+        start = time.perf_counter()
+        # A Java array holds less than 2 GiB
+        batches = self.client.arrow_to_java_batches(
+            self.table, max_rows_per_batch=BYTES_BATCH_ROWS
+        )
+        if do_scan:
+            count, _, scanned = self.tb.scanBatches(batches)
+            elapsed = time.perf_counter() - start
+            expected = -(-self.rows // BYTES_BATCH_ROWS)
+            if count != expected or scanned < self.table.nbytes:
+                raise AssertionError(
+                    f"transfer corrupted: {count} batches of {scanned} bytes"
+                )
+        else:
+            elapsed = time.perf_counter() - start
+        del batches
         return elapsed
 
     def p2j_socket(self, do_scan: bool) -> float:
@@ -273,7 +308,7 @@ def run_size(client, tb, mib: int, args) -> list[dict]:
             )
             results.append(stats)
             print(
-                f"{mib:>5} MiB  {direction:<10} {path:<8} {mode:<8}"
+                f"{mib:>5} MiB  {direction:<10} {path:<9} {mode:<8}"
                 f"{stats['median_s'] * 1e3:>10.2f} ms {stats['mb_per_s']:>9.0f} MB/s"
                 f"  ({stats['reps']} reps)",
                 flush=True,
@@ -288,6 +323,8 @@ def run_size(client, tb, mib: int, args) -> list[dict]:
         bench._reset_arena()
 
         record("py_to_java", "shm_ipc", bench.p2j_shm_ipc)
+        record("py_to_java", "shm_lend", bench.p2j_shm_lend)
+        record("py_to_java", "shm_bytes", bench.p2j_shm_bytes)
         record("py_to_java", "socket", bench.p2j_socket)
         record("py_to_java", "file", bench.p2j_file)
 

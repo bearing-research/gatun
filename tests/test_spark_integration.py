@@ -49,28 +49,21 @@ def _object_ref(client, obj, method, *args):
 def dataframe_from_arrow(client, spark, table):
     """Make a Spark DataFrame out of a pyarrow table.
 
-    The table goes to the JVM as an Arrow table (arrow_to_java) and is handed to
-    Spark the way Spark takes Arrow data: as serialized record batches.
+    Spark takes Arrow data as serialized record batches, and that is how the
+    table goes to the JVM (arrow_to_java_batches): the bytes Python wrote are
+    the bytes Spark reads.
     """
     jvm = client.jvm
-    root = client.arrow_to_java(table)
-
-    record_batch = jvm.org.apache.arrow.vector.VectorUnloader(root).getRecordBatch()
-    serialized = jvm.java.io.ByteArrayOutputStream()
-    channel = jvm.org.apache.arrow.vector.ipc.WriteChannel(
-        jvm.java.nio.channels.Channels.newChannel(serialized)
-    )
-    jvm.org.apache.arrow.vector.ipc.message.MessageSerializer.serialize(
-        channel, record_batch
-    )
-    record_batch.close()
-
-    batches = jvm.java.util.ArrayList()
-    batches.add(_object_ref(client, serialized, "toByteArray"))
-    schema = jvm.org.apache.spark.sql.util.ArrowUtils.fromArrowSchema(root.getSchema())
+    batches = client.arrow_to_java_batches(table)
+    # Only the schema travels as a table, and that one has no rows
+    with client.arrow_to_java(table.schema.empty_table(), copy=False) as empty:
+        schema = jvm.org.apache.spark.sql.util.ArrowUtils.fromArrowSchema(
+            empty.getSchema()
+        )
+        schema_json = schema.json()
     return jvm.org.apache.spark.sql.execution.arrow.ArrowConverters.toDataFrame(
         jvm.scala.jdk.javaapi.CollectionConverters.asScala(batches.iterator()),
-        schema.json(),
+        schema_json,
         spark,
     )
 

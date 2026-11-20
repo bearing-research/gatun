@@ -2446,6 +2446,43 @@ class TestArrowInsideChannelCallbacks:
         assert client.jvm.OtherThread.call(supplier) == 1000
         assert seen[0].equals(table)
 
+    def test_table_lent_inside_a_callback_is_copied(self, client):
+        """Lending needs the client's own channel, which the request waiting
+        for the callback holds. The block still means the same."""
+        table = pa.table({"x": list(range(1000))})
+        seen = []
+
+        def lend():
+            with client.arrow_to_java(table, copy=False) as root:
+                loan_root = root
+                seen.append(client.arrow_from_java(root))
+            seen.append(loan_root)
+            return True
+
+        supplier = client.register_callback(lend, "java.util.function.Supplier")
+        loan = client.arrow_to_java(pa.table({"y": [1]}), copy=False)
+
+        assert client.jvm.OtherThread.call(supplier) is True
+
+        assert seen[0].equals(table)
+        with pytest.raises(JavaException, match="not found"):
+            seen[1].getRowCount()
+        # The client's own loan was left alone
+        assert loan.in_place
+        assert loan.root.getVector("y").get(0) == 1
+        loan.close()
+
+    def test_batches_inside_a_callback(self, client):
+        table = pa.table({"x": list(range(1000))})
+
+        def send():
+            batches = client.arrow_to_java_batches(table, max_rows_per_batch=250)
+            return batches.size()
+
+        supplier = client.register_callback(send, "java.util.function.Supplier")
+
+        assert client.jvm.OtherThread.call(supplier) == 4
+
     def test_while_the_client_is_in_another_request(self, client):
         table = pa.table({"x": [1, 2, 3]})
         seen = []

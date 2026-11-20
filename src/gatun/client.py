@@ -36,6 +36,7 @@ from gatun.generated.org.gatun.protocol import (
     Argument,
     ArrayVal,
     ArrowBatchDescriptor,
+    ArrowForm,
     BatchCommand,
     BatchResponse,
     BoolVal,
@@ -700,6 +701,85 @@ class ArrowTableView:
         except StaleArenaError:
             epoch_status = "STALE"
         return f"<ArrowTableView rows={self.num_rows} cols={self.num_columns} epoch={self._epoch} ({epoch_status})>"
+
+
+class _Loan:
+    """The client's record of a table that is lent to Java: where it lies in
+    the payload zone, and whether the server has been told that it is over."""
+
+    __slots__ = ("end", "ended", "object_id", "start")
+
+    def __init__(self, object_id: int, start: int, end: int):
+        self.object_id = object_id
+        self.start = start
+        self.end = end
+        self.ended = False
+
+
+class ArrowLoan:
+    """A table lent to Java: what arrow_to_java(copy=False) returns.
+
+    Java reads the table where Python wrote it, in the client's shared memory,
+    so nothing is copied into the JVM. In exchange the loan has an end. Use it
+    in a ``with`` block, or call close():
+
+        with client.arrow_to_java(table, copy=False) as root:
+            client.jvm.com.example.Stats.summarize(root)
+
+    When the loan ends, Java can no longer read the table (Arrow raises
+    IllegalStateException in Java code that kept it) and the client reuses the
+    memory. Java code that needs the data for longer must copy it while the
+    loan lasts. A loan that is dropped without close() ends with the client's
+    next request after it was garbage collected.
+
+    While a loan is open its bytes stay where they are: other tables are
+    written after it, so every open loan takes room in the payload zone away
+    from later transfers.
+
+    Attributes:
+        root: JavaObject for the org.apache.arrow.vector.VectorSchemaRoot.
+    """
+
+    def __init__(self, client: GatunClient, root: JavaObject, record: _Loan | None):
+        self._client = client
+        self.root = root
+        # None when Java has a copy of its own, which close() frees
+        self._record = record
+        self._closed = False
+
+    @property
+    def in_place(self) -> bool:
+        """False if the table was copied into the JVM after all, which is what
+        happens inside a callback that Java made from another thread."""
+        return self._record is not None
+
+    @property
+    def closed(self) -> bool:
+        """True once the loan is over: closed, or ended by reset_payload_arena()."""
+        return self._closed or (self._record is not None and self._record.ended)
+
+    def close(self) -> None:
+        """End the loan. Safe to call more than once.
+
+        Inside a callback the client's channel is not free, and the loan ends
+        with the client's next request instead.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self.root.detach()
+        if self._record is None:
+            self._client.free_object(self.root.object_id)
+        else:
+            self._client._end_loan(self._record)
+
+    def __enter__(self) -> JavaObject:
+        if self.closed:
+            raise RuntimeError("This loan has ended")
+        return self.root
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb) -> None:
+        self.close()
 
 
 class JavaList(list):
@@ -1542,8 +1622,14 @@ def _unpack_array_impl(array_val, client: Any, ref_class: Any):
         return result
 
 
-def _arrow_table_to_send(table: pa.Table | pa.RecordBatch) -> pa.Table:
-    """Check a table for arrow_to_java() and return it in the form it is sent in."""
+def _arrow_table_to_send(
+    table: pa.Table | pa.RecordBatch, *, one_batch: bool = True
+) -> pa.Table:
+    """Check a table for arrow_to_java() and return it in the form it is sent in.
+
+    With one_batch=False the table keeps its chunks, each of which is written
+    as a record batch of its own.
+    """
     from gatun.arena import UnsupportedArrowTypeError, _check_type_recursive
 
     if isinstance(table, pa.RecordBatch):
@@ -1562,16 +1648,18 @@ def _arrow_table_to_send(table: pa.Table | pa.RecordBatch) -> pa.Table:
             "pyarrow.compute.dictionary_decode()."
         )
 
+    if not one_batch:
+        return table
     # One chunk per column, so the table arrives as a single record batch and
     # Java can keep its buffers as they are instead of stitching batches together.
     return table.combine_chunks()
 
 
-def _arrow_stream_size(table: pa.Table) -> int:
+def _arrow_stream_size(table: pa.Table, max_chunksize: int | None = None) -> int:
     """The length of the table's Arrow IPC stream, without writing its data."""
     sink = pa.MockOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
+        writer.write_table(table, max_chunksize=max_chunksize)
     return cast(int, sink.size())
 
 
@@ -1585,13 +1673,18 @@ def _require_payload_room(
 
 
 def _write_arrow_table(
-    client: Any, table: pa.Table, offset: int, size: int, zone: str = "Arrow table"
+    client: Any,
+    table: pa.Table,
+    offset: int,
+    size: int,
+    zone: str = "Arrow table",
+    max_chunksize: int | None = None,
 ) -> None:
     """Write a table as an Arrow IPC stream into the payload zone at the given offset.
 
     The stream is written where Java reads it. Building it in a buffer of its
     own and copying that across would pass over the data twice. `size` is the
-    stream's length, from _arrow_stream_size().
+    stream's length, from _arrow_stream_size() with the same `max_chunksize`.
 
     Raises PayloadTooLargeError when it does not fit between the offset and the
     response zone; nothing is written then. Any other failure may leave part of
@@ -1610,7 +1703,7 @@ def _write_arrow_table(
     writer = None
     try:
         with pa.ipc.new_stream(sink, table.schema) as writer:
-            writer.write_table(table)
+            writer.write_table(table, max_chunksize=max_chunksize)
         written = sink.tell()
     finally:
         # Each of these holds the mapping open, and so would a traceback that
@@ -1622,8 +1715,13 @@ def _write_arrow_table(
         )
 
 
-def _finish_arrow_to_object(builder: Any, offset: int, length: int) -> Any:
-    """Build the ArrowToObject command for a stream already in the payload zone."""
+def _finish_arrow_to_object(
+    builder: Any, offset: int, length: int, form: int = ArrowForm.ArrowForm.Table
+) -> Any:
+    """Build the ArrowToObject command for a stream already in the payload zone.
+
+    `form` is what Java makes of the stream, an ArrowForm.
+    """
     BufferDescriptor.Start(builder)
     BufferDescriptor.AddOffset(builder, offset)
     BufferDescriptor.AddLength(builder, length)
@@ -1632,6 +1730,7 @@ def _finish_arrow_to_object(builder: Any, offset: int, length: int) -> Any:
     Cmd.CommandStart(builder)
     Cmd.CommandAddAction(builder, Act.Action.ArrowToObject)
     Cmd.CommandAddArrowStream(builder, stream)
+    Cmd.CommandAddArrowForm(builder, form)
     builder.Finish(Cmd.CommandEnd(builder))
     return builder.Output()
 
@@ -2425,6 +2524,13 @@ class GatunClient(_ValueEncoder):
         # table read in place by arrow_from_java(copy=False) can lie anywhere in it
         self._payload_writes: int = 0
 
+        # Tables lent to Java (arrow_to_java(copy=False)) that the server has
+        # not been told are over: nothing may be written where they lie
+        self._loans: list[_Loan] = []
+        # Loans that are over as far as Python is concerned, waiting for the
+        # channel to tell the server. Handles append here when garbage collected
+        self._loan_ends: deque[_Loan] = deque()
+
         # FlatBuffers builder pool - reuse builders to reduce allocation overhead.
         # One pool per thread: a command is built before the channel is taken,
         # so threads sharing a client would otherwise build into the same buffer.
@@ -2601,9 +2707,11 @@ class GatunClient(_ValueEncoder):
         # arena must not keep the client alive, so it gets a weak reference.
         client_ref = weakref.ref(self)
 
-        def written(end: int) -> None:
+        def written(start: int, end: int) -> None:
             client = client_ref()
             if client is not None:
+                if client._loans or client._loan_ends:
+                    client._require_clear_of_loans(start, end, "The payload arena")
                 client._note_payload_write(end)
 
         arena._on_allocate = written
@@ -2670,6 +2778,8 @@ class GatunClient(_ValueEncoder):
             # before our own command goes into shared memory.
             if self._pending_frees:
                 self._flush_pending_frees()
+            if self._loan_ends:
+                self._flush_loan_ends()
 
             self._write_command(data)
             return self._read_response()
@@ -2786,6 +2896,103 @@ class GatunClient(_ValueEncoder):
                 # must not fail the caller's unrelated request.
                 logger.debug("FreeObject for %d objects failed: %s", len(ids), e)
 
+    def _queue_loan_end(self, record: _Loan) -> None:
+        """Queue the end of a loan whose handle was garbage collected.
+
+        Called by a finalizer, so like _queue_free it only queues.
+        """
+        if not self._dead:
+            self._loan_ends.append(record)
+
+    def _flush_loan_ends(self) -> None:
+        """Tell the server which lent tables are over. The caller holds the channel.
+
+        Freeing the table's object is what ends its loan. Unlike other releases
+        these never travel on the callback connection, which sends no answer:
+        the client reuses a loan's bytes as soon as it counts the loan as over,
+        so the server has to have got there first.
+        """
+        ends = self._loan_ends
+        while ends:
+            try:
+                record = ends.popleft()
+            except IndexError:
+                break
+            channel = self._callback_channel
+            answers_sent = channel.answers_sent if channel is not None else 0
+            self._write_command(
+                _build_free_command(
+                    self._free_builder, [record.object_id], answers_sent
+                )
+            )
+            try:
+                self._read_response()
+            except CancelledException:
+                # cancel() caught this exchange and not the caller's request,
+                # which is cancelled all the same. The server has not taken the
+                # table back, so its room stays reserved until the next try.
+                ends.appendleft(record)
+                raise
+            except JavaException as e:
+                if not record.ended:
+                    # As above, but nobody asked for this to fail: the caller's
+                    # request goes ahead
+                    ends.appendleft(record)
+                    logger.warning(
+                        "Could not end the loan of Java object %d; trying again "
+                        "with the next request: %s",
+                        record.object_id,
+                        e,
+                    )
+                    return
+                # reset_payload_arena() took the table back already, and this
+                # was the release of its object, like any other
+                logger.debug("Releasing lent table %d failed: %s", record.object_id, e)
+            record.ended = True
+            try:
+                self._loans.remove(record)
+            except ValueError:
+                pass  # reset_payload_arena() ended it already
+
+    def _end_loan(self, record: _Loan) -> None:
+        """End a loan now, or with the next request if the channel is not free."""
+        if self._dead or self.sock is None or self.sock.fileno() == -1:
+            return
+        self._loan_ends.append(record)
+        if (
+            _channel_call_of(self) is None
+            and threading.get_ident() not in self._callback_threads
+        ):
+            try:
+                with self._exchange_lock:
+                    self._flush_loan_ends()
+            except OSError:
+                pass
+
+    def _require_clear_of_loans(self, start: int, end: int, what: str) -> None:
+        """Refuse to write the payload zone from `start` to `end` over a lent table."""
+        if (
+            self._loan_ends
+            # Not inside a callback: on the thread that runs the request the
+            # lock is already ours, in the middle of an exchange
+            and _channel_call_of(self) is None
+            and threading.get_ident() not in self._callback_threads
+            and self._exchange_lock.acquire(blocking=False)
+        ):
+            # Loans whose handles were dropped are over; say so if the channel
+            # is free. Waiting for it could wait for the caller's own callback.
+            try:
+                if not self._closed and not self._dead:
+                    self._flush_loan_ends()
+            finally:
+                self._exchange_lock.release()
+        for record in list(self._loans):
+            if start < record.end and end > record.start:
+                raise RuntimeError(
+                    f"{what} would overwrite a table that is lent to Java "
+                    "(arrow_to_java(copy=False)). Close the loan first."
+                )
+
     def _mark_dead(self):
         """Mark client as dead after protocol desync.
 
@@ -2804,6 +3011,8 @@ class GatunClient(_ValueEncoder):
 
         self._dead = True
         self._pending_frees.clear()
+        self._loan_ends.clear()
+        self._loans.clear()
         channel, self._callback_channel = self._callback_channel, None
         if channel is not None:
             channel.close()
@@ -4178,6 +4387,14 @@ class GatunClient(_ValueEncoder):
                 f"Consider resetting arena or using streaming for large tables.",
             )
 
+        if self._loans or self._loan_ends:
+            # Before the first buffer is copied: the arena refuses each buffer
+            # by itself, and a send refused half way has already overwritten
+            # part of the batch that Java holds from the send before
+            self._require_clear_of_loans(
+                arena.offset, arena.offset + estimated, "The payload arena"
+            )
+
         # 1. Copy table buffers into the arena
         buffer_infos, field_nodes = copy_arrow_table_to_arena(table, arena)
         loaded_end = max(
@@ -4266,6 +4483,9 @@ class GatunClient(_ValueEncoder):
         WARNING: After calling this, any ArrowTableView objects from previous
         get_arrow_data() calls become invalid. Accessing them will raise
         StaleArenaError. Copy the data you need before resetting.
+
+        It also ends every loan made with arrow_to_java(copy=False): the whole
+        payload zone is free to reuse afterwards.
         """
         # Outstanding ArrowTableViews are invalid from here on, whatever happens
         self._end_views()
@@ -4283,6 +4503,11 @@ class GatunClient(_ValueEncoder):
         # every later send would be refused as stale.
         self._arena_epoch += 1
         self._arrow_loaded_end = 0
+        # Java took back every lent table with it. Their handles still free
+        # the objects when they are closed or collected.
+        for record in self._loans:
+            record.ended = True
+        self._loans.clear()
         return response
 
     def _note_payload_write(self, end: int) -> None:
@@ -4306,18 +4531,24 @@ class GatunClient(_ValueEncoder):
         self._payload_generation += 1
 
     def _write_table_to_payload(
-        self, table: pa.Table, offset: int, zone: str = "Arrow table"
+        self,
+        table: pa.Table,
+        offset: int,
+        zone: str = "Arrow table",
+        max_chunksize: int | None = None,
     ) -> int:
         """Write a table's IPC stream into the payload zone; returns its length.
 
-        A table that does not fit is refused with nothing written and no view
-        disturbed. Otherwise the views the stream lands on end before its first
-        byte is written.
+        A table that does not fit, or that would land on a table lent to Java,
+        is refused with nothing written and no view disturbed. Otherwise the
+        views the stream lands on end before its first byte is written.
         """
-        size = _arrow_stream_size(table)
+        size = _arrow_stream_size(table, max_chunksize)
         _require_payload_room(self, size, offset, zone)
+        if self._loans or self._loan_ends:
+            self._require_clear_of_loans(offset, offset + size, f"This {zone}")
         self._note_payload_write(offset + size)
-        _write_arrow_table(self, table, offset, size, zone)
+        _write_arrow_table(self, table, offset, size, zone, max_chunksize)
         return size
 
     @_holding_channel
@@ -4365,24 +4596,57 @@ class GatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
+        if self._loans or self._loan_ends:
+            # Java writes the second half of the zone
+            zone = self.response_offset - self.payload_offset
+            self._require_clear_of_loans(zone // 2, zone, "get_arrow_data()")
+
         # Java writes over the region earlier views point at as soon as it has
         # the command, whether or not its answer arrives. The view made from the
         # answer is the only current one.
         self._end_views()
         return cast(ArrowTableView, self._send_raw(builder.Output()))
 
-    def arrow_to_java(self, table: pa.Table | pa.RecordBatch) -> JavaObject:
-        """Copy an Arrow table into the JVM and return a handle to it.
+    @overload
+    def arrow_to_java(
+        self, table: pa.Table | pa.RecordBatch, *, copy: Literal[True] = True
+    ) -> JavaObject: ...
 
-        The handle refers to an org.apache.arrow.vector.VectorSchemaRoot that owns
-        its memory. Pass it to any Java method that takes one, call its methods,
-        or get a table back with arrow_from_java(). Java releases the table's
-        memory when the handle is garbage collected (or the connection closes),
-        so Java code that needs the data for longer must copy it.
+    @overload
+    def arrow_to_java(
+        self, table: pa.Table | pa.RecordBatch, *, copy: Literal[False]
+    ) -> ArrowLoan: ...
+
+    @overload
+    def arrow_to_java(
+        self, table: pa.Table | pa.RecordBatch, *, copy: bool
+    ) -> JavaObject | ArrowLoan: ...
+
+    def arrow_to_java(
+        self, table: pa.Table | pa.RecordBatch, *, copy: bool = True
+    ) -> JavaObject | ArrowLoan:
+        """Hand an Arrow table to the JVM and return a handle to it.
+
+        The handle refers to an org.apache.arrow.vector.VectorSchemaRoot. Pass
+        it to any Java method that takes one, call its methods, or get a table
+        back with arrow_from_java().
+
+        By default Java copies the table out of shared memory, and the copy is
+        its own: Java releases it when the handle is garbage collected (or the
+        connection closes), so Java code that needs the data for longer must
+        copy it.
+
+        With copy=False Java reads the table where Python wrote it, and you get
+        an ArrowLoan to use in a ``with`` block. That saves the JVM a copy into
+        new memory, which is most of what a large transfer costs. The table is
+        Java's to read until the block ends, and not after: see ArrowLoan.
+        Tables are lent on the client's own channel; inside a callback that
+        Java made from another thread the table is copied as usual and the
+        loan's close() frees the copy.
 
         The table is sent in one piece and must fit in the payload zone; connect
         with more memory, or send it in slices, if it does not. It is written
-        into shared memory as it is serialized, and Java copies it out from there.
+        into shared memory as it is serialized.
 
         Inside a callback that Java made from another thread the table goes
         through shared memory of that call's own, as large as the client's, so
@@ -4390,9 +4654,11 @@ class GatunClient(_ValueEncoder):
 
         Args:
             table: A pyarrow Table or RecordBatch.
+            copy: False to lend the table instead of copying it.
 
         Returns:
-            JavaObject wrapping the VectorSchemaRoot.
+            JavaObject wrapping the VectorSchemaRoot, or an ArrowLoan with
+            copy=False.
 
         Raises:
             PayloadTooLargeError: If the table does not fit in shared memory.
@@ -4402,23 +4668,117 @@ class GatunClient(_ValueEncoder):
             root = client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
             root.getRowCount()                      # 3
             client.jvm.com.example.Stats.sum(root)  # your own Java code
+
+            with client.arrow_to_java(table, copy=False) as root:
+                client.jvm.com.example.Stats.sum(root)
         """
         table = _arrow_table_to_send(table)
         call = _channel_call_of(self)
         if call is not None:
             routed, result = self._arrow_to_java_in_call(call, table)
             if routed:
+                root = cast(JavaObject, result)
+                return root if copy else ArrowLoan(self, root, None)
+        if copy:
+            return cast(JavaObject, self._arrow_to_java_on_channel(table))
+        return cast(ArrowLoan, self._lend_arrow_on_channel(table))
+
+    def arrow_to_java_batches(
+        self,
+        table: pa.Table | pa.RecordBatch,
+        *,
+        max_rows_per_batch: int | None = None,
+    ) -> JavaObject:
+        """Hand an Arrow table to the JVM as serialized record batches.
+
+        The handle refers to a java.util.ArrayList of byte arrays, one per
+        record batch, each holding the batch's Arrow IPC message. That is the
+        form Spark takes Arrow data in (ArrowConverters.toDataFrame), and for
+        such a consumer it skips building a table in the JVM only to serialize
+        it again: Java copies the bytes Python wrote, and decodes nothing.
+
+        Each chunk of the table becomes a batch. A Java array holds less than
+        2 GiB, so a table with larger chunks needs max_rows_per_batch.
+
+        The arrays are ordinary Java objects on the heap, released by garbage
+        collection once the handle is gone and nothing in Java refers to them.
+
+        Args:
+            table: A pyarrow Table or RecordBatch.
+            max_rows_per_batch: Split chunks that have more rows than this.
+
+        Returns:
+            JavaObject wrapping the ArrayList.
+
+        Raises:
+            PayloadTooLargeError: If the table does not fit in shared memory.
+            UnsupportedArrowTypeError: If a column is dictionary-encoded.
+
+        Example:
+            batches = client.arrow_to_java_batches(table, max_rows_per_batch=10_000)
+            batches.size()
+        """
+        if max_rows_per_batch is not None and max_rows_per_batch < 1:
+            raise ValueError("max_rows_per_batch must be at least 1")
+        table = _arrow_table_to_send(table, one_batch=False)
+        form = ArrowForm.ArrowForm.Batches
+        call = _channel_call_of(self)
+        if call is not None:
+            routed, result = self._arrow_to_java_in_call(
+                call, table, form, max_rows_per_batch
+            )
+            if routed:
                 return cast(JavaObject, result)
-        return cast(JavaObject, self._arrow_to_java_on_channel(table))
+        return cast(
+            JavaObject,
+            self._arrow_to_java_on_channel(table, form, max_rows_per_batch),
+        )
+
+    def _send_arrow_stream(
+        self, table: pa.Table, form: int, max_chunksize: int | None = None
+    ) -> tuple[JavaObject, int, int]:
+        """Write a table into the payload zone and have Java make an object of it.
+
+        Returns the object and where the stream lies. The caller holds the channel.
+        """
+        if self._loan_ends:
+            # Their room is free once the server knows
+            self._require_usable()
+            self._flush_loan_ends()
+        # Stay clear of a batch Java is still reading in place, and of the
+        # tables it has on loan
+        floor = max(
+            self._arrow_loaded_end,
+            max((record.end for record in self._loans), default=0),
+        )
+        offset = (floor + 63) & ~63
+        size = self._write_table_to_payload(table, offset, max_chunksize=max_chunksize)
+
+        command = _finish_arrow_to_object(self._get_builder(), offset, size, form)
+        return cast(JavaObject, self._send_raw(command)), offset, size
 
     @_holding_channel
-    def _arrow_to_java_on_channel(self, table: pa.Table) -> JavaObject:
-        # Stay clear of a batch Java is still reading in place
-        offset = (self._arrow_loaded_end + 63) & ~63
-        size = self._write_table_to_payload(table, offset)
+    def _arrow_to_java_on_channel(
+        self,
+        table: pa.Table,
+        form: int = ArrowForm.ArrowForm.Table,
+        max_chunksize: int | None = None,
+    ) -> JavaObject:
+        return self._send_arrow_stream(table, form, max_chunksize)[0]
 
-        command = _finish_arrow_to_object(self._get_builder(), offset, size)
-        return cast(JavaObject, self._send_raw(command))
+    @_holding_channel
+    def _lend_arrow_on_channel(self, table: pa.Table) -> ArrowLoan:
+        root, offset, size = self._send_arrow_stream(
+            table, ArrowForm.ArrowForm.LentTable
+        )
+        record = _Loan(root.object_id, offset, offset + size)
+        self._loans.append(record)
+        # Freeing the object is what ends the loan, and the client has to know
+        # when the server has done it: the release goes through _loan_ends, not
+        # with the others, which may travel unanswered on the callback connection
+        root.detach()
+        root._finalizer = weakref.finalize(root, self._queue_loan_end, record)
+        return ArrowLoan(self, root, record)
 
     def _call_memory(self, call: ChannelCall) -> CallMemory | None:
         """The call's shared memory, which Java creates when first asked.
@@ -4449,7 +4809,11 @@ class GatunClient(_ValueEncoder):
         return memory
 
     def _arrow_to_java_in_call(
-        self, call: ChannelCall, table: pa.Table
+        self,
+        call: ChannelCall,
+        table: pa.Table,
+        form: int = ArrowForm.ArrowForm.Table,
+        max_chunksize: int | None = None,
     ) -> tuple[bool, Any]:
         """arrow_to_java() inside a callback that came on the callback connection.
 
@@ -4463,12 +4827,12 @@ class GatunClient(_ValueEncoder):
             memory = self._call_memory(call)
             if memory is None:
                 return False, None
-            size = _arrow_stream_size(table)
+            size = _arrow_stream_size(table, max_chunksize)
             _require_payload_room(memory, size, 0)
             # Tables read in place there end before the first byte is written
             memory._payload_writes += 1
-            _write_arrow_table(memory, table, 0, size)
-            command = _finish_arrow_to_object(self._get_builder(), 0, size)
+            _write_arrow_table(memory, table, 0, size, max_chunksize=max_chunksize)
+            command = _finish_arrow_to_object(self._get_builder(), 0, size, form)
             return self._send_nested(call, command)
 
     def _arrow_from_java_in_call(

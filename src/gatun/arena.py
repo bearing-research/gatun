@@ -73,10 +73,10 @@ class PayloadArena:
     _mmap: mmap.mmap | None
     _base_offset: int
 
-    # Called on each allocation with the offset the new buffer ends at. The
-    # client sets it on the arena it hands out, to learn that its payload zone
-    # is about to be written to
-    _on_allocate: Callable[[int], None] | None = None
+    # Called on each allocation with the offsets the new buffer starts and ends
+    # at. The client sets it on the arena it hands out, to learn that its
+    # payload zone is about to be written to
+    _on_allocate: Callable[[int, int], None] | None = None
 
     def __init__(self, path: Path | str, size: int):
         """Initialize the payload arena from an existing file.
@@ -177,7 +177,7 @@ class PayloadArena:
             )
 
         if self._on_allocate is not None:
-            self._on_allocate(aligned_offset + size)
+            self._on_allocate(aligned_offset, aligned_offset + size)
 
         # Create an Arrow buffer backed by the shared memory region
         # foreign_buffer creates a zero-copy view into existing memory

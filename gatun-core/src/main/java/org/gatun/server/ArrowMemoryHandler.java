@@ -4,7 +4,9 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
@@ -13,9 +15,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
+import org.apache.arrow.flatbuf.Message;
+import org.apache.arrow.flatbuf.MessageHeader;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.OwnershipTransferResult;
 import org.apache.arrow.memory.ReferenceManager;
 import org.apache.arrow.vector.TypeLayout;
 import org.apache.arrow.vector.VectorLoader;
@@ -138,7 +141,12 @@ public class ArrowMemoryHandler implements AutoCloseable {
    * overwrite data that batch still points at.
    */
   public long getLoadedEnd() {
-    return (loadedEnd + ALIGNMENT - 1) & ~((long) ALIGNMENT - 1);
+    return aligned(loadedEnd);
+  }
+
+  /** The first offset at or after {@code offset} where an Arrow buffer may start. */
+  static long aligned(long offset) {
+    return (offset + ALIGNMENT - 1) & ~((long) ALIGNMENT - 1);
   }
 
   /**
@@ -183,6 +191,124 @@ public class ArrowMemoryHandler implements AutoCloseable {
         throw t;
       }
     }
+  }
+
+  /**
+   * One message of an Arrow IPC stream.
+   *
+   * @param metadata a copy of the message's metadata
+   * @param start where the message starts in the stream, at its length prefix
+   * @param bodyStart where its body starts
+   * @param end one past the last byte of its body
+   */
+  record IpcMessage(Message metadata, long start, long bodyStart, long end) {
+    long bodyLength() {
+      return end - bodyStart;
+    }
+  }
+
+  private static final ValueLayout.OfInt STREAM_INT =
+      ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+  /**
+   * Find the messages of an Arrow IPC stream without reading their bodies: where each lies is all
+   * that is needed to hand the bytes on as they are.
+   *
+   * @param stream exactly the bytes of the stream
+   */
+  static List<IpcMessage> ipcMessages(MemorySegment stream) {
+    long size = stream.byteSize();
+    List<IpcMessage> messages = new ArrayList<>();
+    long position = 0;
+    try {
+      while (size - position >= 4) {
+        long start = position;
+        int metadataLength = stream.get(STREAM_INT, position);
+        position += 4;
+        if (metadataLength == -1) {
+          // The continuation marker; streams written before Arrow 0.15 have none
+          if (size - position < 4) {
+            throw new IllegalArgumentException("the stream ends inside a message's length");
+          }
+          metadataLength = stream.get(STREAM_INT, position);
+          position += 4;
+        }
+        if (metadataLength == 0) {
+          break; // the end-of-stream marker
+        }
+        if (metadataLength < 0 || metadataLength > size - position) {
+          throw new IllegalArgumentException(
+              "message metadata of " + metadataLength + " bytes at offset " + start);
+        }
+        // Parsed from a copy: the client can change shared memory while it is being read
+        byte[] metadata = new byte[metadataLength];
+        MemorySegment.copy(stream, ValueLayout.JAVA_BYTE, position, metadata, 0, metadataLength);
+        position += metadataLength;
+        Message message = Message.getRootAsMessage(ByteBuffer.wrap(metadata));
+        long bodyLength = message.bodyLength();
+        if (bodyLength < 0 || bodyLength > size - position) {
+          throw new IllegalArgumentException(
+              "message body of " + bodyLength + " bytes at offset " + position);
+        }
+        messages.add(new IpcMessage(message, start, position, position + bodyLength));
+        position += bodyLength;
+      }
+    } catch (IndexOutOfBoundsException | IllegalArgumentException e) {
+      throw new IllegalArgumentException("Not an Arrow IPC stream: " + e.getMessage(), e);
+    }
+    return messages;
+  }
+
+  /** The schema a stream starts with. Dictionary-encoded columns are refused. */
+  static Schema schemaOf(List<IpcMessage> messages) {
+    if (messages.isEmpty() || messages.get(0).metadata().headerType() != MessageHeader.Schema) {
+      throw new IllegalArgumentException(
+          "Not an Arrow IPC stream: it does not start with a schema");
+    }
+    Schema schema = MessageSerializer.deserializeSchema(messages.get(0).metadata());
+    for (Field field : schema.getFields()) {
+      requireNoDictionary(field);
+    }
+    return schema;
+  }
+
+  /** What {@link #readIpcBatches} found in a stream. */
+  public record Batches(ArrayList<byte[]> batches, long rows) {}
+
+  /**
+   * Copy each record batch of an Arrow IPC stream into a byte array that holds its IPC message,
+   * which is the form Spark passes Arrow data around in. Nothing is decoded.
+   *
+   * @param stream exactly the bytes of the stream
+   */
+  public static Batches readIpcBatches(MemorySegment stream) {
+    List<IpcMessage> messages = ipcMessages(stream);
+    schemaOf(messages);
+    ArrayList<byte[]> batches = new ArrayList<>(messages.size() - 1);
+    long rows = 0;
+    for (IpcMessage message : messages.subList(1, messages.size())) {
+      Message metadata = message.metadata();
+      if (metadata.headerType() != MessageHeader.RecordBatch) {
+        throw new IllegalArgumentException(
+            "Expected record batches after the schema, found "
+                + MessageHeader.name(metadata.headerType()));
+      }
+      long length = message.end() - message.start();
+      if (length > Integer.MAX_VALUE - 8) {
+        throw new IllegalArgumentException(
+            "A record batch of "
+                + length
+                + " bytes does not fit in a Java array; send the table in smaller batches");
+      }
+      byte[] batch = new byte[(int) length];
+      MemorySegment.copy(stream, ValueLayout.JAVA_BYTE, message.start(), batch, 0, (int) length);
+      batches.add(batch);
+      rows +=
+          ((org.apache.arrow.flatbuf.RecordBatch)
+                  metadata.header(new org.apache.arrow.flatbuf.RecordBatch()))
+              .length();
+    }
+    return new Batches(batches, rows);
   }
 
   private static void requireNoDictionary(Field field) {
@@ -292,114 +418,6 @@ public class ArrowMemoryHandler implements AutoCloseable {
   /** Get the current arena epoch. */
   public long getArenaEpoch() {
     return arenaEpoch;
-  }
-
-  /**
-   * ReferenceManager for foreign memory (shared memory owned by Python).
-   *
-   * <p>This manager implements proper reference counting so Arrow's lifecycle management works
-   * normally. The actual memory is never freed since Python owns it, but reference counting allows
-   * Arrow objects to clean up properly.
-   *
-   * <p>A single manager is created per batch/payload segment and shared by all buffers in that
-   * batch to reduce object allocation overhead.
-   */
-  private static class ForeignMemoryReferenceManager implements ReferenceManager {
-    private final java.util.concurrent.atomic.AtomicInteger refCnt =
-        new java.util.concurrent.atomic.AtomicInteger(1);
-    private final BufferAllocator allocator;
-    private final long capacity;
-
-    /**
-     * Create a reference manager for foreign memory.
-     *
-     * @param capacity Total capacity of the memory region
-     * @param allocator Parent allocator (for compatibility, not used for allocation)
-     */
-    ForeignMemoryReferenceManager(long capacity, BufferAllocator allocator) {
-      this.capacity = capacity;
-      this.allocator = allocator;
-    }
-
-    @Override
-    public int getRefCount() {
-      return refCnt.get();
-    }
-
-    @Override
-    public boolean release() {
-      return release(1);
-    }
-
-    @Override
-    public boolean release(int decrement) {
-      if (decrement < 1) {
-        throw new IllegalArgumentException("decrement must be >= 1");
-      }
-      int newRefCnt = refCnt.addAndGet(-decrement);
-      if (newRefCnt < 0) {
-        throw new IllegalStateException("Reference count went negative: " + newRefCnt);
-      }
-      // Return true when refcount hits zero (signals "released")
-      // We don't actually free memory since Python owns it
-      return newRefCnt == 0;
-    }
-
-    @Override
-    public void retain() {
-      retain(1);
-    }
-
-    @Override
-    public void retain(int increment) {
-      if (increment < 1) {
-        throw new IllegalArgumentException("increment must be >= 1");
-      }
-      int oldRefCnt = refCnt.getAndAdd(increment);
-      if (oldRefCnt < 1) {
-        throw new IllegalStateException("Cannot retain after release: refCnt was " + oldRefCnt);
-      }
-    }
-
-    @Override
-    public ArrowBuf retain(ArrowBuf srcBuffer, BufferAllocator targetAllocator) {
-      // Retain the buffer and return it
-      // VectorLoader calls this when loading buffers into vectors
-      retain();
-      return srcBuffer;
-    }
-
-    @Override
-    public ArrowBuf deriveBuffer(ArrowBuf sourceBuffer, long index, long length) {
-      // Create a derived buffer pointing to a slice of the same memory
-      // The derived buffer shares this reference manager
-      long newAddress = sourceBuffer.memoryAddress() + index;
-      retain(); // Derived buffer holds a reference
-      return new ArrowBuf(this, null, length, newAddress);
-    }
-
-    @Override
-    public OwnershipTransferResult transferOwnership(
-        ArrowBuf sourceBuffer, BufferAllocator targetAllocator) {
-      // Foreign memory cannot transfer ownership
-      throw new UnsupportedOperationException("Cannot transfer ownership of foreign memory");
-    }
-
-    @Override
-    public BufferAllocator getAllocator() {
-      return allocator;
-    }
-
-    @Override
-    public long getSize() {
-      return capacity;
-    }
-
-    @Override
-    public long getAccountedSize() {
-      // Not accounted in any allocator since Python owns it
-      return 0;
-    }
   }
 
   /**
@@ -531,7 +549,7 @@ public class ArrowMemoryHandler implements AutoCloseable {
     // 3. Create a single shared ReferenceManager for all buffers in this batch
     // This reduces object allocation and properly represents the shared memory region
     ReferenceManager sharedRefManager =
-        new ForeignMemoryReferenceManager(payloadShm.byteSize(), allocator);
+        new SharedMemoryBuffers(payloadShm.byteSize(), allocator, null);
 
     // 4. Create ArrowBuf wrappers for each buffer descriptor
     // Note: Absent buffers (e.g., no validity bitmap when no nulls) are represented

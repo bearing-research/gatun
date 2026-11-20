@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from gatun.client import GatunClient
-from gatun.launcher import launch_gateway
+from gatun.launcher import JAR_PATH, launch_gateway
 
 # --- Logging Setup ---
 # Pytest captures this automatically. Run with -o log_cli=true to see it live.
@@ -131,13 +131,24 @@ def compile_java(tmp_path):
     a static method spelled in capitals.
     """
 
-    def _compile(class_name: str, source: str) -> str:
+    def _compile(class_name: str, source: str, *, with_server: bool = False) -> str:
+        """`with_server` compiles against the server's JAR, for a class that
+        uses what is in it (Arrow)."""
         java_home = os.environ.get("JAVA_HOME")
         javac = os.path.join(java_home, "bin", "javac") if java_home else "javac"
         source_file = tmp_path / f"{class_name}.java"
         source_file.write_text(source)
+        classpath = ["-cp", str(JAR_PATH)] if with_server else []
         subprocess.run(
-            [javac, "--release", "22", "-d", str(tmp_path), str(source_file)],
+            [
+                javac,
+                "--release",
+                "22",
+                *classpath,
+                "-d",
+                str(tmp_path),
+                str(source_file),
+            ],
             check=True,
         )
         return str(tmp_path)
