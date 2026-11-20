@@ -248,6 +248,36 @@ class TestFetchingFromJava:
         assert first.to_pydict() == {"x": [1, 2, 3]}
         assert second.to_pydict() == {"x": [9, 9, 9]}
 
+    def test_copy_is_made_in_arrows_memory_pool(self, client):
+        """The pool hands back the memory of a table that was dropped. A bytes
+        object of 32 MiB or more is new memory from the OS each time, and
+        touching it cost several times the copy."""
+        column = pa.array(range(100_000), type=pa.int64())
+        root = client.arrow_to_java(pa.table({"x": column}))
+        # The count is the whole process's: nothing else may be freed meanwhile
+        gc.collect()
+        gc.disable()
+        try:
+            before = pa.total_allocated_bytes()
+            table = client.arrow_from_java(root)
+            added = pa.total_allocated_bytes() - before
+        finally:
+            gc.enable()
+
+        assert added >= table.nbytes
+
+    def test_fetch_leaves_the_mapping_free_to_close(self, make_client):
+        """The copy is made through views of the mapping, which hold it open
+        while they live."""
+        client = make_client()
+        shm = client.shm
+        table = client.arrow_from_java(client.arrow_to_java(pa.table({"x": [1, 2, 3]})))
+
+        client.close()
+
+        assert shm.closed
+        assert table.to_pydict() == {"x": [1, 2, 3]}
+
     def test_object_that_is_not_a_table(self, client):
         items = client.create_object("java.util.ArrayList")
 

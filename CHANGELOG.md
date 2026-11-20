@@ -59,6 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `JavaArray(element_type=...)` rejects unknown element types instead of sending them as `Object[]`
 - The launched server runs in its own process group, exits when the Python process that launched it is gone, and `launch_gateway()` refuses a fixed `socket_path` that a live server is already using
 - Connecting checks that the filesystem has room for the whole shared memory file and refuses the session if not, with the reason in the error. The file is still sparse, so this is a check and not a reservation: it catches a disk that cannot hold the file, not several sessions that later fill it between them
+- `arrow_from_java()` copies a table into Arrow's memory pool instead of a `bytes` object. The pool reuses the memory of a table that was dropped, where a `bytes` object of 32 MiB or more was new memory from the operating system each time: fetching a 128 MiB table took about 120 ms and now takes about 25 ms (measured on Linux with pyarrow's default mimalloc pool), and tables under 32 MiB take as long as before. With `ARROW_DEFAULT_MEMORY_POOL=system` nothing changes
+- The server no longer runs with Arrow's debug allocator (`-Darrow.memory.debug.allocator=true`), which records a stack trace for every buffer operation: a small `arrow_to_java()` took more than twice as long with it. A leaked buffer is still reported, without the place it was allocated; pass the flag in `extra_jvm_flags` or `jvm_flags` to get that back
 
 ### Fixed
 - `client.cancel()` during a batch ends the batch. It used to cancel only the command that was running: with `stop_on_error=False` the rest of the batch still ran. The batch now raises `CancelledException`
@@ -118,6 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A failed `reset_payload_arena()` no longer leaves the client's epoch ahead of the server's
 - The launcher reaps a server it had to kill, leaves ignored signals ignored, does not stop the parent's server from a forked child, keeps only a tail of the server's output, drains that output during startup, and stops the server when startup times out or is interrupted
 - `client.jvm.Encoders.STRING()`-style uppercase static methods and lowercase static fields (`System.out`) resolve by what they are, not how they are spelled
+- The server's Netty filled the direct memory it allocated with zeros before use: the launcher passed `io.netty.tryReflectionSetAccessible`, but Netty is relocated inside the server JAR and reads `gatun.shaded.io.netty.tryReflectionSetAccessible`. The launcher now passes both. Arrow's memory in the server is then taken without a `DirectByteBuffer` around it: it no longer counts against the JVM's own direct memory limit or shows in the JVM's direct buffer pool statistics. Netty counts it itself, against a limit of the same size (`-XX:MaxDirectMemorySize`, or `-Dgatun.shaded.io.netty.maxDirectMemory` to set it apart), so a server whose NIO buffers and Arrow tables shared one limit can now use up to that much for each
 
 ## [0.2.1] - 2026-01-17
 

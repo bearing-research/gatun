@@ -93,9 +93,12 @@ DEFAULT_JVM_FLAGS = [
     "--add-opens=java.base/java.net=ALL-UNNAMED",
     "--add-opens=java.base/java.io=ALL-UNNAMED",
     "--add-opens=java.base/java.security=ALL-UNNAMED",
-    # Netty reflective access
+    # Netty reflective access, without which it zero-fills the direct memory it
+    # allocates. The server's own Netty is relocated in the JAR, and the names
+    # of its system properties with it; the plain name is for a Netty on the
+    # classpath (Spark's).
     "-Dio.netty.tryReflectionSetAccessible=true",
-    "-Darrow.memory.debug.allocator=true",
+    "-Dgatun.shaded.io.netty.tryReflectionSetAccessible=true",
 ]
 
 
