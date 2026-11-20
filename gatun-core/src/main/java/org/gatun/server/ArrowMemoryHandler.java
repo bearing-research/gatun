@@ -19,7 +19,6 @@ import org.apache.arrow.flatbuf.Message;
 import org.apache.arrow.flatbuf.MessageHeader;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.OwnershipTransferResult;
 import org.apache.arrow.memory.ReferenceManager;
 import org.apache.arrow.vector.TypeLayout;
 import org.apache.arrow.vector.VectorLoader;
@@ -422,114 +421,6 @@ public class ArrowMemoryHandler implements AutoCloseable {
   }
 
   /**
-   * ReferenceManager for foreign memory (shared memory owned by Python).
-   *
-   * <p>This manager implements proper reference counting so Arrow's lifecycle management works
-   * normally. The actual memory is never freed since Python owns it, but reference counting allows
-   * Arrow objects to clean up properly.
-   *
-   * <p>A single manager is created per batch/payload segment and shared by all buffers in that
-   * batch to reduce object allocation overhead.
-   */
-  private static class ForeignMemoryReferenceManager implements ReferenceManager {
-    private final java.util.concurrent.atomic.AtomicInteger refCnt =
-        new java.util.concurrent.atomic.AtomicInteger(1);
-    private final BufferAllocator allocator;
-    private final long capacity;
-
-    /**
-     * Create a reference manager for foreign memory.
-     *
-     * @param capacity Total capacity of the memory region
-     * @param allocator Parent allocator (for compatibility, not used for allocation)
-     */
-    ForeignMemoryReferenceManager(long capacity, BufferAllocator allocator) {
-      this.capacity = capacity;
-      this.allocator = allocator;
-    }
-
-    @Override
-    public int getRefCount() {
-      return refCnt.get();
-    }
-
-    @Override
-    public boolean release() {
-      return release(1);
-    }
-
-    @Override
-    public boolean release(int decrement) {
-      if (decrement < 1) {
-        throw new IllegalArgumentException("decrement must be >= 1");
-      }
-      int newRefCnt = refCnt.addAndGet(-decrement);
-      if (newRefCnt < 0) {
-        throw new IllegalStateException("Reference count went negative: " + newRefCnt);
-      }
-      // Return true when refcount hits zero (signals "released")
-      // We don't actually free memory since Python owns it
-      return newRefCnt == 0;
-    }
-
-    @Override
-    public void retain() {
-      retain(1);
-    }
-
-    @Override
-    public void retain(int increment) {
-      if (increment < 1) {
-        throw new IllegalArgumentException("increment must be >= 1");
-      }
-      int oldRefCnt = refCnt.getAndAdd(increment);
-      if (oldRefCnt < 1) {
-        throw new IllegalStateException("Cannot retain after release: refCnt was " + oldRefCnt);
-      }
-    }
-
-    @Override
-    public ArrowBuf retain(ArrowBuf srcBuffer, BufferAllocator targetAllocator) {
-      // Retain the buffer and return it
-      // VectorLoader calls this when loading buffers into vectors
-      retain();
-      return srcBuffer;
-    }
-
-    @Override
-    public ArrowBuf deriveBuffer(ArrowBuf sourceBuffer, long index, long length) {
-      // Create a derived buffer pointing to a slice of the same memory
-      // The derived buffer shares this reference manager
-      long newAddress = sourceBuffer.memoryAddress() + index;
-      retain(); // Derived buffer holds a reference
-      return new ArrowBuf(this, null, length, newAddress);
-    }
-
-    @Override
-    public OwnershipTransferResult transferOwnership(
-        ArrowBuf sourceBuffer, BufferAllocator targetAllocator) {
-      // Foreign memory cannot transfer ownership
-      throw new UnsupportedOperationException("Cannot transfer ownership of foreign memory");
-    }
-
-    @Override
-    public BufferAllocator getAllocator() {
-      return allocator;
-    }
-
-    @Override
-    public long getSize() {
-      return capacity;
-    }
-
-    @Override
-    public long getAccountedSize() {
-      // Not accounted in any allocator since Python owns it
-      return 0;
-    }
-  }
-
-  /**
    * Process an Arrow IPC stream from shared memory.
    *
    * @param payloadSlice Memory segment containing the Arrow IPC data
@@ -658,7 +549,7 @@ public class ArrowMemoryHandler implements AutoCloseable {
     // 3. Create a single shared ReferenceManager for all buffers in this batch
     // This reduces object allocation and properly represents the shared memory region
     ReferenceManager sharedRefManager =
-        new ForeignMemoryReferenceManager(payloadShm.byteSize(), allocator);
+        new SharedMemoryBuffers(payloadShm.byteSize(), allocator, null);
 
     // 4. Create ArrowBuf wrappers for each buffer descriptor
     // Note: Absent buffers (e.g., no validity bitmap when no nulls) are represented
