@@ -2831,19 +2831,26 @@ class GatunClient(_ValueEncoder):
                 return result
 
         with self._exchange_lock:
-            # 2. Release objects whose wrappers were garbage collected since the
-            # last request. A packed command carries them, a chunk at a time.
-            # For any other, and for a packed one with no room, they are a
-            # round trip of their own, which has to finish before our own
-            # command goes into shared memory.
+            # 2. End the loans whose handles were garbage collected. Before the
+            # releases below: this step can fail the request, and by then no
+            # object ID may have left the queue for a command that is not sent.
+            if self._loan_ends:
+                self._flush_loan_ends()
+
+            # 3. Release objects whose wrappers were garbage collected since the
+            # last request. A packed command carries them if they are one
+            # command's worth. A longer queue, any other command, and a packed
+            # one with no room send them in round trips of their own, which
+            # have to finish before our own command goes into shared memory.
+            # The whole queue goes out every time: a program that drops more
+            # handles per call than one command carries would otherwise leave
+            # Java holding more of them with every call.
             riding = None
             if self._pending_frees:
-                if packed:
+                if packed and len(self._pending_frees) <= _FREE_CHUNK_SIZE:
                     data, riding = self._with_pending_frees(data)
                 if riding is None:
                     self._flush_pending_frees()
-            if self._loan_ends:
-                self._flush_loan_ends()
 
             self._write_command(data)
             if riding is None:
@@ -2982,6 +2989,12 @@ class GatunClient(_ValueEncoder):
             self._write_command(_build_free_command(ids, answers_sent))
             try:
                 self._read_response()
+            except CancelledException:
+                # cancel() caught this exchange and not the caller's request,
+                # which is cancelled all the same. The server may not have got
+                # to these, and it ignores an ID it has already released.
+                frees.extendleft(reversed(ids))
+                raise
             except JavaException as e:
                 # The server ignores unknown IDs, so this is unexpected, and it
                 # must not fail the caller's unrelated request.

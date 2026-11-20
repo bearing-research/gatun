@@ -38,6 +38,12 @@ from gatun.generated.org.gatun.protocol import Action, Value
 # fit it in.
 COMMAND_ZONE_SIZE = 65536
 
+# The longest command packed here. Short of the zone by more than a packed
+# command's extra bytes and the wrapper a command gets inside a callback, where
+# it travels in a frame with the zone's limit (`_nested_command` in client.py):
+# what the builder could fit in a frame must not be refused for being packed.
+_PACKED_LIMIT = COMMAND_ZONE_SIZE - 512
+
 _INT = Value.Value.IntVal
 _STRING = Value.Value.StringVal
 _DOUBLE = Value.Value.DoubleVal
@@ -265,7 +271,7 @@ def pack_command(
     if parts is None:
         return None
     command = b"".join((_HEADER, *parts))
-    return command if len(command) <= COMMAND_ZONE_SIZE else None
+    return command if len(command) <= _PACKED_LIMIT else None
 
 
 # A batch starts like any packed command, with the same vtables and a Command
@@ -336,7 +342,7 @@ def pack_batch(
     parts = [_BATCH_HEADERS[bool(stop_on_error)], b"", _PADDING[skip]]
     for action, target_id, name, args in commands:
         block = _command_parts(base, action, name, target_id, args, ref_types, False)
-        if block is None or base > COMMAND_ZONE_SIZE:
+        if block is None or base > _PACKED_LIMIT:
             return None
         distances.append(base - entry)
         entry += 4
@@ -348,7 +354,7 @@ def pack_batch(
     except struct.error:
         # More than 4 GiB of commands: the builder refuses it in its own words
         return None
-    return b"".join(parts) if base <= COMMAND_ZONE_SIZE else None
+    return b"".join(parts) if base <= _PACKED_LIMIT else None
 
 
 def with_frees(command: bytes, ids: list[int], answers_sent: int = 0) -> bytes:
@@ -403,13 +409,19 @@ NOT_PLAIN: Any = object()
 # error, a callback, a batch or an Arrow answer has more, or lacks the value.
 _PLAIN_VTABLE_SIZE = 14
 
+# A reply on the callback connection also names its call: call_id, the 13th
+# field, is the last one present, and the seven before it are absent.
+_NESTED_VTABLE_SIZE = 30
+_NO_SLOTS = bytes(14)
+
 
 def read_plain(buf: bytes, client: Any, ref_class: Any) -> Any:
     """The value a response holds, or NOT_PLAIN if it is anything but one value.
 
     The values read here are an integer, a string, a boolean, a double, null and
     an object, which becomes `ref_class(client, object_id)`. Everything else,
-    errors and callbacks among it, is for the generated reader.
+    errors and callbacks among it, is for the generated reader. A reply on the
+    callback connection is such a value with its call's ID beside it.
     """
     return _plain_at(buf, _u32_at(buf, 0)[0], client, ref_class)
 
@@ -434,7 +446,10 @@ def batch_values(buf: bytes, batch: int, client: Any, ref_class: Any) -> list[An
 def _plain_at(buf: bytes, table: int, client: Any, ref_class: Any) -> Any:
     """`read_plain` for the Response table that starts `table` bytes into `buf`."""
     vtable = table - _i32(buf, table)[0]
-    if _u16(buf, vtable)[0] != _PLAIN_VTABLE_SIZE:
+    size = _u16(buf, vtable)[0]
+    if size != _PLAIN_VTABLE_SIZE and (
+        size != _NESTED_VTABLE_SIZE or buf[vtable + 14 : vtable + 28] != _NO_SLOTS
+    ):
         return NOT_PLAIN
     is_error, _, _, kind_at, value_at = _response_slots(buf, vtable + 4)
     if is_error or not kind_at or not value_at:

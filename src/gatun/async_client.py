@@ -45,6 +45,7 @@ from gatun.callback_channel import (
 )
 from gatun.client import (
     _CALL_ENDED,
+    _FREE_CHUNK_SIZE,
     _OPEN_CALL_MEMORY,
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
@@ -487,10 +488,12 @@ class AsyncGatunClient(_ValueEncoder):
                 raise PayloadTooLargeError(len(data), max_command_size, "Command")
 
             # Release objects whose wrappers were garbage collected. A packed
-            # command carries them, a chunk at a time; for any other, and for
-            # a packed one with no room, they are round trips of their own.
+            # command carries them if they are one command's worth; a longer
+            # queue, any other command, and a packed one with no room send them
+            # in round trips of their own. The whole queue goes out every time
+            # (see GatunClient._send_raw).
             riding = None
-            if self._pending_frees and packed:
+            if packed and 0 < len(self._pending_frees) <= _FREE_CHUNK_SIZE:
                 ids = _take_free_chunk(self._pending_frees)
                 if len(data) + wire.free_ids_size(len(ids)) > max_command_size:
                     self._pending_frees.extendleft(reversed(ids))
@@ -512,7 +515,13 @@ class AsyncGatunClient(_ValueEncoder):
                     logger.debug("FreeObject for %d objects failed: %s", len(ids), e)
 
             if prepare is not None:
-                prepare()
+                try:
+                    prepare()
+                except BaseException:
+                    # Nothing was sent, the releases the command carries included
+                    if riding is not None:
+                        self._pending_frees.extendleft(reversed(riding))
+                    raise
             try:
                 response = await self._exchange(data, wait_for_response)
             except CancelledException:

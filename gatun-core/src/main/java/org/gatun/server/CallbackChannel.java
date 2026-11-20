@@ -186,14 +186,20 @@ final class CallbackChannel {
   void run() {
     // A platform thread, like the reader (see GatunServer.openCallbackChannel): every frame
     // to Python waits for this thread to wake
-    Thread writer = Thread.ofPlatform().daemon(true).name(name + "-writer").start(this::writeLoop);
+    // Started inside the try: if it cannot be (the process is at its limit of threads, an
+    // OutOfMemoryError), the channel must still be closed, or its callers wait for frames
+    // that nothing writes
+    Thread writer = null;
     try {
+      writer = Thread.ofPlatform().daemon(true).name(name + "-writer").start(this::writeLoop);
       readLoop();
-    } catch (IOException | RuntimeException e) {
+    } catch (IOException | RuntimeException | OutOfMemoryError e) {
       LOG.log(closed ? Level.FINE : Level.WARNING, name + " ended: " + e);
     } finally {
       close();
-      writer.interrupt();
+      if (writer != null) {
+        writer.interrupt();
+      }
     }
   }
 

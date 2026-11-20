@@ -337,9 +337,10 @@ public class GatunServer {
     // A session's thread spends its life blocked on its socket, and a platform thread wakes
     // from that in one step: the kernel makes it runnable. A virtual thread needs the poller
     // thread to notice the socket and then a carrier to be woken for it, which made every
-    // request about 30 microseconds slower. Sessions are few (gatun.limits.max_sessions), so
-    // a thread each costs little. A new thread per session, never a reused one: the session's
-    // thread-locals end with it.
+    // request about 30 microseconds slower. A program has a handful of sessions, so a thread
+    // each costs little, and a connection whose thread cannot be started is refused (see
+    // start()). A new thread per session, never a reused one: the session's thread-locals end
+    // with it.
     this.threadPool =
         Executors.newThreadPerTaskExecutor(
             Thread.ofPlatform().daemon(true).name("gatun-session-", 1).factory());
@@ -411,21 +412,33 @@ public class GatunServer {
           continue;
         }
         long sessionId = sessionCounter.incrementAndGet();
-        threadPool.submit(() -> {
-          if (!takeSessionSlot()) {
-            LOG.warning(
-                "Refused a connection: "
-                    + ResourceLimits.MAX_SESSIONS
-                    + " sessions are open (max_sessions)");
-            try {
-              client.close();
-            } catch (IOException e) {
-              // already gone
+        try {
+          threadPool.submit(() -> {
+            if (!takeSessionSlot()) {
+              LOG.warning(
+                  "Refused a connection: "
+                      + ResourceLimits.MAX_SESSIONS
+                      + " sessions are open (max_sessions)");
+              try {
+                client.close();
+              } catch (IOException e) {
+                // already gone
+              }
+              return;
             }
-            return;
+            handleClient(client, sessionId);
+          });
+        } catch (OutOfMemoryError | RuntimeException e) {
+          // No thread for it: the process is at its limit of threads, which the JVM reports
+          // as an OutOfMemoryError. Like running out of file descriptors above, that refuses
+          // this connection and must not end the sessions already running.
+          LOG.log(Level.WARNING, "Refused a connection: could not start its thread", e);
+          try {
+            client.close();
+          } catch (IOException closing) {
+            // already gone
           }
-          handleClient(client, sessionId);
-        });
+        }
       }
     }
   }
@@ -598,10 +611,19 @@ public class GatunServer {
     // Platform threads for the connection's reader (this one) and its writer, as for the
     // session: each is blocked on a socket or a queue between frames and every callback
     // waits for both to wake
-    Thread.ofPlatform()
-        .daemon(true)
-        .name("gatun-callbacks-" + sessionId)
-        .start(() -> serveCallbackConnection(ctx, listener, path));
+    try {
+      Thread.ofPlatform()
+          .daemon(true)
+          .name("gatun-callbacks-" + sessionId)
+          .start(() -> serveCallbackConnection(ctx, listener, path));
+    } catch (OutOfMemoryError e) {
+      // The process is at its limit of threads. The session goes on without the connection.
+      ctx.callbackListener = null;
+      listener.close();
+      deleteQuietly(path);
+      sessionFiles.remove(path);
+      throw new IOException("Could not start a thread for the callback connection", e);
+    }
     return path;
   }
 

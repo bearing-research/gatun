@@ -21,7 +21,8 @@ from gatun import (
     connect,
     wire,
 )
-from gatun.client import JavaObject, TypeHint
+from gatun.callback_channel import MAX_FRAME_SIZE
+from gatun.client import JavaObject, TypeHint, _nested_command
 from gatun.generated.org.gatun.protocol import (
     Action,
     BatchResponse,
@@ -173,7 +174,7 @@ class TestPackCommand:
 
     def test_a_command_past_the_command_zone_is_left_to_the_builder(self):
         """The builder writes fewer bytes for the same command, and may fit it in."""
-        fits = wire.pack_command(INVOKE, "add", 1, ("x" * 65_000,), ())
+        fits = wire.pack_command(INVOKE, "add", 1, ("x" * 64_500,), ())
         assert fits is not None and len(fits) <= wire.COMMAND_ZONE_SIZE
         assert wire.pack_command(INVOKE, "add", 1, ("x" * 65_400,), ()) is None
 
@@ -435,6 +436,39 @@ class TestReadPlain:
         Response.Start(builder)
         Response.AddReturnValType(builder, V.IntVal)
         Response.AddReturnVal(builder, value)
+        Response.AddCallbackId(builder, 4)
+        builder.Finish(Response.End(builder))
+
+        assert wire.read_plain(bytes(builder.Output()), None, as_pair) is wire.NOT_PLAIN
+
+    def test_a_reply_on_the_callback_connection_is_a_value_with_its_call_id(self):
+        builder = flatbuffers.Builder(256)
+        value = int_value(7)(builder)
+        Response.Start(builder)
+        Response.AddReturnValType(builder, V.IntVal)
+        Response.AddReturnVal(builder, value)
+        Response.AddCallId(builder, 4)
+        builder.Finish(Response.End(builder))
+
+        assert wire.read_plain(bytes(builder.Output()), None, as_pair) == 7
+
+    @pytest.mark.parametrize(
+        "add",
+        [
+            lambda b: Response.AddIsCallback(b, True),
+            lambda b: Response.AddCallbackId(b, 9),
+            lambda b: Response.AddIsError(b, True),
+            lambda b: Response.AddCallbackReleased(b, True),
+        ],
+        ids=["is_callback", "callback_id", "is_error", "callback_released"],
+    )
+    def test_a_call_id_with_anything_else_is_not_plain(self, add):
+        builder = flatbuffers.Builder(256)
+        value = int_value(7)(builder)
+        Response.Start(builder)
+        Response.AddReturnValType(builder, V.IntVal)
+        Response.AddReturnVal(builder, value)
+        add(builder)
         Response.AddCallId(builder, 4)
         builder.Finish(Response.End(builder))
 
@@ -664,6 +698,13 @@ class TestPackedCalls:
 
         assert items.get(0) == text
 
+    def test_a_packed_command_fits_the_frame_it_gets_inside_a_callback(self):
+        """There it travels wrapped, in a frame with the command zone's limit."""
+        for length in range(64_800, 65_536, 7):
+            data = wire.pack_command(INVOKE, "add", 5, ("x" * length,), (JavaObject,))
+            if data is not None:
+                assert len(_nested_command(1, data)) <= MAX_FRAME_SIZE
+
     def test_a_batch_that_only_the_builder_fits_in(self, client):
         items = client.create_object("java.util.ArrayList")
         commands = [(INVOKE, items.object_id, "add", (n,)) for n in range(800)]
@@ -764,10 +805,40 @@ class TestRidingReleases:
 
         del dropped
         gc.collect()
-        # Each command takes a chunk of 512 with it
-        for _ in range(3):
-            kept.size()
+        # More than one command carries: sent ahead of it, all of them
+        kept.size()
 
+        assert live_objects(client) == baseline
+
+    def test_a_request_that_is_not_sent_keeps_them_queued(
+        self, own_client, monkeypatch
+    ):
+        """Ending a loan comes first and can fail the request: cancel() may
+        catch that exchange."""
+        client = own_client
+        kept = client.create_object("java.util.ArrayList")
+        baseline = live_objects(client)
+        for _ in range(3):
+            client.create_object("java.util.ArrayList")
+        gc.collect()
+        kept.size()
+        dropped = client.create_objects([("java.util.ArrayList", ())] * 3)
+        del dropped
+        gc.collect()
+        assert len(client._pending_frees) == 3
+
+        def cancelled():
+            raise CancelledException("cancelled")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(client, "_flush_loan_ends", cancelled)
+            client._loan_ends.append(object())
+            with pytest.raises(CancelledException):
+                kept.size()
+            client._loan_ends.clear()
+
+        assert len(client._pending_frees) == 3
+        assert kept.size() == 0
         assert live_objects(client) == baseline
         assert requests_of(client, "FreeObject") == 0
 
@@ -843,6 +914,26 @@ class TestRidingReleases:
 
         assert requests_of(client, "FreeObject") == 1
         assert live_objects(client) == baseline
+
+    async def test_async_client_more_than_one_chunk(self):
+        client = await aconnect()
+        try:
+            kept = await client.create_object("java.util.ArrayList")
+            metrics = await client.get_metrics()
+            baseline = int(metrics.split("current_objects:")[1].split()[0])
+            dropped = [
+                await client.create_objects([("java.util.ArrayList", ())] * 400)
+                for _ in range(3)
+            ]
+            del dropped
+            gc.collect()
+
+            assert await kept.size() == 0
+
+            metrics = await client.get_metrics()
+            assert int(metrics.split("current_objects:")[1].split()[0]) == baseline
+        finally:
+            await client.close()
 
     async def test_async_client(self):
         client = await aconnect()
