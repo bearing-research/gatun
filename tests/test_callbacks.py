@@ -1539,6 +1539,29 @@ class TestJavaCallsInsideChannelCallbacks:
 
         assert client.jvm.OtherThread.call(supplier) == 4
 
+    def test_a_plain_answer_is_read_without_the_generated_classes(
+        self, client, monkeypatch
+    ):
+        parsed = []
+        parse = client._parse_response
+
+        def spy(resp):
+            parsed.append(resp)
+            return parse(resp)
+
+        Math = client.jvm.java.lang.Math
+        results = []
+        task = client.register_callback(
+            lambda: results.append(Math.max(3, 4)), "java.lang.Runnable"
+        )
+
+        with monkeypatch.context() as patched:
+            patched.setattr(client, "_parse_response", spy)
+            client.jvm.OtherThread.later(task, 0)
+            assert _eventually(lambda: results or None) == [4]
+
+        assert parsed == []
+
     def test_while_the_client_is_in_another_request(self, client):
         seen = []
 

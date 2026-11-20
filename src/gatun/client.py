@@ -25,6 +25,7 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from gatun.arena import PayloadArena, ScopedArenaContext
 
+from gatun import wire
 from gatun.callback_channel import (
     MAX_FRAME_SIZE,
     CallbackChannel,
@@ -65,8 +66,8 @@ from gatun.generated.org.gatun.protocol import Command as Cmd
 logger = logging.getLogger(__name__)
 
 
-# Object IDs released per FreeObject command. Each ID costs about 40 bytes, so a full
-# chunk stays well inside the 64KB command zone.
+# Object IDs released per command. Each ID is 8 bytes, so a full chunk takes a
+# small part of the 64KB command zone and leaves the command it rides on its room.
 _FREE_CHUNK_SIZE = 512
 
 _EPOCH_ORDINAL = datetime.date(1970, 1, 1).toordinal()
@@ -87,9 +88,7 @@ def _take_free_chunk(pending: deque[int]) -> list[int]:
     return ids
 
 
-def _build_free_command(
-    builder: flatbuffers.Builder, ids: list[int], answers_sent: int = 0
-) -> bytes:
+def _build_free_command(ids: list[int], answers_sent: int = 0) -> bytes:
     """Build a FreeObject command that releases every ID in one round trip.
 
     `answers_sent` is for a command that goes on the client's own channel: the
@@ -98,27 +97,7 @@ def _build_free_command(
     answers before it releases anything. Read the count after taking the IDs
     off the queue, never before.
     """
-    builder.Clear()
-    arg_offsets = []
-    for object_id in ids:
-        IntVal.Start(builder)
-        IntVal.AddV(builder, object_id)
-        val_off = IntVal.End(builder)
-        Argument.Start(builder)
-        Argument.AddValType(builder, Value.Value.IntVal)
-        Argument.AddVal(builder, val_off)
-        arg_offsets.append(Argument.End(builder))
-    Cmd.CommandStartArgsVector(builder, len(arg_offsets))
-    for offset in reversed(arg_offsets):
-        builder.PrependUOffsetTRelative(offset)
-    args_vec = builder.EndVector()
-    Cmd.CommandStart(builder)
-    Cmd.CommandAddAction(builder, Act.Action.FreeObject)
-    Cmd.CommandAddArgs(builder, args_vec)
-    if answers_sent:
-        Cmd.CommandAddAnswersSent(builder, answers_sent)
-    builder.Finish(Cmd.CommandEnd(builder))
-    return bytes(builder.Output())
+    return wire.pack_free(ids, answers_sent)
 
 
 def _encode_temporal(value: Any) -> tuple[int, int] | None:
@@ -181,7 +160,7 @@ def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int)
 PROTOCOL_VERSION = 5
 
 # Memory zone sizes - must match GatunServer.java constants
-COMMAND_ZONE_SIZE = 65536  # 64KB for commands
+COMMAND_ZONE_SIZE = wire.COMMAND_ZONE_SIZE  # 64KB for commands
 RESPONSE_ZONE_SIZE = 65536  # 64KB for responses
 
 # Maximum size for callback error messages to prevent exceeding command zone.
@@ -2623,8 +2602,6 @@ class GatunClient(_ValueEncoder):
         # another request, inside a callback, on another thread, at interpreter
         # exit), so it must never touch the socket or the command zone itself.
         self._pending_frees: deque[int] = deque()
-        # Dedicated builder, so flushing frees never disturbs a command being built
-        self._free_builder = flatbuffers.Builder(64)
 
         # One request/response exchange at a time. The channel carries a single
         # exchange, so threads sharing a client take turns. Re-entrant because
@@ -2816,11 +2793,17 @@ class GatunClient(_ValueEncoder):
 
         return ScopedArenaContext(self)
 
-    def _send_raw(self, data: bytes, expects_response: bool = True):
+    def _send_raw(
+        self, data: bytes, expects_response: bool = True, packed: bool = False
+    ):
         """Write a command to SHM, signal Java and return the parsed response.
 
         With expects_response=False the command is one-way: Java sends no reply and
         nothing is read. That is only true of CallbackResponse.
+
+        `packed` says the command came from `wire.pack_command`. Such a command
+        takes the queued object releases with it instead of waiting for a
+        round trip that sends them.
         """
         # 0a. Fail fast on a connection that cannot be used
         self._require_usable()
@@ -2848,16 +2831,54 @@ class GatunClient(_ValueEncoder):
                 return result
 
         with self._exchange_lock:
-            # 2. Release objects whose wrappers were garbage collected since the
-            # last request. This is a round trip of its own, so it has to finish
-            # before our own command goes into shared memory.
-            if self._pending_frees:
-                self._flush_pending_frees()
+            # 2. End the loans whose handles were garbage collected. Before the
+            # releases below: this step can fail the request, and by then no
+            # object ID may have left the queue for a command that is not sent.
             if self._loan_ends:
                 self._flush_loan_ends()
 
+            # 3. Release objects whose wrappers were garbage collected since the
+            # last request. A packed command carries them if they are one
+            # command's worth. A longer queue, any other command, and a packed
+            # one with no room send them in round trips of their own, which
+            # have to finish before our own command goes into shared memory.
+            # The whole queue goes out every time: a program that drops more
+            # handles per call than one command carries would otherwise leave
+            # Java holding more of them with every call.
+            riding = None
+            if self._pending_frees:
+                if packed and len(self._pending_frees) <= _FREE_CHUNK_SIZE:
+                    data, riding = self._with_pending_frees(data)
+                if riding is None:
+                    self._flush_pending_frees()
+
             self._write_command(data)
-            return self._read_response()
+            if riding is None:
+                return self._read_response()
+            try:
+                return self._read_response()
+            except CancelledException:
+                # The request may have been interrupted before the server got
+                # to them. It ignores an ID it has already released.
+                self._pending_frees.extend(riding)
+                raise
+
+    def _with_pending_frees(self, data: bytes) -> tuple[bytes, list[int] | None]:
+        """Add the queued object releases to a packed command.
+
+        Returns the command and the IDs it now carries, or the command as it
+        was and None if they do not fit beside it. The caller holds the channel.
+        """
+        ids = _take_free_chunk(self._pending_frees)
+        if not ids:
+            return data, None
+        if len(data) + wire.free_ids_size(len(ids)) > self.payload_offset:
+            self._pending_frees.extendleft(reversed(ids))
+            return data, None
+        # Read after the IDs were taken; see _build_free_command
+        channel = self._callback_channel
+        answers_sent = channel.answers_sent if channel is not None else 0
+        return wire.with_frees(data, ids, answers_sent), ids
 
     def _require_usable(self) -> None:
         if self._closed:
@@ -2891,6 +2912,9 @@ class GatunClient(_ValueEncoder):
             ) from None
         if reply is None:
             return False, None
+        value = wire.read_plain(reply, self, JavaObject)
+        if value is not wire.NOT_PLAIN:
+            return True, value
         resp = Response.Response.GetRootAsResponse(reply, 0)
         if resp.IsError() and resp.ErrorType() == _CALL_ENDED:
             # The Java thread gave up on the callback (it was interrupted) and
@@ -2955,7 +2979,6 @@ class GatunClient(_ValueEncoder):
         with another command.
         """
         frees = self._pending_frees
-        builder = self._free_builder
         while frees:
             ids = _take_free_chunk(frees)
             if not ids:
@@ -2963,9 +2986,15 @@ class GatunClient(_ValueEncoder):
 
             channel = self._callback_channel
             answers_sent = channel.answers_sent if channel is not None else 0
-            self._write_command(_build_free_command(builder, ids, answers_sent))
+            self._write_command(_build_free_command(ids, answers_sent))
             try:
                 self._read_response()
+            except CancelledException:
+                # cancel() caught this exchange and not the caller's request,
+                # which is cancelled all the same. The server may not have got
+                # to these, and it ignores an ID it has already released.
+                frees.extendleft(reversed(ids))
+                raise
             except JavaException as e:
                 # The server ignores unknown IDs, so this is unexpected, and it
                 # must not fail the caller's unrelated request.
@@ -2995,11 +3024,7 @@ class GatunClient(_ValueEncoder):
                 break
             channel = self._callback_channel
             answers_sent = channel.answers_sent if channel is not None else 0
-            self._write_command(
-                _build_free_command(
-                    self._free_builder, [record.object_id], answers_sent
-                )
-            )
+            self._write_command(_build_free_command([record.object_id], answers_sent))
             try:
                 self._read_response()
             except CancelledException:
@@ -3185,7 +3210,13 @@ class GatunClient(_ValueEncoder):
                     response_size=sz,
                 )
 
-            # 4. Parse FlatBuffer
+            # 4. A response that is one plain value, which most are, is read
+            # without the generated classes
+            value = wire.read_plain(resp_buf, self, JavaObject)
+            if value is not wire.NOT_PLAIN:
+                return value
+
+            # 5. Parse FlatBuffer
             resp = Response.Response.GetRootAsResponse(resp_buf, 0)
 
             # Check if this is a callback request from Java
@@ -3414,7 +3445,7 @@ class GatunClient(_ValueEncoder):
             if not ids:
                 return
             try:
-                channel.send(_build_free_command(flatbuffers.Builder(64), ids))
+                channel.send(_build_free_command(ids))
             except OSError:
                 # The connection is gone; the next request can still send them
                 frees.extend(ids)
@@ -3638,6 +3669,12 @@ class GatunClient(_ValueEncoder):
         return data
 
     def create_object(self, class_name, *args):
+        data = wire.pack_command(
+            Act.Action.CreateObject, class_name, 0, args, self._object_ref_types
+        )
+        if data is not None:
+            return self._send_raw(data, packed=True)
+
         builder = self._get_builder(large=True)
         cls_off = self._create_string(builder, class_name)
 
@@ -3667,6 +3704,12 @@ class GatunClient(_ValueEncoder):
         return self._send_raw(builder.Output())
 
     def invoke_method(self, obj_id, method_name, *args):
+        data = wire.pack_command(
+            Act.Action.InvokeMethod, method_name, obj_id, args, self._object_ref_types
+        )
+        if data is not None:
+            return self._send_raw(data, packed=True)
+
         builder = self._get_builder(large=True)
         meth_off = self._create_string(builder, method_name)
 
@@ -3708,9 +3751,20 @@ class GatunClient(_ValueEncoder):
             *args: Arguments to pass to the method
             return_object_ref: If True, return result as ObjectRef (no auto-conversion)
         """
-        builder = self._get_builder(large=True)
         # Format: "fully.qualified.ClassName.methodName"
         full_name = f"{class_name}.{method_name}"
+        data = wire.pack_command(
+            Act.Action.InvokeStaticMethod,
+            full_name,
+            0,
+            args,
+            self._object_ref_types,
+            return_object_ref,
+        )
+        if data is not None:
+            return self._send_raw(data, packed=True)
+
+        builder = self._get_builder(large=True)
         name_off = self._create_string(builder, full_name)
 
         # Build argument tables (must be done before Command)
@@ -3751,6 +3805,10 @@ class GatunClient(_ValueEncoder):
         if isinstance(obj_id, JavaObject):
             obj_id = obj_id.object_id
 
+        data = wire.pack_command(Act.Action.GetField, field_name, obj_id, (), ())
+        if data is not None:
+            return self._send_raw(data, packed=True)
+
         builder = self._get_builder()
         name_off = self._create_string(builder, field_name)
 
@@ -3773,6 +3831,12 @@ class GatunClient(_ValueEncoder):
         """
         if isinstance(obj_id, JavaObject):
             obj_id = obj_id.object_id
+
+        data = wire.pack_command(
+            Act.Action.SetField, field_name, obj_id, (value,), self._object_ref_types
+        )
+        if data is not None:
+            return self._send_raw(data, packed=True)
 
         builder = self._get_builder()
         name_off = self._create_string(builder, field_name)
@@ -3807,8 +3871,12 @@ class GatunClient(_ValueEncoder):
             >>> client.get_static_field("java.lang.Integer", "MAX_VALUE")
             2147483647
         """
-        builder = self._get_builder()
         full_name = f"{class_name}.{field_name}"
+        data = wire.pack_command(Act.Action.GetStaticField, full_name, 0, (), ())
+        if data is not None:
+            return self._send_raw(data, packed=True)
+
+        builder = self._get_builder()
         name_off = self._create_string(builder, full_name)
 
         Cmd.CommandStart(builder)
@@ -3912,6 +3980,10 @@ class GatunClient(_ValueEncoder):
             obj_id = obj.object_id
         else:
             obj_id = obj
+
+        data = wire.pack_command(Act.Action.IsInstanceOf, class_name, obj_id, (), ())
+        if data is not None:
+            return cast(bool, self._send_raw(data, packed=True))
 
         builder = self._get_builder()
         name_off = self._create_string(builder, class_name)
@@ -5069,9 +5141,9 @@ class GatunClient(_ValueEncoder):
     def batch(self, stop_on_error: bool = False) -> BatchContext:
         """Create a batch context for executing multiple commands in one round-trip.
 
-        Batching amortizes the per-call overhead (~100-150μs) across multiple
-        operations. Commands are queued locally and sent together when the
-        context exits or execute() is called.
+        A command sent on its own costs a round trip; in a batch it costs a
+        few microseconds. Commands are queued locally and sent together when
+        the context exits or execute() is called.
 
         Args:
             stop_on_error: If True, stop executing on first error.
@@ -5190,8 +5262,8 @@ class BatchContext:
     """Context manager for batching multiple commands into a single round-trip.
 
     Commands queued in a batch are sent together when execute() is called
-    (or automatically when exiting a context manager). This reduces per-call
-    overhead from ~100-150μs to ~10μs per operation.
+    (or automatically when exiting a context manager). An operation in a
+    batch costs a few microseconds instead of a round trip.
 
     Attributes:
         stop_on_error: If True, Java stops executing after first error.
@@ -5321,7 +5393,79 @@ class BatchContext:
         # client's shared builder.
         self._client._check_reentrancy()
 
-        # Build the batch command
+        # Nothing has been sent up to the exchange below, so a failure before it
+        # (an argument that cannot be encoded, say) leaves the batch as it was.
+        # From there on it counts as executed whatever happens: Java may have
+        # run some of it.
+        data = wire.pack_batch(
+            self._command_data, self._client._object_ref_types, self._stop_on_error
+        )
+        packed = data is not None
+        if data is None:
+            data = self._build()
+        if len(data) > self._client.payload_offset:
+            raise PayloadTooLargeError(
+                len(data), self._client.payload_offset, "Command"
+            )
+        call = _channel_call_of(self._client)
+        if call is not None:
+            # On the callback connection the command travels wrapped, in a
+            # frame with a limit of its own: refused here, it was not sent
+            _nested_command(call.call_id, data)
+
+        self._executed = True
+        try:
+            # The ordinary exchange: it serves callbacks that the batched calls
+            # trigger, and marks the connection dead if it is interrupted
+            batch_resp = self._client._send_raw(data, packed=packed)
+        except BaseException as e:
+            self._error = e
+            raise
+        finally:
+            self._targets.clear()
+        if not isinstance(batch_resp, BatchResponse.BatchResponse):
+            self._error = RuntimeError("Expected BatchResponse but got something else")
+            raise self._error
+
+        _ = batch_resp.ErrorIndex()  # Available for debugging
+        response_count = batch_resp.ResponsesLength()
+        # Most results are one plain value, read without the generated classes
+        plain = wire.batch_values(
+            batch_resp._tab.Bytes, batch_resp._tab.Pos, self._client, JavaObject
+        )
+
+        # Unpack each sub-response
+        for i in range(response_count):
+            if plain[i] is not wire.NOT_PLAIN:
+                self._results.append(plain[i])
+                continue
+            sub_resp = batch_resp.Responses(i)
+            if sub_resp.IsError():
+                error_msg = sub_resp.ErrorMsg().decode("utf-8")
+                error_type_bytes = sub_resp.ErrorType()
+                error_type = (
+                    error_type_bytes.decode("utf-8")
+                    if error_type_bytes
+                    else "java.lang.RuntimeException"
+                )
+                # Store exception object instead of raising
+                exc = self._make_exception(error_type, error_msg)
+                self._results.append(exc)
+            else:
+                value = self._client._unpack_value(
+                    sub_resp.ReturnValType(), sub_resp.ReturnVal()
+                )
+                self._results.append(value)
+
+        # Fill remaining slots with None if stopped early
+        while len(self._results) < len(self._command_data):
+            self._results.append(None)
+
+        return self._results
+
+    def _build(self) -> bytes:
+        """The batch command, made with the builder: for a batch with a command
+        that `wire.pack_batch` does not cover."""
         builder = self._client._get_builder(large=True)
 
         # Build all sub-commands first (must be done before BatchCommand)
@@ -5375,62 +5519,7 @@ class BatchContext:
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        # Nothing has been sent up to here, so a failure above (an argument that
-        # cannot be encoded, say) leaves the batch as it was. From here on it
-        # counts as executed whatever happens: Java may have run some of it.
-        data = builder.Output()
-        if len(data) > self._client.payload_offset:
-            raise PayloadTooLargeError(
-                len(data), self._client.payload_offset, "Command"
-            )
-        call = _channel_call_of(self._client)
-        if call is not None:
-            # On the callback connection the command travels wrapped, in a
-            # frame with a limit of its own: refused here, it was not sent
-            _nested_command(call.call_id, data)
-
-        self._executed = True
-        try:
-            # The ordinary exchange: it serves callbacks that the batched calls
-            # trigger, and marks the connection dead if it is interrupted
-            batch_resp = self._client._send_raw(data)
-        except BaseException as e:
-            self._error = e
-            raise
-        finally:
-            self._targets.clear()
-        if not isinstance(batch_resp, BatchResponse.BatchResponse):
-            self._error = RuntimeError("Expected BatchResponse but got something else")
-            raise self._error
-
-        _ = batch_resp.ErrorIndex()  # Available for debugging
-        response_count = batch_resp.ResponsesLength()
-
-        # Unpack each sub-response
-        for i in range(response_count):
-            sub_resp = batch_resp.Responses(i)
-            if sub_resp.IsError():
-                error_msg = sub_resp.ErrorMsg().decode("utf-8")
-                error_type_bytes = sub_resp.ErrorType()
-                error_type = (
-                    error_type_bytes.decode("utf-8")
-                    if error_type_bytes
-                    else "java.lang.RuntimeException"
-                )
-                # Store exception object instead of raising
-                exc = self._make_exception(error_type, error_msg)
-                self._results.append(exc)
-            else:
-                value = self._client._unpack_value(
-                    sub_resp.ReturnValType(), sub_resp.ReturnVal()
-                )
-                self._results.append(value)
-
-        # Fill remaining slots with None if stopped early
-        while len(self._results) < len(self._command_data):
-            self._results.append(None)
-
-        return self._results
+        return bytes(builder.Output())
 
     def _make_exception(self, error_type: str, error_msg: str) -> Exception:
         """Create an exception object without raising it."""

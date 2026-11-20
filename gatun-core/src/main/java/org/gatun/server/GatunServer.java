@@ -334,7 +334,16 @@ public class GatunServer {
     this.socketPath = Path.of(socketPathStr);
     this.memorySize = memorySize;
     this.responseOffset = memorySize - RESPONSE_ZONE_SIZE;
-    this.threadPool = Executors.newVirtualThreadPerTaskExecutor();
+    // A session's thread spends its life blocked on its socket, and a platform thread wakes
+    // from that in one step: the kernel makes it runnable. A virtual thread needs the poller
+    // thread to notice the socket and then a carrier to be woken for it, which made every
+    // request about 30 microseconds slower. A program has a handful of sessions, so a thread
+    // each costs little, and a connection whose thread cannot be started is refused (see
+    // start()). A new thread per session, never a reused one: the session's thread-locals end
+    // with it.
+    this.threadPool =
+        Executors.newThreadPerTaskExecutor(
+            Thread.ofPlatform().daemon(true).name("gatun-session-", 1).factory());
     // Large Arrow buffers come from a pool of the server's own (see ArrowBlockPool)
     this.arrowPool = ArrowBlockPool.fromProperties(memorySize);
     this.allocator =
@@ -403,21 +412,33 @@ public class GatunServer {
           continue;
         }
         long sessionId = sessionCounter.incrementAndGet();
-        threadPool.submit(() -> {
-          if (!takeSessionSlot()) {
-            LOG.warning(
-                "Refused a connection: "
-                    + ResourceLimits.MAX_SESSIONS
-                    + " sessions are open (max_sessions)");
-            try {
-              client.close();
-            } catch (IOException e) {
-              // already gone
+        try {
+          threadPool.submit(() -> {
+            if (!takeSessionSlot()) {
+              LOG.warning(
+                  "Refused a connection: "
+                      + ResourceLimits.MAX_SESSIONS
+                      + " sessions are open (max_sessions)");
+              try {
+                client.close();
+              } catch (IOException e) {
+                // already gone
+              }
+              return;
             }
-            return;
+            handleClient(client, sessionId);
+          });
+        } catch (OutOfMemoryError | RuntimeException e) {
+          // No thread for it: the process is at its limit of threads, which the JVM reports
+          // as an OutOfMemoryError. Like running out of file descriptors above, that refuses
+          // this connection and must not end the sessions already running.
+          LOG.log(Level.WARNING, "Refused a connection: could not start its thread", e);
+          try {
+            client.close();
+          } catch (IOException closing) {
+            // already gone
           }
-          handleClient(client, sessionId);
-        });
+        }
       }
     }
   }
@@ -587,9 +608,22 @@ public class GatunServer {
     }
     sessionFiles.add(path);
     ctx.callbackListener = listener;
-    Thread.ofVirtual()
-        .name("gatun-callbacks-" + sessionId)
-        .start(() -> serveCallbackConnection(ctx, listener, path));
+    // Platform threads for the connection's reader (this one) and its writer, as for the
+    // session: each is blocked on a socket or a queue between frames and every callback
+    // waits for both to wake
+    try {
+      Thread.ofPlatform()
+          .daemon(true)
+          .name("gatun-callbacks-" + sessionId)
+          .start(() -> serveCallbackConnection(ctx, listener, path));
+    } catch (OutOfMemoryError e) {
+      // The process is at its limit of threads. The session goes on without the connection.
+      ctx.callbackListener = null;
+      listener.close();
+      deleteQuietly(path);
+      sessionFiles.remove(path);
+      throw new IOException("Could not start a thread for the callback connection", e);
+    }
     return path;
   }
 
@@ -946,6 +980,13 @@ public class GatunServer {
         control.beginRequest();
         try {
           checkArgumentCount(cmd.argsLength());
+          if (cmd.action() == Action.FreeObject || cmd.freeIdsLength() > 0) {
+            awaitAnswersBefore(cmd);
+          }
+          if (cmd.action() != Action.FreeObject) {
+            // Handles the client dropped since its last command, released before this one runs
+            freeRiding(cmd, sessionObjectIds, quota);
+          }
 
           if (cmd.action() == Action.CreateObject) {
             String className = cmd.targetName();
@@ -987,7 +1028,6 @@ public class GatunServer {
             LOG.fine("Created object ID " + newId + " of type " + className);
 
           } else if (cmd.action() == Action.FreeObject) {
-            awaitAnswersBefore(cmd);
             freeObjects(cmd, sessionObjectIds, quota);
             result = null;
           } else if (cmd.action() == Action.InvokeMethod) {
@@ -1555,11 +1595,12 @@ public class GatunServer {
   }
 
   /**
-   * Handle FreeObject. The object ID is in target_id, or, to release many objects in one round
-   * trip, the IDs are passed as integer args and target_id is ignored. Unknown and already-freed
-   * IDs are ignored.
+   * Handle FreeObject. The clients send the IDs in free_ids; one ID in target_id, or several as
+   * integer args with target_id ignored, are accepted as well. Unknown and already-freed IDs are
+   * ignored.
    */
   private void freeObjects(Command cmd, Set<Long> sessionObjectIds, SessionQuota quota) {
+    freeRiding(cmd, sessionObjectIds, quota);
     int idCount = cmd.argsLength();
     if (idCount == 0) {
       freeObject(cmd.targetId(), sessionObjectIds, quota);
@@ -1572,6 +1613,16 @@ public class GatunServer {
         arg.val(iv);
         freeObject(iv.v(), sessionObjectIds, quota);
       }
+    }
+  }
+
+  /**
+   * Release the objects a command names in {@code free_ids}. Any command may carry them: a handle
+   * the client dropped is released with its next command instead of a round trip of its own.
+   */
+  private void freeRiding(Command cmd, Set<Long> sessionObjectIds, SessionQuota quota) {
+    for (int i = 0, count = cmd.freeIdsLength(); i < count; i++) {
+      freeObject(cmd.freeIds(i), sessionObjectIds, quota);
     }
   }
 

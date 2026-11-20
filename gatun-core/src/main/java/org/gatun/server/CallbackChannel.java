@@ -61,7 +61,7 @@ final class CallbackChannel {
   private final BlockingQueue<ByteBuffer> outbox = new LinkedBlockingQueue<>();
   private volatile boolean closed;
 
-  // A lock, not a monitor: the waiters are virtual threads
+  // A lock with a condition: awaitAnswers waits with a time limit
   private final ReentrantLock answersLock = new ReentrantLock();
   private final Condition answersChanged = answersLock.newCondition();
   private long answersDecoded; // guarded by answersLock
@@ -184,14 +184,22 @@ final class CallbackChannel {
 
   /** Serve the connection on the calling thread until it ends, then close it. */
   void run() {
-    Thread writer = Thread.ofVirtual().name(name + "-writer").start(this::writeLoop);
+    // A platform thread, like the reader (see GatunServer.openCallbackChannel): every frame
+    // to Python waits for this thread to wake
+    // Started inside the try: if it cannot be (the process is at its limit of threads, an
+    // OutOfMemoryError), the channel must still be closed, or its callers wait for frames
+    // that nothing writes
+    Thread writer = null;
     try {
+      writer = Thread.ofPlatform().daemon(true).name(name + "-writer").start(this::writeLoop);
       readLoop();
-    } catch (IOException | RuntimeException e) {
+    } catch (IOException | RuntimeException | OutOfMemoryError e) {
       LOG.log(closed ? Level.FINE : Level.WARNING, name + " ended: " + e);
     } finally {
       close();
-      writer.interrupt();
+      if (writer != null) {
+        writer.interrupt();
+      }
     }
   }
 

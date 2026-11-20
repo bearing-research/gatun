@@ -317,6 +317,10 @@ table Command {
   callback_methods: [string];
   // For Action.ArrowToObject
   arrow_form: ArrowForm;
+  // On any command: objects to release before it runs. A handle the client dropped is
+  // released with its next command, not with a round trip of its own. answers_sent goes
+  // with these as it does with FreeObject.
+  free_ids: [long];
 }
 
 // Batch of commands to execute sequentially

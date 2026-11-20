@@ -37,6 +37,7 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from gatun.arena import AsyncScopedArenaContext
 
+from gatun import wire
 from gatun.callback_channel import (
     AsyncCallbackChannel,
     AsyncChannelCall,
@@ -44,6 +45,7 @@ from gatun.callback_channel import (
 )
 from gatun.client import (
     _CALL_ENDED,
+    _FREE_CHUNK_SIZE,
     _OPEN_CALL_MEMORY,
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
@@ -52,6 +54,7 @@ from gatun.client import (
     PROTOCOL_VERSION,
     RESPONSE_ZONE_SIZE,
     CallbackTimeoutError,
+    CancelledException,
     DeadConnectionError,
     JavaException,
     JavaObject,
@@ -341,7 +344,6 @@ class AsyncGatunClient(_ValueEncoder):
 
         # IDs of collected AsyncJavaObjects, released ahead of the next request
         self._pending_frees: deque[int] = deque()
-        self._free_builder = flatbuffers.Builder(64)
 
         # What the server said each dotted path is (class, method, field)
         self._reflect_cache: _LRUCache[str] = _LRUCache(1024)
@@ -453,6 +455,7 @@ class AsyncGatunClient(_ValueEncoder):
         expects_response: bool = True,
         prepare: Callable[[], None] | None = None,
         finish: Callable[[Any], Any] | None = None,
+        packed: bool = False,
     ):
         """Write command to SHM and signal Java asynchronously.
 
@@ -461,6 +464,10 @@ class AsyncGatunClient(_ValueEncoder):
         carries data in the payload zone must touch the zone only from there:
         another task's request can run before the lock is taken or after it is
         released, and it uses the same zone.
+
+        `packed` says the command came from `wire.pack_command`. Such a command
+        takes the queued object releases with it instead of waiting for a
+        round trip that sends them.
         """
         self._require_usable(expects_response)
 
@@ -480,23 +487,49 @@ class AsyncGatunClient(_ValueEncoder):
             if len(data) > max_command_size:
                 raise PayloadTooLargeError(len(data), max_command_size, "Command")
 
-            # Release objects whose wrappers were garbage collected
-            while self._pending_frees:
+            # Release objects whose wrappers were garbage collected. A packed
+            # command carries them if they are one command's worth; a longer
+            # queue, any other command, and a packed one with no room send them
+            # in round trips of their own. The whole queue goes out every time
+            # (see GatunClient._send_raw).
+            riding = None
+            if packed and 0 < len(self._pending_frees) <= _FREE_CHUNK_SIZE:
+                ids = _take_free_chunk(self._pending_frees)
+                if len(data) + wire.free_ids_size(len(ids)) > max_command_size:
+                    self._pending_frees.extendleft(reversed(ids))
+                elif ids:
+                    # Read after the IDs were taken; see _build_free_command
+                    channel = self._callback_channel
+                    answers_sent = channel.answers_sent if channel is not None else 0
+                    data = wire.with_frees(data, ids, answers_sent)
+                    riding = ids
+            while riding is None and self._pending_frees:
                 ids = _take_free_chunk(self._pending_frees)
                 if not ids:
                     break
                 channel = self._callback_channel
                 answers_sent = channel.answers_sent if channel is not None else 0
                 try:
-                    await self._exchange(
-                        _build_free_command(self._free_builder, ids, answers_sent)
-                    )
+                    await self._exchange(_build_free_command(ids, answers_sent))
                 except JavaException as e:
                     logger.debug("FreeObject for %d objects failed: %s", len(ids), e)
 
             if prepare is not None:
-                prepare()
-            response = await self._exchange(data, wait_for_response)
+                try:
+                    prepare()
+                except BaseException:
+                    # Nothing was sent, the releases the command carries included
+                    if riding is not None:
+                        self._pending_frees.extendleft(reversed(riding))
+                    raise
+            try:
+                response = await self._exchange(data, wait_for_response)
+            except CancelledException:
+                # The request may have been interrupted before the server got
+                # to them. It ignores an ID it has already released.
+                if riding is not None:
+                    self._pending_frees.extend(riding)
+                raise
             if wait_for_response:
                 return finish(response) if finish is not None else response
 
@@ -573,6 +606,9 @@ class AsyncGatunClient(_ValueEncoder):
             ) from None
         if reply is None:
             return False, None
+        value = wire.read_plain(reply, self, AsyncJavaObject)
+        if value is not wire.NOT_PLAIN:
+            return True, value
         resp = Response.Response.GetRootAsResponse(reply, 0)
         if resp.IsError() and resp.ErrorType() == _CALL_ENDED:
             # The Java thread gave up on the callback (it was interrupted) and
@@ -643,6 +679,12 @@ class AsyncGatunClient(_ValueEncoder):
             # Read response from shared memory
             self.shm.seek(self.response_offset)
             response_data = self.shm.read(response_len)
+
+            # A response that is one plain value, which most are, is read
+            # without the generated classes
+            value = wire.read_plain(response_data, self, AsyncJavaObject)
+            if value is not wire.NOT_PLAIN:
+                return value
 
             # Parse response
             resp = Response.Response.GetRootAsResponse(response_data, 0)
@@ -813,7 +855,7 @@ class AsyncGatunClient(_ValueEncoder):
             if not ids:
                 return
             try:
-                await channel.send(_build_free_command(flatbuffers.Builder(64), ids))
+                await channel.send(_build_free_command(ids))
             except OSError:
                 # The connection is gone; the next request can still send them
                 frees.extend(ids)
@@ -939,6 +981,12 @@ class AsyncGatunClient(_ValueEncoder):
 
     async def create_object(self, class_name: str, *args) -> AsyncJavaObject:
         """Create a new Java object asynchronously."""
+        data = wire.pack_command(
+            Act.Action.CreateObject, class_name, 0, args, self._object_ref_types
+        )
+        if data is not None:
+            return cast(AsyncJavaObject, await self._send_raw(data, packed=True))
+
         builder = flatbuffers.Builder(1024)
         name_off = builder.CreateString(class_name)
 
@@ -968,6 +1016,12 @@ class AsyncGatunClient(_ValueEncoder):
         if isinstance(obj_id, (JavaObject, AsyncJavaObject)):
             obj_id = obj_id.object_id
 
+        data = wire.pack_command(
+            Act.Action.InvokeMethod, method_name, obj_id, args, self._object_ref_types
+        )
+        if data is not None:
+            return await self._send_raw(data, packed=True)
+
         builder = flatbuffers.Builder(1024)
         name_off = builder.CreateString(method_name)
 
@@ -995,8 +1049,14 @@ class AsyncGatunClient(_ValueEncoder):
 
     async def invoke_static_method(self, class_name: str, method_name: str, *args):
         """Invoke a static method on a class asynchronously."""
-        builder = flatbuffers.Builder(1024)
         full_name = f"{class_name}.{method_name}"
+        data = wire.pack_command(
+            Act.Action.InvokeStaticMethod, full_name, 0, args, self._object_ref_types
+        )
+        if data is not None:
+            return await self._send_raw(data, packed=True)
+
+        builder = flatbuffers.Builder(1024)
         name_off = builder.CreateString(full_name)
 
         arg_offsets = []
@@ -1025,6 +1085,10 @@ class AsyncGatunClient(_ValueEncoder):
         if isinstance(obj_id, (JavaObject, AsyncJavaObject)):
             obj_id = obj_id.object_id
 
+        data = wire.pack_command(Act.Action.GetField, field_name, obj_id, (), ())
+        if data is not None:
+            return await self._send_raw(data, packed=True)
+
         builder = flatbuffers.Builder(256)
         name_off = builder.CreateString(field_name)
 
@@ -1041,6 +1105,12 @@ class AsyncGatunClient(_ValueEncoder):
         """Set a field value on a Java object asynchronously."""
         if isinstance(obj_id, (JavaObject, AsyncJavaObject)):
             obj_id = obj_id.object_id
+
+        data = wire.pack_command(
+            Act.Action.SetField, field_name, obj_id, (value,), self._object_ref_types
+        )
+        if data is not None:
+            return await self._send_raw(data, packed=True)
 
         builder = flatbuffers.Builder(256)
         name_off = builder.CreateString(field_name)
@@ -1077,6 +1147,10 @@ class AsyncGatunClient(_ValueEncoder):
             obj_id = obj.object_id
         else:
             obj_id = obj
+
+        data = wire.pack_command(Act.Action.IsInstanceOf, class_name, obj_id, (), ())
+        if data is not None:
+            return cast(bool, await self._send_raw(data, packed=True))
 
         builder = flatbuffers.Builder(256)
         name_off = builder.CreateString(class_name)
@@ -1432,8 +1506,13 @@ class AsyncGatunClient(_ValueEncoder):
 
     async def get_static_field(self, class_name: str, field_name: str):
         """Get a static field value from a Java class."""
+        full_name = f"{class_name}.{field_name}"
+        data = wire.pack_command(Act.Action.GetStaticField, full_name, 0, (), ())
+        if data is not None:
+            return await self._send_raw(data, packed=True)
+
         builder = flatbuffers.Builder(256)
-        name_off = builder.CreateString(f"{class_name}.{field_name}")
+        name_off = builder.CreateString(full_name)
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.GetStaticField)
         Cmd.CommandAddTargetName(builder, name_off)
