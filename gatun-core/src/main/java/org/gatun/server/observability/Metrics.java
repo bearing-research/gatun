@@ -45,6 +45,9 @@ public class Metrics {
   private final AtomicLong peakObjectCount = new AtomicLong(0);
   private final AtomicLong currentSessionCount = new AtomicLong(0);
 
+  // Lines about the server's pool of Arrow memory, from the server that has one
+  private volatile java.util.function.Supplier<String> arrowPoolReport;
+
   // Timestamp for rate calculations
   private final long startTimeNanos = System.nanoTime();
 
@@ -167,6 +170,11 @@ public class Metrics {
     return totalCallbackErrors.sum();
   }
 
+  /** Have {@link #report} include what the server's pool of Arrow memory says about itself. */
+  public void setArrowPoolReport(java.util.function.Supplier<String> report) {
+    this.arrowPoolReport = report;
+  }
+
   /** Format all metrics as a human-readable report. */
   public String report() {
     StringBuilder sb = new StringBuilder();
@@ -185,6 +193,10 @@ public class Metrics {
     sb.append("\nArrow:\n");
     sb.append(String.format("  total_rows: %d\n", getTotalArrowRows()));
     sb.append(String.format("  total_bytes_copied: %d\n", getTotalBytesCopied()));
+    java.util.function.Supplier<String> pool = arrowPoolReport;
+    if (pool != null) {
+      sb.append(pool.get());
+    }
 
     // Callback stats
     sb.append("\nCallbacks:\n");
