@@ -4,7 +4,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
-import org.gatun.protocol.Action;
 
 /**
  * Collects and exposes metrics for monitoring Gatun server performance.
@@ -206,7 +205,7 @@ public class Metrics {
     // Per-action stats
     sb.append("\nPer-Action Latency (microseconds):\n");
     for (byte action : requestCounts.keySet()) {
-      String actionName = getActionName(action);
+      String actionName = RequestContext.actionName(action);
       long count = getRequestCount(action);
       long errors = getErrorCount(action);
       long p50 = getLatencyPercentile(action, 0.50);
@@ -218,40 +217,6 @@ public class Metrics {
     }
 
     return sb.toString();
-  }
-
-  /** Get action name for display. */
-  private static String getActionName(byte action) {
-    return switch (action) {
-      case Action.CreateObject -> "CreateObject";
-      case Action.FreeObject -> "FreeObject";
-      case Action.InvokeMethod -> "InvokeMethod";
-      case Action.InvokeStaticMethod -> "InvokeStaticMethod";
-      case Action.GetField -> "GetField";
-      case Action.SetField -> "SetField";
-      case Action.GetStaticField -> "GetStaticField";
-      case Action.SetStaticField -> "SetStaticField";
-      case Action.SendArrowBatch -> "SendArrowBatch";
-      case Action.SendArrowBuffers -> "SendArrowBuffers";
-      case Action.GetArrowData -> "GetArrowData";
-      case Action.ResetPayloadArena -> "ResetPayloadArena";
-      case Action.RegisterCallback -> "RegisterCallback";
-      case Action.UnregisterCallback -> "UnregisterCallback";
-      case Action.Cancel -> "Cancel";
-      case Action.IsInstanceOf -> "IsInstanceOf";
-      case Action.Reflect -> "Reflect";
-      case Action.GetFields -> "GetFields";
-      case Action.InvokeMethods -> "InvokeMethods";
-      case Action.CreateObjects -> "CreateObjects";
-      case Action.Batch -> "Batch";
-      case Action.GetMetrics -> "GetMetrics";
-      case Action.ArrowToObject -> "ArrowToObject";
-      case Action.ArrowFromObject -> "ArrowFromObject";
-      case Action.OpenCallbackChannel -> "OpenCallbackChannel";
-      case Action.NestedCommand -> "NestedCommand";
-      case Action.OpenCallMemory -> "OpenCallMemory";
-      default -> "Unknown(" + action + ")";
-    };
   }
 
   /**

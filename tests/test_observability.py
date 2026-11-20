@@ -144,6 +144,17 @@ class TestMetricsPerAction:
         # Should see InvokeMethod in the per-action stats
         assert "InvokeMethod:" in metrics
 
+    def test_every_action_is_reported_by_name(self, client):
+        """No action shows up as a number: Ping, action 0, was `Unknown(0)`."""
+        client.ping()
+        client.get_static_field("java.lang.Integer", "MAX_VALUE")
+
+        metrics = client.get_metrics()
+
+        assert "  Ping: count=" in metrics
+        assert "  GetStaticField: count=" in metrics
+        assert "Unknown(" not in metrics
+
 
 class TestMetricsWithTracing:
     """Test metrics with tracing enabled."""

@@ -55,7 +55,7 @@ public class GatunServer {
   // Protocol version - increment when making breaking changes to the protocol
   // Version 2: Per-client shared memory (handshake includes SHM path)
   // Version 4: Callback connection (Action.OpenCallbackChannel, call_id)
-  public static final int PROTOCOL_VERSION = 4;
+  public static final int PROTOCOL_VERSION = 5;
 
   private static final Set<PosixFilePermission> OWNER_ONLY =
       PosixFilePermissions.fromString("rw-------");
@@ -2082,129 +2082,21 @@ public class GatunServer {
       // Use actual object type for better overload resolution
       type = value.getClass();
     } else if (valType == Value.ListVal) {
-      // Convert Python list to Java ArrayList
-      // Use fast path for homogeneous lists (all elements same type)
-      ListVal lv = (ListVal) arg.val(new ListVal());
-      int len = lv.itemsLength();
-      // Check collection size limit
-      ResourceLimits.checkCollectionSize(len);
-      java.util.ArrayList<Object> list = new java.util.ArrayList<>(len);
-
-      if (len > 0) {
-        // Check first element type to determine if we can use fast path
-        Argument first = lv.items(0);
-        byte firstType = first.valType();
-
-        // Fast paths for common homogeneous list types
-        if (firstType == Value.StringVal) {
-          // Try homogeneous string list
-          boolean allStrings = true;
-          for (int i = 1; i < len && allStrings; i++) {
-            if (lv.items(i).valType() != Value.StringVal) allStrings = false;
-          }
-          if (allStrings) {
-            StringVal sv = tempStringVal.get();
-            for (int i = 0; i < len; i++) {
-              lv.items(i).val(sv);
-              String element = sv.v();
-              ResourceLimits.checkStringLength(element);
-              list.add(element);
-            }
-          } else {
-            // Fall back to per-element conversion
-            for (int i = 0; i < len; i++) {
-              Object[] converted = convertArgument(lv.items(i));
-              list.add(converted[0]);
-            }
-          }
-        } else if (firstType == Value.IntVal) {
-          // Try homogeneous int/long list
-          boolean allInts = true;
-          for (int i = 1; i < len && allInts; i++) {
-            if (lv.items(i).valType() != Value.IntVal) allInts = false;
-          }
-          if (allInts) {
-            // One element type for the whole list: Integer if every value fits, otherwise
-            // Long. Choosing per element gave Java code a List that was neither.
-            IntVal iv = tempIntVal.get();
-            boolean fitsInt = true;
-            for (int i = 0; i < len && fitsInt; i++) {
-              lv.items(i).val(iv);
-              long longVal = iv.v();
-              fitsInt = longVal >= Integer.MIN_VALUE && longVal <= Integer.MAX_VALUE;
-            }
-            for (int i = 0; i < len; i++) {
-              lv.items(i).val(iv);
-              if (fitsInt) {
-                list.add((int) iv.v());
-              } else {
-                list.add(iv.v());
-              }
-            }
-          } else {
-            for (int i = 0; i < len; i++) {
-              Object[] converted = convertArgument(lv.items(i));
-              list.add(converted[0]);
-            }
-          }
-        } else if (firstType == Value.DoubleVal) {
-          // Try homogeneous double list
-          boolean allDoubles = true;
-          for (int i = 1; i < len && allDoubles; i++) {
-            if (lv.items(i).valType() != Value.DoubleVal) allDoubles = false;
-          }
-          if (allDoubles) {
-            DoubleVal dv = tempDoubleVal.get();
-            for (int i = 0; i < len; i++) {
-              lv.items(i).val(dv);
-              list.add(dv.v());
-            }
-          } else {
-            for (int i = 0; i < len; i++) {
-              Object[] converted = convertArgument(lv.items(i));
-              list.add(converted[0]);
-            }
-          }
-        } else if (firstType == Value.ObjectRef) {
-          // Try homogeneous object ref list
-          boolean allRefs = true;
-          for (int i = 1; i < len && allRefs; i++) {
-            if (lv.items(i).valType() != Value.ObjectRef) allRefs = false;
-          }
-          if (allRefs) {
-            ObjectRef ref = tempObjectRef.get();
-            for (int i = 0; i < len; i++) {
-              lv.items(i).val(ref);
-              list.add(requireSessionObject(ref.id()));
-            }
-          } else {
-            for (int i = 0; i < len; i++) {
-              Object[] converted = convertArgument(lv.items(i));
-              list.add(converted[0]);
-            }
-          }
-        } else {
-          // Other types or mixed: use generic conversion
-          for (int i = 0; i < len; i++) {
-            Object[] converted = convertArgument(lv.items(i));
-            list.add(converted[0]);
-          }
-        }
-      }
-      value = list;
+      // One element type for a list of integers: Integer if every value fits, otherwise Long.
+      // Choosing per element gave Java code a List that was neither.
+      value = convertListVal((ListVal) arg.val(new ListVal()), true);
       type = java.util.ArrayList.class;
     } else if (valType == Value.MapVal) {
-      // Convert Python dict to Java HashMap
       MapVal mv = (MapVal) arg.val(new MapVal());
-      int mapSize = mv.entriesLength();
-      // Check collection size limit
-      ResourceLimits.checkCollectionSize(mapSize);
+      List<Object> keys = mv.keys() == null ? List.of() : convertListVal(mv.keys(), false);
+      List<Object> values = mv.values() == null ? List.of() : convertListVal(mv.values(), false);
+      if (keys.size() != values.size()) {
+        throw new IllegalArgumentException(
+            "A map with " + keys.size() + " keys and " + values.size() + " values");
+      }
       java.util.HashMap<Object, Object> map = new java.util.HashMap<>();
-      for (int i = 0; i < mapSize; i++) {
-        MapEntry entry = mv.entries(i);
-        Object[] keyConverted = convertArgument(entry.key());
-        Object[] valConverted = convertArgument(entry.value());
-        map.put(keyConverted[0], valConverted[0]);
+      for (int i = 0; i < keys.size(); i++) {
+        map.put(keys.get(i), values.get(i));
       }
       value = map;
       type = java.util.HashMap.class;
@@ -2291,6 +2183,99 @@ public class GatunServer {
         }
       }
     };
+  }
+
+  /**
+   * The elements of a ListVal, whichever form it travels in.
+   *
+   * @param oneIntegerType for a list of integers: all Integer if every value fits in an int and all
+   *     Long otherwise. Without it each value is an Integer if it fits, as a single integer
+   *     argument is (the keys and values of a map).
+   */
+  private java.util.ArrayList<Object> convertListVal(ListVal lv, boolean oneIntegerType) {
+    int len = lv.longsLength();
+    if (len > 0) {
+      ResourceLimits.checkCollectionSize(len);
+      java.util.ArrayList<Object> list = new java.util.ArrayList<>(len);
+      boolean allFit = true;
+      for (int i = 0; i < len && allFit; i++) {
+        allFit = fitsInt(lv.longs(i));
+      }
+      for (int i = 0; i < len; i++) {
+        long v = lv.longs(i);
+        if (allFit || (!oneIntegerType && fitsInt(v))) {
+          list.add((int) v);
+        } else {
+          list.add(v);
+        }
+      }
+      return list;
+    }
+    len = lv.doublesLength();
+    if (len > 0) {
+      ResourceLimits.checkCollectionSize(len);
+      java.util.ArrayList<Object> list = new java.util.ArrayList<>(len);
+      for (int i = 0; i < len; i++) {
+        list.add(lv.doubles(i));
+      }
+      return list;
+    }
+    len = lv.boolsLength();
+    if (len > 0) {
+      ResourceLimits.checkCollectionSize(len);
+      java.util.ArrayList<Object> list = new java.util.ArrayList<>(len);
+      for (int i = 0; i < len; i++) {
+        list.add(lv.bools(i));
+      }
+      return list;
+    }
+    len = lv.stringLengthsLength();
+    if (len > 0) {
+      ResourceLimits.checkCollectionSize(len);
+      java.util.ArrayList<Object> list = new java.util.ArrayList<>(len);
+      int total = lv.stringBytesLength();
+      byte[] bytes = new byte[total];
+      if (total > 0) {
+        lv.stringBytesAsByteBuffer().get(bytes);
+      }
+      int at = 0;
+      for (int i = 0; i < len; i++) {
+        int n = lv.stringLengths(i);
+        if (n < 0 || n > total - at) {
+          throw new IllegalArgumentException("A list of strings whose lengths exceed its bytes");
+        }
+        String element = new String(bytes, at, n, java.nio.charset.StandardCharsets.UTF_8);
+        ResourceLimits.checkStringLength(element);
+        list.add(element);
+        at += n;
+      }
+      return list;
+    }
+    len = lv.itemsLength();
+    ResourceLimits.checkCollectionSize(len);
+    java.util.ArrayList<Object> list = new java.util.ArrayList<>(len);
+    for (int i = 0; i < len; i++) {
+      list.add(convertArgument(lv.items(i))[0]);
+    }
+    if (oneIntegerType && len > 0) {
+      // Integers that came one by one (an IntEnum, a subclass of int) follow the same rule,
+      // unless a type hint chose the type of one of them
+      boolean integers = true;
+      boolean allFit = true;
+      for (int i = 0; i < len && integers; i++) {
+        Argument item = lv.items(i);
+        integers = item.valType() == Value.IntVal && item.typeHint() == null;
+        allFit &= list.get(i) instanceof Integer;
+      }
+      if (integers && !allFit) {
+        list.replaceAll(element -> ((Number) element).longValue());
+      }
+    }
+    return list;
+  }
+
+  private static boolean fitsInt(long v) {
+    return v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE;
   }
 
   /** Convert a TemporalVal to the java.sql type that matches its kind. */
@@ -2491,44 +2476,19 @@ public class GatunServer {
       type = Value.ObjectRef;
       valueOffset = ObjectRef.createObjectRef(builder, ((ObjectRefT) value).id);
     } else if (value instanceof List<?> list) {
-      // Auto-convert List to ListVal
       type = Value.ListVal;
-      int[] itemOffsets = new int[list.size()];
-      for (int i = 0; i < list.size(); i++) {
-        int[] packed = packNested(builder, list.get(i), sessionObjectIds);
-        Argument.startArgument(builder);
-        Argument.addValType(builder, (byte) packed[0]);
-        Argument.addVal(builder, packed[1]);
-        itemOffsets[i] = Argument.endArgument(builder);
-      }
-      int itemsVec = ListVal.createItemsVector(builder, itemOffsets);
-      valueOffset = ListVal.createListVal(builder, itemsVec);
+      valueOffset = packList(builder, list, sessionObjectIds);
     } else if (value instanceof Map<?, ?> map) {
-      // Auto-convert Map to MapVal
       type = Value.MapVal;
-      int[] entryOffsets = new int[map.size()];
-      int idx = 0;
+      List<Object> keys = new ArrayList<>(map.size());
+      List<Object> values = new ArrayList<>(map.size());
       for (Map.Entry<?, ?> entry : map.entrySet()) {
-        int[] keyPacked = packNested(builder, entry.getKey(), sessionObjectIds);
-        int[] valPacked = packNested(builder, entry.getValue(), sessionObjectIds);
-
-        Argument.startArgument(builder);
-        Argument.addValType(builder, (byte) keyPacked[0]);
-        Argument.addVal(builder, keyPacked[1]);
-        int keyArgOffset = Argument.endArgument(builder);
-
-        Argument.startArgument(builder);
-        Argument.addValType(builder, (byte) valPacked[0]);
-        Argument.addVal(builder, valPacked[1]);
-        int valArgOffset = Argument.endArgument(builder);
-
-        MapEntry.startMapEntry(builder);
-        MapEntry.addKey(builder, keyArgOffset);
-        MapEntry.addValue(builder, valArgOffset);
-        entryOffsets[idx++] = MapEntry.endMapEntry(builder);
+        keys.add(entry.getKey());
+        values.add(entry.getValue());
       }
-      int entriesVec = MapVal.createEntriesVector(builder, entryOffsets);
-      valueOffset = MapVal.createMapVal(builder, entriesVec);
+      int keysOffset = packList(builder, keys, sessionObjectIds);
+      int valuesOffset = packList(builder, values, sessionObjectIds);
+      valueOffset = MapVal.createMapVal(builder, keysOffset, valuesOffset);
     } else if (value.getClass().isArray()) {
       // Handle Java arrays
       type = Value.ArrayVal;
@@ -2549,6 +2509,99 @@ public class GatunServer {
     }
 
     return new int[] {type, valueOffset};
+  }
+
+  // What every element of a list is, for packList
+  private static final int MIXED = 0;
+  private static final int INTEGERS = 1;
+  private static final int FLOATS = 2;
+  private static final int BOOLEANS = 3;
+  private static final int STRINGS = 4;
+
+  private static int elementKind(Object element) {
+    if (element instanceof String) {
+      return STRINGS;
+    } else if (element instanceof Integer
+        || element instanceof Long
+        || element instanceof Short
+        || element instanceof Byte) {
+      return INTEGERS;
+    } else if (element instanceof Double || element instanceof Float) {
+      return FLOATS;
+    } else if (element instanceof Boolean) {
+      return BOOLEANS;
+    }
+    return MIXED;
+  }
+
+  /** Pack a list as a ListVal: one vector if its elements are of one simple kind. */
+  private int packList(FlatBufferBuilder builder, List<?> list, Set<Long> sessionObjectIds) {
+    // Copied first: the list may be one that other threads change, and its size is used twice
+    Object[] elements = list.toArray();
+    int n = elements.length;
+    int kind = n == 0 ? MIXED : elementKind(elements[0]);
+    for (int i = 1; i < n && kind != MIXED; i++) {
+      if (elementKind(elements[i]) != kind) {
+        kind = MIXED;
+      }
+    }
+    switch (kind) {
+      case INTEGERS -> {
+        long[] values = new long[n];
+        for (int i = 0; i < n; i++) {
+          values[i] = ((Number) elements[i]).longValue();
+        }
+        int vector = ListVal.createLongsVector(builder, values);
+        ListVal.startListVal(builder);
+        ListVal.addLongs(builder, vector);
+      }
+      case FLOATS -> {
+        double[] values = new double[n];
+        for (int i = 0; i < n; i++) {
+          values[i] = ((Number) elements[i]).doubleValue();
+        }
+        int vector = ListVal.createDoublesVector(builder, values);
+        ListVal.startListVal(builder);
+        ListVal.addDoubles(builder, vector);
+      }
+      case BOOLEANS -> {
+        boolean[] values = new boolean[n];
+        for (int i = 0; i < n; i++) {
+          values[i] = (Boolean) elements[i];
+        }
+        int vector = ListVal.createBoolsVector(builder, values);
+        ListVal.startListVal(builder);
+        ListVal.addBools(builder, vector);
+      }
+      case STRINGS -> {
+        int[] lengths = new int[n];
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < n; i++) {
+          byte[] encoded = ((String) elements[i]).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+          lengths[i] = encoded.length;
+          bytes.writeBytes(encoded);
+        }
+        int bytesVector = ListVal.createStringBytesVector(builder, bytes.toByteArray());
+        int lengthsVector = ListVal.createStringLengthsVector(builder, lengths);
+        ListVal.startListVal(builder);
+        ListVal.addStringLengths(builder, lengthsVector);
+        ListVal.addStringBytes(builder, bytesVector);
+      }
+      default -> {
+        int[] itemOffsets = new int[n];
+        for (int i = 0; i < n; i++) {
+          int[] packed = packNested(builder, elements[i], sessionObjectIds);
+          Argument.startArgument(builder);
+          Argument.addValType(builder, (byte) packed[0]);
+          Argument.addVal(builder, packed[1]);
+          itemOffsets[i] = Argument.endArgument(builder);
+        }
+        int vector = ListVal.createItemsVector(builder, itemOffsets);
+        ListVal.startListVal(builder);
+        ListVal.addItems(builder, vector);
+      }
+    }
+    return ListVal.endListVal(builder);
   }
 
   // --- HELPER: Pack Java array into ArrayVal ---
@@ -3490,11 +3543,8 @@ public class GatunServer {
             arrowFromObject(
                 cmd.targetId(), memory.segment(), memory.arrow(), ctx.quota.getSessionId()));
       default:
-        byte action = cmd.action();
         throw new UnsupportedOperationException(
-            (action >= 0 && action < Action.names.length
-                    ? Action.names[action]
-                    : "Action " + action)
+            RequestContext.actionName(cmd.action())
                 + " cannot be used inside a callback that Java made from another thread");
     }
   }

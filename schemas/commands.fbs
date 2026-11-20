@@ -105,19 +105,27 @@ table CallbackRef {
   interface_name: string; // Java interface to implement (e.g., "java.util.Comparator")
 }
 
-// For auto-convert: Java List -> Python list
+// A list, in either direction (Python list <-> java.util.List).
+//
+// A list whose elements are all integers, all floats, all booleans or all strings travels
+// as one vector of them: building a table per element costs the Python client several
+// microseconds each. Any other list (mixed, nested, object references, nulls) is one
+// Argument per element. At most one of the forms is present; an empty list has none.
 table ListVal {
-  items: [Argument];  // Reuse Argument to hold nested Values
+  items: [Argument];
+  longs: [long];
+  doubles: [double];
+  bools: [bool];
+  // Strings: the number of UTF-8 bytes of each, and all their bytes end to end
+  string_lengths: [int];
+  string_bytes: [ubyte];
 }
 
-// For auto-convert: Java Map -> Python dict
-table MapEntry {
-  key: Argument;
-  value: Argument;
-}
-
+// A map, in either direction (Python dict <-> java.util.Map): its keys and its values in
+// the same order, as two lists of one length
 table MapVal {
-  entries: [MapEntry];
+  keys: ListVal;
+  values: ListVal;
 }
 
 // For Java arrays (int[], String[], Object[], etc.)

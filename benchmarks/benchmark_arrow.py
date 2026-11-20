@@ -143,17 +143,24 @@ def main() -> None:
             report.note(f"{single / took:.0f}x faster than 500 add() calls")
 
         report.section("Collections and arrays as arguments")
-        # A command holds 64KB: a dict of 1,000 entries does not fit in one
         for count in (100, 500):
             items = list(range(count))
+            words = [f"word_{i}" for i in range(count)]
+            # ints and strings in one list: built one element at a time
+            mixed = [i if i % 2 else f"word_{i}" for i in range(count)]
             mapping = {f"key_{i}": i for i in range(count)}
             int_array = pa.array(items, type=pa.int32())
             double_array = pa.array(items, type=pa.float64())
-            report.case(
-                f"list of {count} ints -> ArrayList",
-                lambda v=items: client.create_object("java.util.ArrayList", v),
-                n=count,
-            )
+            for name, value in (
+                (f"list of {count} ints -> ArrayList", items),
+                (f"list of {count} strings -> ArrayList", words),
+                (f"list of {count} ints and strings -> ArrayList", mixed),
+            ):
+                report.case(
+                    name,
+                    lambda v=value: client.create_object("java.util.ArrayList", v),
+                    n=count,
+                )
             report.case(
                 f"dict of {count} entries -> HashMap",
                 lambda v=mapping: client.create_object("java.util.HashMap", v),
@@ -169,6 +176,33 @@ def main() -> None:
                 lambda v=double_array: arrays.hashCode(v),
                 n=count,
             )
+
+        report.section("Collections as return values")
+        for count in (100, 500):
+            for name, java_class, value in (
+                (
+                    f"ArrayList of {count} ints -> list",
+                    "java.util.ArrayList",
+                    list(range(count)),
+                ),
+                (
+                    f"ArrayList of {count} strings -> list",
+                    "java.util.ArrayList",
+                    [f"word_{i}" for i in range(count)],
+                ),
+                (
+                    f"HashMap of {count} entries -> dict",
+                    "java.util.HashMap",
+                    {f"key_{i}": i for i in range(count)},
+                ),
+            ):
+                held = client.create_object(java_class, value)
+                # clone() returns the collection itself, which arrives as its elements
+                report.case(
+                    name,
+                    lambda h=held: client.invoke_method(h.object_id, "clone"),
+                    n=count,
+                )
     finally:
         arena.close()
         client.close()

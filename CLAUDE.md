@@ -34,7 +34,7 @@ These sizes are hardcoded on both sides and must stay in sync: `PAYLOAD_OFFSET` 
 ### Where Changes Must Be Mirrored
 The protocol is implemented several times over, so a wire-level change usually touches all of these:
 - `schemas/commands.fbs` — add the `Action` / table / field
-- `GatunServer.handleClient` — top-level dispatch (an `if/else if` chain on `cmd.action()`); new actions also need a name in `Metrics.getActionName`
+- `GatunServer.handleClient` — top-level dispatch (an `if/else if` chain on `cmd.action()`). Logs and metrics take an action's name from the generated `Action.names` (`RequestContext.actionName`)
 - `GatunServer.executeCommand` — a second, separate dispatch used only for sub-commands inside `Action.Batch`; an action missing here works standalone but fails in `client.batch()`
 - `src/gatun/client.py` — sync client, plus `BatchContext` if the action should be batchable
 - `src/gatun/callback_channel.py` and `CallbackChannel.java` — the callback connection, for a change to how callbacks travel (see Python Callbacks)
@@ -48,7 +48,7 @@ On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which
 
 ### Protocol Handshake
 Format: `[4 bytes: version][4 bytes: arena_epoch][8 bytes: memory size][2 bytes: shm_path_len][N bytes: shm_path]`
-- Protocol version (currently 4) is verified on connect
+- Protocol version (currently 5) is verified on connect
 - Version mismatch raises RuntimeError with upgrade instructions
 - SHM path is the per-client shared memory file path (e.g., `/tmp/gatun.sock.1.shm`)
 
@@ -119,6 +119,7 @@ The shadow JAR relocates Netty (`gatun.shaded.io.netty`) so it can coexist with 
 - Socket path: Generated randomly in `/tmp/gatun_<pid>_<random>.sock` by default. The launcher refuses a fixed `socket_path` that a live server is listening on
 - The launched server runs in its own process group and is passed `-Dgatun.parent.pid`; it exits when that process is gone (`GatunServer.watchParent`), which covers a Python process that was killed
 - A table from `get_arrow_data().table` is built on `pa.py_buffer(memoryview(shm)[...])`, so it holds a buffer export of the mapping and keeps it alive past `close()`. Do not go back to `pa.foreign_buffer` on a raw address there: such a table reads unmapped memory after `close()`
+- A list whose elements are all `int`, all `float`, all `bool` or all `str` (the exact type) travels as one vector of `ListVal` (`longs`, `doubles`, `bools`, or `string_lengths` + `string_bytes`), in both directions; any other list is one `Argument` per element (`items`). A map is two such lists, keys and values. The Python builder costs several microseconds per table, so the client packs these with `struct` (`_build_list`) and reads them with `struct.unpack_from` at the vectors' vtable slots, which are written out in `client.py` (`_LIST_LONGS` and the others): change the order of `ListVal`'s fields in the schema and they must follow. Java keeps the rule that a list of integers is all `Integer` if every value fits and all `Long` otherwise (`convertListVal`), also for integers that came one by one; the integers of a map are typed one at a time, as a single argument is
 - Use `T | None` syntax instead of `Optional[T]`
 - No fallback imports (e.g., no `tomli` for older Python)
 
@@ -856,6 +857,8 @@ bridge.is_instance_of(obj, "java.util.List")  # True
 comparator = bridge.register_callback(lambda a, b: a - b, "java.util.Comparator")
 bridge.unregister_callback(comparator)
 ```
+
+`gatun.bridge.JavaException` and its subclasses are the client's classes (imported, not defined again), so the adapter converts nothing: the objects it returns are the client's `JavaObject`s, and a method called on one raises the client's exception whatever the bridge defines.
 
 ### PySpark Usage
 Nothing in this repo or in stock PySpark switches PySpark over to Gatun; there is no `PYSPARK_USE_GATUN` switch. Running PySpark on Gatun needs a PySpark build ported to the `BridgeAdapter` interface (`docs/bridge_adapter_spec.md`). What this repo tests is driving Spark's JVM classes directly via `connect(classpath=<spark jars>)` (`tests/test_spark_integration.py`), which needs a JDK Spark supports: it passes on 22 and fails on 27. That file's `dataframe_from_arrow` / `arrow_from_dataframe` helpers show a pyarrow table becoming a Spark DataFrame and a query result coming back as Arrow, through `arrow_to_java_batches` / `arrow_from_java` and Spark-internal converters (`ArrowConverters.toDataFrame`, `Dataset.toArrowBatchRdd`).

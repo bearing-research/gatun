@@ -33,7 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `memory` accepts `K` / `M` / `G` suffixes, fractions (`"1.5GB"`), a byte count, or an int
 
 ### Changed
-- Protocol version is now 4: `Action.OpenCallbackChannel`, `Action.NestedCommand`, `Action.OpenCallMemory` and a `call_id` on commands and responses, for the callback connection. Client and server must be upgraded together
+- Protocol version is now 5: a list whose elements are all integers, all floats, all booleans or all strings travels as one vector instead of a table per element, in both directions, and a map travels as its keys and its values, two such lists. What arrives is unchanged: the same Java element types for a Python list or dict, the same Python values for a Java `List` or `Map`. Client and server must be upgraded together
+- Protocol version 4: `Action.OpenCallbackChannel`, `Action.NestedCommand`, `Action.OpenCallMemory` and a `call_id` on commands and responses, for the callback connection. Client and server must be upgraded together
 - A Java object that a callback returns is no longer released before Java has read the callback's answer
 - A session can unregister only its own callbacks, and `unregister_callback()` keeps the Python function until the server has dropped the callback
 - A callback's arguments that could not be sent (more than 64KB of them) no longer leave their objects registered for the session
@@ -67,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Project links pointed at the repository's old location
+- `get_metrics()` and the server's request log name every action. `Ping` was reported as `Unknown(0)`, and the log showed the same for `GetMetrics`, the Arrow object transfers and everything else added since batches: the two tables of names had each been kept by hand
+- `gatun.bridge.JavaException` and its subclasses are the client's exception classes, not a second set with the same names. `except gatun.bridge.JavaException` let through every Java exception that did not come from one of the adapter's own methods: a call through `bridge.jvm`, or a method of an object the bridge returned. `str()` of one raised by an adapter method is now the Java stack trace, as everywhere else, where it was the class and the message
 - README: the async client's handles are garbage collected like the sync client's; the static field example used a call that raises; `StaleArenaError` has no `view_epoch` attribute; the payload zone's halves belong to `send_arrow_buffers` / `get_arrow_data` only
 - `docs/bridge_adapter_spec.md` described `BridgeAdapter` as a protocol with optional parts and carried a copy of the contract tests that had drifted from `tests/test_bridge_contract.py`
 - The performance numbers in the README and `docs/benchmarks.md` dated from 0.1.0 and a different machine. They are measured again, on Linux, with the corrected scripts: a single call through Gatun takes about twice as long as one through Py4J, where the README said a third to a half as long; Gatun is ahead for collections as arguments, large return values and bulk data

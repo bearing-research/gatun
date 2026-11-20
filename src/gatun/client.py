@@ -50,7 +50,6 @@ from gatun.generated.org.gatun.protocol import (
     IntVal,
     InvokeMethodsRequest,
     ListVal,
-    MapEntry,
     MapVal,
     MethodCall,
     ObjectRef,
@@ -179,7 +178,7 @@ def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int)
 
 # Protocol version - must match the server version
 # Version 2: Per-client shared memory (handshake includes SHM path)
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 # Memory zone sizes - must match GatunServer.java constants
 COMMAND_ZONE_SIZE = 65536  # 64KB for commands
@@ -277,11 +276,11 @@ class JavaException(Exception):
         stack_trace: The full Java stack trace as a string
     """
 
-    def __init__(self, java_class: str, message: str, stack_trace: str):
+    def __init__(self, java_class: str, message: str, stack_trace: str = ""):
         self.java_class = java_class
         self.message = message
         self.stack_trace = stack_trace
-        super().__init__(stack_trace)
+        super().__init__(stack_trace or f"{java_class}: {message}")
 
 
 class JavaSecurityException(JavaException):
@@ -1435,6 +1434,57 @@ class _JVMNode:
         return f"<JVM {self._path}>"
 
 
+# Where ListVal's vectors are in its table: the nth field of a table is at 4 + 2n,
+# in the schema's order. The generated accessors read one element per call, which
+# is what these forms exist to avoid.
+_LIST_LONGS = 6
+_LIST_DOUBLES = 8
+_LIST_BOOLS = 10
+_LIST_STRING_LENGTHS = 12
+_LIST_STRING_BYTES = 14
+
+
+def _unpack_list(list_obj: Any, client: Any, ref_class: Any) -> list[Any]:
+    """The elements of a ListVal, whichever form it travels in."""
+    count = list_obj.ItemsLength()
+    if count:
+        return [
+            _unpack_value_impl(item.ValType(), item.Val(), client, ref_class)
+            for item in map(list_obj.Items, range(count))
+        ]
+    tab = list_obj._tab
+    data = tab.Bytes
+    count = list_obj.LongsLength()
+    if count:
+        at = tab.Vector(tab.Offset(_LIST_LONGS))
+        return list(struct.unpack_from(f"<{count}q", data, at))
+    count = list_obj.DoublesLength()
+    if count:
+        at = tab.Vector(tab.Offset(_LIST_DOUBLES))
+        return list(struct.unpack_from(f"<{count}d", data, at))
+    count = list_obj.BoolsLength()
+    if count:
+        at = tab.Vector(tab.Offset(_LIST_BOOLS))
+        return list(struct.unpack_from(f"<{count}?", data, at))
+    count = list_obj.StringLengthsLength()
+    if count:
+        lengths = struct.unpack_from(
+            f"<{count}i", data, tab.Vector(tab.Offset(_LIST_STRING_LENGTHS))
+        )
+        total = sum(lengths)
+        text = b""
+        if total:
+            at = tab.Vector(tab.Offset(_LIST_STRING_BYTES))
+            text = bytes(data[at : at + total])
+        strings = []
+        at = 0
+        for length in lengths:
+            strings.append(text[at : at + length].decode("utf-8"))
+            at += length
+        return strings
+    return []
+
+
 def _unpack_value_impl(
     val_type: int, val_table: Any, client: Any, ref_class: Any
 ) -> Any:
@@ -1472,31 +1522,25 @@ def _unpack_value_impl(
     elif val_type == Value.Value.ListVal:
         list_obj = ListVal.ListVal()
         list_obj.Init(val_table.Bytes, val_table.Pos)
-        list_result = JavaList()
-        for i in range(list_obj.ItemsLength()):
-            item = list_obj.Items(i)
-            list_result.append(
-                _unpack_value_impl(item.ValType(), item.Val(), client, ref_class)
-            )
-        return list_result
+        return JavaList(_unpack_list(list_obj, client, ref_class))
     elif val_type == Value.Value.MapVal:
         map_obj = MapVal.MapVal()
         map_obj.Init(val_table.Bytes, val_table.Pos)
-        map_result: dict[Any, Any] = {}
-        for i in range(map_obj.EntriesLength()):
-            entry = map_obj.Entries(i)
-            key_arg = entry.Key()
-            val_arg = entry.Value()
-            key = _unpack_value_impl(
-                key_arg.ValType(), key_arg.Val(), client, ref_class
+        keys_obj = map_obj.Keys()
+        values_obj = map_obj.Values()
+        if keys_obj is None or values_obj is None:
+            return {}
+        return dict(
+            zip(
+                # a Java List as a key: lists are not hashable
+                (
+                    tuple(key) if isinstance(key, list) else key
+                    for key in _unpack_list(keys_obj, client, ref_class)
+                ),
+                _unpack_list(values_obj, client, ref_class),
+                strict=True,
             )
-            val = _unpack_value_impl(
-                val_arg.ValType(), val_arg.Val(), client, ref_class
-            )
-            if isinstance(key, list):
-                key = tuple(key)  # a Java List key; lists are not hashable
-            map_result[key] = val
-        return map_result
+        )
     elif val_type == Value.Value.ArrayVal:
         arr_obj = ArrayVal.ArrayVal()
         arr_obj.Init(val_table.Bytes, val_table.Pos)
@@ -2119,35 +2163,13 @@ class _ValueEncoder:
             # JavaArray came from Java and should go back as ArrayVal (Java array)
             return self._build_java_array(builder, value)
         elif isinstance(value, (list, tuple, range)):
-            # Auto-convert Python list/tuple/range to ListVal (Java ArrayList)
-            # These are treated the same as lists for Java interop
-            items = list(value) if isinstance(value, range) else value
-            item_offsets = []
-            for item in items:
-                item_offsets.append(self._build_argument(builder, item))
-            ListVal.StartItemsVector(builder, len(item_offsets))
-            for offset in reversed(item_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            items_vec = builder.EndVector()
-            ListVal.Start(builder)
-            ListVal.AddItems(builder, items_vec)
-            return Value.Value.ListVal, ListVal.End(builder)
+            return Value.Value.ListVal, self._build_list(builder, value)
         elif isinstance(value, dict):
-            # Auto-convert Python dict to MapVal
-            entry_offsets = []
-            for k, v in value.items():
-                key_arg = self._build_argument(builder, k)
-                val_arg = self._build_argument(builder, v)
-                MapEntry.Start(builder)
-                MapEntry.AddKey(builder, key_arg)
-                MapEntry.AddValue(builder, val_arg)
-                entry_offsets.append(MapEntry.End(builder))
-            MapVal.StartEntriesVector(builder, len(entry_offsets))
-            for offset in reversed(entry_offsets):
-                builder.PrependUOffsetTRelative(offset)
-            entries_vec = builder.EndVector()
+            keys_off = self._build_list(builder, tuple(value))
+            values_off = self._build_list(builder, tuple(value.values()))
             MapVal.Start(builder)
-            MapVal.AddEntries(builder, entries_vec)
+            MapVal.AddKeys(builder, keys_off)
+            MapVal.AddValues(builder, values_off)
             return Value.Value.MapVal, MapVal.End(builder)
         elif isinstance(value, (pa.Array, pa.ChunkedArray)):
             # Convert PyArrow array to ArrayVal
@@ -2175,6 +2197,59 @@ class _ValueEncoder:
                 return Value.Value.TemporalVal, TemporalVal.End(builder)
             else:
                 raise TypeError(f"Unsupported argument type: {type(value)}")
+
+    def _build_list(self, builder, items) -> int:
+        """Build a ListVal from a list, tuple or range and return its offset.
+
+        Elements that are all `int`, all `float`, all `bool` or all `str` go as one
+        vector packed in C: a table per element costs several microseconds each in
+        this builder. The exact type decides, so a subclass (an `IntEnum`) or a
+        list of several types goes element by element, through `_build_argument`.
+        """
+        count = len(items)
+        kinds = set(map(type, items))
+        if len(kinds) == 1:
+            kind = kinds.pop()
+            if kind is int:
+                try:
+                    packed = struct.pack(f"<{count}q", *items)
+                except struct.error:
+                    # An integer past 64 bits: the element that has it reports it
+                    pass
+                else:
+                    vector = _create_typed_vector(builder, packed, 8, count)
+                    ListVal.Start(builder)
+                    ListVal.AddLongs(builder, vector)
+                    return cast(int, ListVal.End(builder))
+            elif kind is float:
+                packed = struct.pack(f"<{count}d", *items)
+                vector = _create_typed_vector(builder, packed, 8, count)
+                ListVal.Start(builder)
+                ListVal.AddDoubles(builder, vector)
+                return cast(int, ListVal.End(builder))
+            elif kind is bool:
+                vector = _create_typed_vector(builder, bytes(items), 1, count)
+                ListVal.Start(builder)
+                ListVal.AddBools(builder, vector)
+                return cast(int, ListVal.End(builder))
+            elif kind is str:
+                encoded = [item.encode("utf-8") for item in items]
+                bytes_vector = builder.CreateByteVector(b"".join(encoded))
+                lengths = struct.pack(f"<{count}i", *map(len, encoded))
+                lengths_vector = _create_typed_vector(builder, lengths, 4, count)
+                ListVal.Start(builder)
+                ListVal.AddStringLengths(builder, lengths_vector)
+                ListVal.AddStringBytes(builder, bytes_vector)
+                return cast(int, ListVal.End(builder))
+
+        item_offsets = [self._build_argument(builder, item) for item in items]
+        ListVal.StartItemsVector(builder, len(item_offsets))
+        for offset in reversed(item_offsets):
+            builder.PrependUOffsetTRelative(offset)
+        items_vector = builder.EndVector()
+        ListVal.Start(builder)
+        ListVal.AddItems(builder, items_vector)
+        return cast(int, ListVal.End(builder))
 
     def _build_arrow_array(self, builder, arr: pa.Array):
         """Build an ArrayVal from a PyArrow Array.
