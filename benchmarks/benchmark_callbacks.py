@@ -78,6 +78,40 @@ def main() -> None:
                 f"{stats['per_callback_us']:.1f} us each"
             )
 
+        # With a callback timeout, the default, the client runs each callback
+        # on a thread of its own so that it can stop waiting for it
+        report.section("The same sort with callback_timeout=None")
+        untimed = connect(callback_timeout=None)
+        try:
+            untimed_comparator = untimed.register_callback(
+                compare, "java.util.Comparator"
+            )
+            untimed_collections = untimed.jvm.java.util.Collections
+            values = list(range(100))
+            random.Random(7).shuffle(values)
+            calls[0] = 0
+            in_python = report.case(
+                "sort 100, Python comparator, no timeout",
+                lambda items: untimed_collections.sort(items, untimed_comparator),
+                setup=lambda: untimed.create_object("java.util.ArrayList", values),
+                n=100,
+            )
+            stats = report.cases[-1]
+            per_sort = calls[0] / (stats["runs"] + stats["warmup_runs"])
+            java_sort = next(
+                c["median_us"]
+                for c in report.cases
+                if c["name"] == "sort 100, Java comparator"
+            )
+            stats["callbacks"] = per_sort
+            stats["per_callback_us"] = (in_python - java_sort) / per_sort
+            report.note(
+                f"{per_sort:.0f} callbacks a sort, "
+                f"{stats['per_callback_us']:.1f} us each"
+            )
+        finally:
+            untimed.close()
+
         report.section("On the request's thread: one callback")
         merge = client.register_callback(
             lambda old, new: old + new, "java.util.function.BiFunction"

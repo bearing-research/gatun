@@ -2075,52 +2075,27 @@ def main():
             "Py4J Throughput (auto_convert=False)",
         )
 
-    # Summary
+    # Summary: the geometric mean of the per-case ratios of medians. A mean of
+    # the latencies themselves would be the list(100) case and little else.
+    def overall(py4j: list[dict], label: str) -> None:
+        ratios = [
+            p["median_us"] / g["median_us"]
+            for g, p in zip(gatun_latency, py4j)
+            if g["median_us"] > 0 and p["median_us"] == p["median_us"]
+        ]
+        if not ratios:
+            return
+        mean = statistics.geometric_mean(ratios)
+        verdict = f"{mean:.2f}x faster" if mean >= 1 else f"{1 / mean:.2f}x slower"
+        print(f"Gatun against Py4J ({label}): {verdict} (geometric mean of medians)")
+
     print("=" * 80)
     print(" Summary")
     print("=" * 80)
-
-    avg_gatun = statistics.mean(r["mean_us"] for r in gatun_latency)
-    print(f"Gatun average latency: {avg_gatun:.1f} μs per operation")
-
     if py4j_latency_auto:
-        avg_py4j_auto = statistics.mean(r["mean_us"] for r in py4j_latency_auto)
-        print(
-            f"Py4J (auto_convert=True) average latency:  {avg_py4j_auto:.1f} μs per operation"
-        )
-
-        speedups = [
-            p["mean_us"] / g["mean_us"]
-            for g, p in zip(gatun_latency, py4j_latency_auto)
-            if g["mean_us"] > 0
-        ]
-        geo_mean = statistics.geometric_mean(speedups)
-        print(
-            f"\nGatun vs Py4J (auto_convert=True): {geo_mean:.2f}x faster (geometric mean)"
-        )
-
+        overall(py4j_latency_auto, "auto_convert=True")
     if py4j_latency_no_auto:
-        import math
-
-        valid_results = [
-            r["mean_us"] for r in py4j_latency_no_auto if not math.isnan(r["mean_us"])
-        ]
-        if valid_results:
-            avg_py4j_no_auto = statistics.mean(valid_results)
-            print(
-                f"Py4J (auto_convert=False) average latency: {avg_py4j_no_auto:.1f} μs per operation"
-            )
-
-            speedups = [
-                p["mean_us"] / g["mean_us"]
-                for g, p in zip(gatun_latency, py4j_latency_no_auto)
-                if g["mean_us"] > 0 and not math.isnan(p["mean_us"])
-            ]
-            if speedups:
-                geo_mean = statistics.geometric_mean(speedups)
-                print(
-                    f"Gatun vs Py4J (auto_convert=False): {geo_mean:.2f}x faster (geometric mean)"
-                )
+        overall(py4j_latency_no_auto, "auto_convert=False")
 
     # Run payload sweep to identify crossover points
     print("\n" + "-" * 80)
