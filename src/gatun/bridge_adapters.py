@@ -8,21 +8,12 @@ from __future__ import annotations
 from typing import Any, ClassVar, cast
 
 from gatun import connect as gatun_connect
-from gatun.bridge import (
-    JAVA_EXCEPTION_MAP,
-    BridgeAdapter,
-    JavaException,
-    JVMRef,
-    JVMView,
-)
+from gatun.bridge import BridgeAdapter, JVMRef, JVMView
 from gatun.client import (
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
     GatunClient,
     JavaObject,
-)
-from gatun.client import (
-    JavaException as GatunJavaException,
 )
 from gatun.client import (
     JVMView as GatunJVMView,
@@ -72,12 +63,9 @@ class GatunAdapter(BridgeAdapter):
 
     def new(self, class_name: str, *args: Any) -> JVMRef:
         """Create a new JVM object."""
-        try:
-            assert self._client is not None, "Bridge is closed"
-            result: JVMRef = self._client.create_object(class_name, *args)
-            return result
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        assert self._client is not None, "Bridge is closed"
+        result: JVMRef = self._client.create_object(class_name, *args)
+        return result
 
     def close(self) -> None:
         """Close the bridge and release all resources."""
@@ -94,59 +82,38 @@ class GatunAdapter(BridgeAdapter):
 
     def call(self, ref: JVMRef, method: str, *args: Any) -> Any:
         """Call an instance method on a JVM object."""
-        try:
-            obj_id = ref.object_id if hasattr(ref, "object_id") else ref
-            return self._client.invoke_method(obj_id, method, *args)
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        obj_id = ref.object_id if hasattr(ref, "object_id") else ref
+        return self._client.invoke_method(obj_id, method, *args)
 
     def call_static(self, class_name: str, method: str, *args: Any) -> Any:
         """Call a static method on a JVM class."""
-        try:
-            return self._client.invoke_static_method(class_name, method, *args)
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        return self._client.invoke_static_method(class_name, method, *args)
 
     # === Field Access ===
 
     def get_field(self, ref: JVMRef, name: str) -> Any:
         """Get an instance field value."""
-        try:
-            obj_id = ref.object_id if hasattr(ref, "object_id") else ref
-            return self._client.get_field(obj_id, name)
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        obj_id = ref.object_id if hasattr(ref, "object_id") else ref
+        return self._client.get_field(obj_id, name)
 
     def set_field(self, ref: JVMRef, name: str, value: Any) -> None:
         """Set an instance field value."""
-        try:
-            obj_id = ref.object_id if hasattr(ref, "object_id") else ref
-            self._client.set_field(obj_id, name, value)
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        obj_id = ref.object_id if hasattr(ref, "object_id") else ref
+        self._client.set_field(obj_id, name, value)
 
     def get_static_field(self, class_name: str, name: str) -> Any:
         """Get a static field value."""
-        try:
-            return self._client.get_static_field(class_name, name)
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        return self._client.get_static_field(class_name, name)
 
     def set_static_field(self, class_name: str, name: str, value: Any) -> None:
         """Set a static field value."""
-        try:
-            self._client.set_static_field(class_name, name, value)
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        self._client.set_static_field(class_name, name, value)
 
     # === Type Checking ===
 
     def is_instance_of(self, ref: JVMRef, class_name: str) -> bool:
         """Check if object is instance of class."""
-        try:
-            return self._client.is_instance_of(ref, class_name)
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        return self._client.is_instance_of(ref, class_name)
 
     # === Arrays ===
 
@@ -164,79 +131,61 @@ class GatunAdapter(BridgeAdapter):
 
     def new_array(self, element_class: str, length: int) -> JVMRef:
         """Create a new JVM array."""
-        try:
-            # Get the Class object for the element type
-            if element_class in self._PRIMITIVE_TYPES:
-                wrapper_class, field = self._PRIMITIVE_TYPES[element_class]
-                class_obj = self._client.get_static_field(wrapper_class, field)
-            else:
-                class_obj = self._client.invoke_static_method(
-                    "java.lang.Class", "forName", element_class
-                )
-
-            # Create the array using reflection
-            # Use return_object_ref=True to get an ObjectRef instead of auto-converted array
-            return cast(
-                JVMRef,
-                self._client.invoke_static_method(
-                    "java.lang.reflect.Array",
-                    "newInstance",
-                    class_obj,
-                    length,
-                    return_object_ref=True,
-                ),
+        # Get the Class object for the element type
+        if element_class in self._PRIMITIVE_TYPES:
+            wrapper_class, field = self._PRIMITIVE_TYPES[element_class]
+            class_obj = self._client.get_static_field(wrapper_class, field)
+        else:
+            class_obj = self._client.invoke_static_method(
+                "java.lang.Class", "forName", element_class
             )
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+
+        # Create the array using reflection
+        # Use return_object_ref=True to get an ObjectRef instead of auto-converted array
+        return cast(
+            JVMRef,
+            self._client.invoke_static_method(
+                "java.lang.reflect.Array",
+                "newInstance",
+                class_obj,
+                length,
+                return_object_ref=True,
+            ),
+        )
 
     def array_get(self, array_ref: JVMRef, index: int) -> Any:
         """Get element at index from JVM array."""
-        try:
-            return self._client.invoke_static_method(
-                "java.lang.reflect.Array", "get", array_ref, index
-            )
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        return self._client.invoke_static_method(
+            "java.lang.reflect.Array", "get", array_ref, index
+        )
 
     def array_set(self, array_ref: JVMRef, index: int, value: Any) -> None:
         """Set element at index in JVM array."""
-        try:
-            self._client.invoke_static_method(
-                "java.lang.reflect.Array", "set", array_ref, index, value
-            )
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        self._client.invoke_static_method(
+            "java.lang.reflect.Array", "set", array_ref, index, value
+        )
 
     def array_length(self, array_ref: JVMRef) -> int:
         """Get length of JVM array."""
-        try:
-            return cast(
-                int,
-                self._client.invoke_static_method(
-                    "java.lang.reflect.Array", "getLength", array_ref
-                ),
-            )
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        return cast(
+            int,
+            self._client.invoke_static_method(
+                "java.lang.reflect.Array", "getLength", array_ref
+            ),
+        )
 
     # === Callbacks ===
 
     def register_callback(self, handler: Any, interface: str) -> JVMRef:
         """Make a JVM object that implements a Java interface in Python."""
-        try:
-            assert self._client is not None, "Bridge is closed"
-            result: JVMRef = self._client.register_callback(handler, interface)
-            return result
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        assert self._client is not None, "Bridge is closed"
+        result: JVMRef = self._client.register_callback(handler, interface)
+        return result
 
     def unregister_callback(self, ref: JVMRef) -> None:
         """Stop serving a callback and let go of its handler."""
-        try:
-            assert self._client is not None, "Bridge is closed"
-            self._client.unregister_callback(cast(Any, ref))
-        except GatunJavaException as e:
-            raise self._convert_exception(e) from None
+        assert self._client is not None, "Bridge is closed"
+        self._client.unregister_callback(cast(Any, ref))
 
     # === JVM View ===
 
@@ -249,18 +198,6 @@ class GatunAdapter(BridgeAdapter):
     def java_import(self, package: str) -> None:
         """Import package for shorter class names."""
         gatun_java_import(self._client.jvm, package)
-
-    # === Exception Conversion ===
-
-    def _convert_exception(self, exc: GatunJavaException) -> JavaException:
-        """Convert Gatun exception to bridge JavaException."""
-        java_class = getattr(exc, "java_class", type(exc).__name__)
-        message = getattr(exc, "message", str(exc))
-        stack_trace = getattr(exc, "stack_trace", "")
-
-        # Find the appropriate exception class
-        exc_class = JAVA_EXCEPTION_MAP.get(java_class, JavaException)
-        return exc_class(java_class, message, stack_trace)
 
 
 class _GatunJVMViewAdapter(JVMView):

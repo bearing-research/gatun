@@ -37,11 +37,11 @@ A call is a round trip, and on this machine a round trip through Py4J (PySpark's
 | Static method call (`Math.max(10, 20)`) | 291 μs | 204 μs | Py4J 1.4x faster |
 | Create an object and drop it (`ArrayList()`) | 359 μs | 88 μs | Py4J 4.1x faster |
 | Calls in a loop | 5,500 /s | 9,500 /s | Py4J 1.7x faster |
-| Python list of 100 as an argument | 2.1 ms | 10.8 ms | Gatun 5.2x faster |
+| Python list of 100 as an argument | 0.55 ms | 6.2 ms | Gatun 11x faster |
 | `is_instance_of` | 145 μs | 519 μs | Gatun 3.6x faster |
 | Return a 16 KB `byte[]` | 193 μs | 42 ms | Gatun 218x faster |
 
-Both bridges were given the same JVM settings and a warm JVM, with classes bound once (`Math = jvm.java.lang.Math`). Creating an object and dropping it costs Gatun a second round trip, to release it.
+Both bridges were given the same JVM settings and a warm JVM, with classes bound once (`Math = jvm.java.lang.Math`). Creating an object and dropping it costs Gatun a second round trip, to release it. The list row is from a later run than the others, on another host of the same kind where every round trip was shorter; both of its figures are from that run.
 
 ### Fewer Round Trips
 
@@ -71,10 +71,10 @@ Next to the other ways of getting 500 integers into Java:
 
 | How | Time |
 |-----|-----:|
-| 500 `add()` calls | 92 ms |
-| 500 `add()` calls in a `batch()` | 24 ms |
-| A Python list as a constructor argument | 6.7 ms |
-| A `pyarrow.Array` argument (arrives as `int[]`) | 0.25 ms |
+| 500 `add()` calls | 78 ms |
+| 500 `add()` calls in a `batch()` | 22 ms |
+| A Python list as a constructor argument | 0.35 ms |
+| A `pyarrow.Array` argument (arrives as `int[]`) | 0.19 ms |
 
 ### Callbacks
 

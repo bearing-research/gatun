@@ -363,6 +363,19 @@ class BridgeContractTests:
         exc_str = str(exc_info.value).lower()
         assert "index" in exc_str or "bounds" in exc_str
 
+    def test_exception_from_the_jvm_view(self, bridge: BridgeAdapter):
+        """A call through `bridge.jvm` raises the bridge's exception class."""
+        with pytest.raises(JavaException) as exc_info:
+            bridge.jvm.java.lang.Integer.parseInt("not a number")
+        assert exc_info.value.java_class == "java.lang.NumberFormatException"
+
+    def test_exception_from_a_returned_object(self, bridge: BridgeAdapter):
+        """So does a method called on an object the bridge returned."""
+        obj = bridge.jvm.java.util.ArrayList()
+        with pytest.raises(JavaException) as exc_info:
+            obj.get(0)
+        assert "IndexOutOfBounds" in exc_info.value.java_class
+
     # ==========================================================================
     # Object Lifecycle (3 tests)
     # ==========================================================================

@@ -17,30 +17,17 @@ public record RequestContext(
 
   /** Get action name for logging. */
   public String actionName() {
-    return switch (action) {
-      case Action.CreateObject -> "CreateObject";
-      case Action.FreeObject -> "FreeObject";
-      case Action.InvokeMethod -> "InvokeMethod";
-      case Action.InvokeStaticMethod -> "InvokeStaticMethod";
-      case Action.GetField -> "GetField";
-      case Action.SetField -> "SetField";
-      case Action.GetStaticField -> "GetStaticField";
-      case Action.SetStaticField -> "SetStaticField";
-      case Action.SendArrowBatch -> "SendArrowBatch";
-      case Action.SendArrowBuffers -> "SendArrowBuffers";
-      case Action.GetArrowData -> "GetArrowData";
-      case Action.ResetPayloadArena -> "ResetPayloadArena";
-      case Action.RegisterCallback -> "RegisterCallback";
-      case Action.UnregisterCallback -> "UnregisterCallback";
-      case Action.Cancel -> "Cancel";
-      case Action.IsInstanceOf -> "IsInstanceOf";
-      case Action.Reflect -> "Reflect";
-      case Action.GetFields -> "GetFields";
-      case Action.InvokeMethods -> "InvokeMethods";
-      case Action.CreateObjects -> "CreateObjects";
-      case Action.Batch -> "Batch";
-      default -> "Unknown(" + action + ")";
-    };
+    return actionName(action);
+  }
+
+  /**
+   * The schema's name for an action. Taken from the generated table, so an action added to the
+   * schema has its name in logs and metrics without being listed anywhere else.
+   */
+  public static String actionName(byte action) {
+    return action >= 0 && action < Action.names.length
+        ? Action.names[action]
+        : "Unknown(" + action + ")";
   }
 
   /** Calculate elapsed time in microseconds. */

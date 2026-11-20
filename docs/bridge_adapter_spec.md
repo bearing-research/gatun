@@ -257,7 +257,7 @@ class JavaException(Exception):
         self.java_class = java_class
         self.message = message
         self.stack_trace = stack_trace
-        super().__init__(f"{java_class}: {message}")
+        super().__init__(stack_trace or f"{java_class}: {message}")
 ```
 
 Subclasses:
@@ -269,13 +269,13 @@ Subclasses:
 - `JavaNullPointerException`
 - `JavaIndexOutOfBoundsException`
 - `JavaNumberFormatException`
+- `JavaRuntimeException`
 
-These are the classes in `gatun.bridge`. They are not the client's exceptions of the same
-names (`gatun.JavaException` and its subclasses, exported from the package's top level), and
-neither is a subclass of the other: catch `gatun.bridge.JavaException` around adapter calls.
-`GatunAdapter` raises them from its own methods (`new`, `call`, `call_static`, the field and
-array methods). A call made through `bridge.jvm` is the client's and raises the client's
-classes.
+`gatun.bridge` and the package's top level export the same classes, so
+`except gatun.bridge.JavaException` catches a Java exception however the call was made: through
+an adapter method (`new`, `call`, `call_static`, the field and array methods), through
+`bridge.jvm`, or as a method of an object the bridge returned. `str()` of one is the Java
+stack trace, whose first line is the class and the message.
 
 ## Contract Tests
 

@@ -25,6 +25,19 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Protocol, runtime_checkable
 
+from gatun.client import (
+    JavaClassNotFoundException,
+    JavaException,
+    JavaIllegalArgumentException,
+    JavaIndexOutOfBoundsException,
+    JavaNoSuchFieldException,
+    JavaNoSuchMethodException,
+    JavaNullPointerException,
+    JavaNumberFormatException,
+    JavaRuntimeException,
+    JavaSecurityException,
+)
+
 
 @runtime_checkable
 class JVMRef(Protocol):
@@ -256,51 +269,12 @@ class JVMView(ABC):
 
 # === Exception Hierarchy ===
 
-
-class JavaException(Exception):
-    """Base class for Java exceptions raised in Python."""
-
-    def __init__(self, java_class: str, message: str, stack_trace: str = ""):
-        self.java_class = java_class
-        self.message = message
-        self.stack_trace = stack_trace
-        super().__init__(f"{java_class}: {message}")
-
-
-class JavaSecurityException(JavaException):
-    """java.lang.SecurityException"""
-
-
-class JavaIllegalArgumentException(JavaException):
-    """java.lang.IllegalArgumentException"""
-
-
-class JavaNoSuchMethodException(JavaException):
-    """java.lang.NoSuchMethodException"""
-
-
-class JavaNoSuchFieldException(JavaException):
-    """java.lang.NoSuchFieldException"""
-
-
-class JavaClassNotFoundException(JavaException):
-    """java.lang.ClassNotFoundException"""
-
-
-class JavaNullPointerException(JavaException):
-    """java.lang.NullPointerException"""
-
-
-class JavaIndexOutOfBoundsException(JavaException):
-    """java.lang.IndexOutOfBoundsException"""
-
-
-class JavaNumberFormatException(JavaException):
-    """java.lang.NumberFormatException"""
-
-
-# Mapping from Java exception class names to Python exception classes
-JAVA_EXCEPTION_MAP = {
+# The client's own classes under the names the bridge is documented with. A second
+# set of classes here could only be raised by the adapter's own methods: an
+# exception from a call made any other way (`bridge.jvm.java.util.ArrayList()`, a
+# method of an object the bridge returned) comes straight from the client, and
+# `except gatun.bridge.JavaException` would have let it through.
+JAVA_EXCEPTION_MAP: dict[str, type[JavaException]] = {
     "java.lang.SecurityException": JavaSecurityException,
     "java.lang.IllegalArgumentException": JavaIllegalArgumentException,
     "java.lang.NoSuchMethodException": JavaNoSuchMethodException,
@@ -311,4 +285,5 @@ JAVA_EXCEPTION_MAP = {
     "java.lang.ArrayIndexOutOfBoundsException": JavaIndexOutOfBoundsException,
     "java.lang.StringIndexOutOfBoundsException": JavaIndexOutOfBoundsException,
     "java.lang.NumberFormatException": JavaNumberFormatException,
+    "java.lang.RuntimeException": JavaRuntimeException,
 }

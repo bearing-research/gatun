@@ -5,9 +5,9 @@ What Gatun's operations cost, measured, and how single calls compare with Py4J (
 ## What the numbers say
 
 - **A single call is slower than Py4J's.** An instance method call takes about 150 μs through Gatun and about 77 μs through Py4J on the test machine, and a loop of calls runs at about 5,500 a second against 9,500 to 11,000. Creating an object and dropping it costs Gatun two round trips (the second releases the object), which is where its largest deficit is.
-- **Gatun is faster when a call carries a collection or a large return value.** A Python list of 100 integers becomes an `ArrayList` in 2.1 ms against 10.8 ms. `is_instance_of` is one round trip, not several (145 μs against 519 μs). Py4J takes about 40 ms to return a string of 8 KB or a byte array of 16 KB; Gatun takes 0.2 ms.
+- **Gatun is faster when a call carries a collection or a large return value.** A Python list of 100 integers becomes an `ArrayList` in 0.55 ms against 6.2 ms. `is_instance_of` is one round trip, not several (145 μs against 519 μs). Py4J takes about 40 ms to return a string of 8 KB or a byte array of 16 KB; Gatun takes 0.2 ms.
 - **Round trips are the cost, so sending several operations together pays.** A hundred method calls take 19 ms one at a time, 5.1 ms in a `batch()` and 4.3 ms as one `invoke_methods()`.
-- **Bulk data belongs in Arrow.** 16 MB of columns reaches Java in 1.3 to 3.6 ms depending on the method, and 128 MiB in 8 to 28 ms, where an Arrow stream over a Unix socket takes 106 ms. Getting 500 integers into Java takes 92 ms as 500 calls and 0.25 ms as one `pyarrow.Array` argument.
+- **Bulk data belongs in Arrow.** 16 MB of columns reaches Java in 1.3 to 3.6 ms depending on the method, and 128 MiB in 8 to 28 ms, where an Arrow stream over a Unix socket takes 106 ms. Getting 500 integers into Java takes 78 ms as 500 calls, 0.35 ms as one Python list and 0.19 ms as one `pyarrow.Array` argument.
 - **A callback costs about 390 μs** with the default callback timeout, and 230 μs with `callback_timeout=None`.
 
 ## Test environment
@@ -76,9 +76,9 @@ Median microseconds unless marked. The last column compares Gatun with Py4J as P
 | 3.6 two instance calls | 536 μs | 651 μs | 267 μs | 320 μs | 257 μs | 2.0x slower |
 | 4.1 static field, int | 158 μs | 181 μs | 75.4 μs | 83.0 μs | 80.7 μs | 2.1x slower |
 | 4.2 static field, object | 323 μs | 381 μs | 163 μs | 177 μs | 163 μs | 2.0x slower |
-| 5.1 list of 10 as an argument, then two calls | 876 μs | 1.08 ms | 1.53 ms | 1.71 ms | n/a | 1.7x faster |
-| 5.2 list of 100 as an argument, then two calls | 2.08 ms | 2.54 ms | 10.8 ms | 12.2 ms | n/a | 5.2x faster |
-| 5.3 dict of 3 as an argument, then two calls | 892 μs | 1.06 ms | 850 μs | 954 μs | n/a | the same |
+| 5.1 list of 10 as an argument, then two calls | 528 μs | 624 μs | 809 μs | 1.17 ms | n/a | 1.5x faster |
+| 5.2 list of 100 as an argument, then two calls | 554 μs | 700 μs | 6.19 ms | 7.48 ms | n/a | 11x faster |
+| 5.3 dict of 3 as an argument, then two calls | 651 μs | 789 μs | 601 μs | 753 μs | n/a | 1.1x slower |
 | 5.4 110 bytes in and out, four calls | 968 μs | 1.17 ms | 553 μs | 723 μs | 477 μs | 1.8x slower |
 | 5.5 1 KB in and out, four calls | 1.00 ms | 1.30 ms | 625 μs | 731 μs | 545 μs | 1.6x slower |
 | 6.1 returns an int | 147 μs | 194 μs | 79.4 μs | 101 μs | 79.1 μs | 1.8x slower |
@@ -90,6 +90,8 @@ Median microseconds unless marked. The last column compares Gatun with Py4J as P
 | 8.2 `is_instance_of`, false | 138 μs | 173 μs | 521 μs | 567 μs | 468 μs | 3.8x faster |
 | 9.1 `jvm.java.lang.Math.max(10, 20)`, full path | 206 μs | 232 μs | 512 μs | 581 μs | 450 μs | 2.5x faster |
 | 9.2 `jvm.java.util.ArrayList()`, full path | 300 μs | 371 μs | 402 μs | 498 μs | 368 μs | 1.3x faster |
+
+Rows 5.1 to 5.3 are from a later run, on the build that sends a list as one vector (protocol version 5), and both of their bridges were timed in it. That run was on another host of the same kind, where every round trip was shorter (an instance call took 112 μs through Gatun and 44 μs through Py4J), so compare those rows within themselves and not with their neighbours.
 
 Three things explain most of the table:
 
@@ -241,22 +243,34 @@ Getting 500 integers into Java:
 
 | How | Median | Against 500 calls |
 |---|---:|---:|
-| 500 `add()` calls | 92.1 ms | |
-| 500 `add()` calls in a `batch()` | 23.7 ms | 3.9x faster |
-| A Python list as a constructor argument | 6.73 ms | 14x faster |
-| An `int32` `pyarrow.Array` as an argument (arrives as `int[]`) | 248 μs | 370x faster |
-| A table with `arrow_to_java()` | 443 μs | 208x faster |
+| 500 `add()` calls | 77.7 ms | |
+| 500 `add()` calls in a `batch()` | 22.4 ms | 3.5x faster |
+| A Python list as a constructor argument | 353 μs | 220x faster |
+| An `int32` `pyarrow.Array` as an argument (arrives as `int[]`) | 193 μs | 404x faster |
+| A table with `arrow_to_java()` | 357 μs | 217x faster |
 
 Collections and arrays as arguments, by size:
 
 | Argument | 100 elements | 500 elements |
 |---|---:|---:|
-| `list` of ints to `ArrayList` | 1.75 ms | 6.78 ms |
-| `dict` to `HashMap` | 4.32 ms | 19.0 ms |
-| `pyarrow` `int32` array to `int[]` | 249 μs | 234 μs |
-| `pyarrow` `float64` array to `double[]` | 230 μs | 233 μs |
+| `list` of ints to `ArrayList` | 316 μs | 318 μs |
+| `list` of strings to `ArrayList` | 343 μs | 385 μs |
+| `list` of ints and strings to `ArrayList` | 1.74 ms | 6.97 ms |
+| `dict` of string keys and int values to `HashMap` | 365 μs | 434 μs |
+| `pyarrow` `int32` array to `int[]` | 180 μs | 173 μs |
+| `pyarrow` `float64` array to `double[]` | 175 μs | 193 μs |
 
-A list costs about 13 μs an element and a dict about 37 μs an entry, each element being encoded on its own. An array costs the same at 100 elements as at 500. A command holds 64 KB, which a dict of a thousand entries exceeds.
+Collections as return values:
+
+| Returned | 100 elements | 500 elements |
+|---|---:|---:|
+| `ArrayList` of ints to `list` | 120 μs | 153 μs |
+| `ArrayList` of strings to `list` | 160 μs | 214 μs |
+| `HashMap` of string keys and int values to `dict` | 216 μs | 339 μs |
+
+A list whose elements are all ints, all floats, all bools or all strings travels as one vector, and a dict as two such lists, so the length hardly shows: the 300 μs and more of the argument rows is mostly the two round trips of creating the collection and releasing it. A list of mixed types is encoded one element at a time, at about 14 μs each. Until protocol version 5 every list and dict was: measured on the same machine in alternation with the figures above, 500 ints took 5.97 ms as an argument and 5.58 ms as a return value, and a dict of 500 took 14.6 ms and 12.9 ms. A command holds 64 KB, which is about 8,000 ints or a dict of 3,000 short entries; beyond that, use Arrow.
+
+These three tables are from a later build than the rest of this document (the commit that introduced protocol version 5), in two runs of their own.
 
 ## Where a call's time goes
 
