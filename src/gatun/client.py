@@ -160,7 +160,7 @@ def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int)
 PROTOCOL_VERSION = 5
 
 # Memory zone sizes - must match GatunServer.java constants
-COMMAND_ZONE_SIZE = 65536  # 64KB for commands
+COMMAND_ZONE_SIZE = wire.COMMAND_ZONE_SIZE  # 64KB for commands
 RESPONSE_ZONE_SIZE = 65536  # 64KB for responses
 
 # Maximum size for callback error messages to prevent exceeding command zone.
@@ -5380,7 +5380,79 @@ class BatchContext:
         # client's shared builder.
         self._client._check_reentrancy()
 
-        # Build the batch command
+        # Nothing has been sent up to the exchange below, so a failure before it
+        # (an argument that cannot be encoded, say) leaves the batch as it was.
+        # From there on it counts as executed whatever happens: Java may have
+        # run some of it.
+        data = wire.pack_batch(
+            self._command_data, self._client._object_ref_types, self._stop_on_error
+        )
+        packed = data is not None
+        if data is None:
+            data = self._build()
+        if len(data) > self._client.payload_offset:
+            raise PayloadTooLargeError(
+                len(data), self._client.payload_offset, "Command"
+            )
+        call = _channel_call_of(self._client)
+        if call is not None:
+            # On the callback connection the command travels wrapped, in a
+            # frame with a limit of its own: refused here, it was not sent
+            _nested_command(call.call_id, data)
+
+        self._executed = True
+        try:
+            # The ordinary exchange: it serves callbacks that the batched calls
+            # trigger, and marks the connection dead if it is interrupted
+            batch_resp = self._client._send_raw(data, packed=packed)
+        except BaseException as e:
+            self._error = e
+            raise
+        finally:
+            self._targets.clear()
+        if not isinstance(batch_resp, BatchResponse.BatchResponse):
+            self._error = RuntimeError("Expected BatchResponse but got something else")
+            raise self._error
+
+        _ = batch_resp.ErrorIndex()  # Available for debugging
+        response_count = batch_resp.ResponsesLength()
+        # Most results are one plain value, read without the generated classes
+        plain = wire.batch_values(
+            batch_resp._tab.Bytes, batch_resp._tab.Pos, self._client, JavaObject
+        )
+
+        # Unpack each sub-response
+        for i in range(response_count):
+            if plain[i] is not wire.NOT_PLAIN:
+                self._results.append(plain[i])
+                continue
+            sub_resp = batch_resp.Responses(i)
+            if sub_resp.IsError():
+                error_msg = sub_resp.ErrorMsg().decode("utf-8")
+                error_type_bytes = sub_resp.ErrorType()
+                error_type = (
+                    error_type_bytes.decode("utf-8")
+                    if error_type_bytes
+                    else "java.lang.RuntimeException"
+                )
+                # Store exception object instead of raising
+                exc = self._make_exception(error_type, error_msg)
+                self._results.append(exc)
+            else:
+                value = self._client._unpack_value(
+                    sub_resp.ReturnValType(), sub_resp.ReturnVal()
+                )
+                self._results.append(value)
+
+        # Fill remaining slots with None if stopped early
+        while len(self._results) < len(self._command_data):
+            self._results.append(None)
+
+        return self._results
+
+    def _build(self) -> bytes:
+        """The batch command, made with the builder: for a batch with a command
+        that `wire.pack_batch` does not cover."""
         builder = self._client._get_builder(large=True)
 
         # Build all sub-commands first (must be done before BatchCommand)
@@ -5434,62 +5506,7 @@ class BatchContext:
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        # Nothing has been sent up to here, so a failure above (an argument that
-        # cannot be encoded, say) leaves the batch as it was. From here on it
-        # counts as executed whatever happens: Java may have run some of it.
-        data = builder.Output()
-        if len(data) > self._client.payload_offset:
-            raise PayloadTooLargeError(
-                len(data), self._client.payload_offset, "Command"
-            )
-        call = _channel_call_of(self._client)
-        if call is not None:
-            # On the callback connection the command travels wrapped, in a
-            # frame with a limit of its own: refused here, it was not sent
-            _nested_command(call.call_id, data)
-
-        self._executed = True
-        try:
-            # The ordinary exchange: it serves callbacks that the batched calls
-            # trigger, and marks the connection dead if it is interrupted
-            batch_resp = self._client._send_raw(data)
-        except BaseException as e:
-            self._error = e
-            raise
-        finally:
-            self._targets.clear()
-        if not isinstance(batch_resp, BatchResponse.BatchResponse):
-            self._error = RuntimeError("Expected BatchResponse but got something else")
-            raise self._error
-
-        _ = batch_resp.ErrorIndex()  # Available for debugging
-        response_count = batch_resp.ResponsesLength()
-
-        # Unpack each sub-response
-        for i in range(response_count):
-            sub_resp = batch_resp.Responses(i)
-            if sub_resp.IsError():
-                error_msg = sub_resp.ErrorMsg().decode("utf-8")
-                error_type_bytes = sub_resp.ErrorType()
-                error_type = (
-                    error_type_bytes.decode("utf-8")
-                    if error_type_bytes
-                    else "java.lang.RuntimeException"
-                )
-                # Store exception object instead of raising
-                exc = self._make_exception(error_type, error_msg)
-                self._results.append(exc)
-            else:
-                value = self._client._unpack_value(
-                    sub_resp.ReturnValType(), sub_resp.ReturnVal()
-                )
-                self._results.append(value)
-
-        # Fill remaining slots with None if stopped early
-        while len(self._results) < len(self._command_data):
-            self._results.append(None)
-
-        return self._results
+        return bytes(builder.Output())
 
     def _make_exception(self, error_type: str, error_msg: str) -> Exception:
         """Create an exception object without raising it."""

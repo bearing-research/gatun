@@ -337,7 +337,7 @@ public class GatunServer {
     // A session's thread spends its life blocked on its socket, and a platform thread wakes
     // from that in one step: the kernel makes it runnable. A virtual thread needs the poller
     // thread to notice the socket and then a carrier to be woken for it, which made every
-    // request about 25 microseconds slower. Sessions are few (gatun.limits.max_sessions), so
+    // request about 30 microseconds slower. Sessions are few (gatun.limits.max_sessions), so
     // a thread each costs little. A new thread per session, never a reused one: the session's
     // thread-locals end with it.
     this.threadPool =

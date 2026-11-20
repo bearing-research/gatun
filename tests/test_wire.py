@@ -24,6 +24,7 @@ from gatun import (
 from gatun.client import JavaObject, TypeHint
 from gatun.generated.org.gatun.protocol import (
     Action,
+    BatchResponse,
     BoolVal,
     Command,
     DoubleVal,
@@ -170,6 +171,12 @@ class TestPackCommand:
     def test_what_it_leaves_to_the_builder(self, value):
         assert wire.pack_command(INVOKE, "add", 1, (value,), ()) is None
 
+    def test_a_command_past_the_command_zone_is_left_to_the_builder(self):
+        """The builder writes fewer bytes for the same command, and may fit it in."""
+        fits = wire.pack_command(INVOKE, "add", 1, ("x" * 65_000,), ())
+        assert fits is not None and len(fits) <= wire.COMMAND_ZONE_SIZE
+        assert wire.pack_command(INVOKE, "add", 1, ("x" * 65_400,), ()) is None
+
     def test_a_name_or_an_id_of_another_type_is_left_to_the_builder(self):
         assert wire.pack_command(INVOKE, b"size", 1, (), ()) is None
         assert wire.pack_command(INVOKE, "size", "1", (), ()) is None
@@ -219,6 +226,79 @@ class TestWithFrees:
         assert command.AnswersSent() == 2
         assert command.ArgsLength() == 0
         assert command.TargetId() == 0
+
+
+BATCH_COMMANDS = [
+    (Action.Action.CreateObject, 0, "java.util.ArrayList", ()),
+    (INVOKE, 7, "add", ("héllo",)),
+    (INVOKE, 2**40, "set", (0, 1.5)),
+    (Action.Action.InvokeStaticMethod, 0, "java.lang.Math.max", (10, 20)),
+    (Action.Action.GetField, 7, "size", ()),
+    (Action.Action.SetField, 7, "flag", (True,)),
+    (INVOKE, 7, "add", (None,)),
+    (INVOKE, 7, "add", (Handle(99),)),
+]
+
+
+class TestPackBatch:
+    @pytest.mark.parametrize("stop_on_error", [False, True])
+    def test_every_command_reads_back(self, stop_on_error):
+        outer = read_command(wire.pack_batch(BATCH_COMMANDS, (Handle,), stop_on_error))
+
+        assert outer.Action() == Action.Action.Batch
+        assert outer.TargetName() is None
+        assert outer.ArgsLength() == 0
+        assert outer.FreeIdsLength() == 0
+        batch = outer.Batch()
+        assert batch.StopOnError() is stop_on_error
+        assert batch.CommandsLength() == len(BATCH_COMMANDS)
+        for index, (action, target_id, name, args) in enumerate(BATCH_COMMANDS):
+            command = batch.Commands(index)
+            assert command.Action() == action
+            assert command.TargetId() == target_id
+            assert command.TargetName() == name.encode()
+            assert command.ArgsLength() == len(args)
+            assert command.Batch() is None
+            for position, value in enumerate(args):
+                expected = value.object_id if isinstance(value, Handle) else value
+                assert argument_of(command, position)[1] == expected
+
+    def test_any_number_of_commands(self):
+        # The vector of commands is padded to a multiple of 8 for odd counts
+        for count in range(1, 12):
+            commands = [(INVOKE, n, "n" * n, (n,)) for n in range(count)]
+            batch = read_command(wire.pack_batch(commands, (), False)).Batch()
+            assert batch.CommandsLength() == count
+            for n in range(count):
+                assert batch.Commands(n).TargetId() == n
+                assert batch.Commands(n).TargetName() == b"n" * n
+                assert argument_of(batch.Commands(n), 0) == (V.IntVal, n)
+
+    def test_ids_ride_on_a_batch(self):
+        packed = wire.pack_batch(BATCH_COMMANDS, (Handle,), True)
+
+        outer = read_command(wire.with_frees(packed, [3, 4], 6))
+
+        assert [outer.FreeIds(i) for i in range(outer.FreeIdsLength())] == [3, 4]
+        assert outer.AnswersSent() == 6
+        assert outer.Action() == Action.Action.Batch
+        assert outer.Batch().StopOnError() is True
+        assert outer.Batch().CommandsLength() == len(BATCH_COMMANDS)
+        assert outer.Batch().Commands(1).TargetName() == b"add"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            (INVOKE, 7, "add", ([1, 2],)),
+            (INVOKE, 7, "add", (2**70,)),
+            (INVOKE, 7, None, ()),
+            (INVOKE, 7, "add", (Handle(1),)),  # not given as an object type
+        ],
+    )
+    def test_one_command_for_the_builder_leaves_it_the_batch(self, command):
+        commands = [BATCH_COMMANDS[1], command, BATCH_COMMANDS[2]]
+
+        assert wire.pack_batch(commands, (), False) is None
 
 
 def response_with(kind, add_value, force_defaults=False):
@@ -368,6 +448,67 @@ class TestReadPlain:
         assert wire.read_plain(bytes(builder.Output()), None, as_pair) is wire.NOT_PLAIN
 
 
+class TestBatchValues:
+    def batch_response(self, add_responses):
+        """A Response holding a BatchResponse; returns the bytes and its table."""
+        builder = flatbuffers.Builder(1024)
+        responses = add_responses(builder)
+        BatchResponse.StartResponsesVector(builder, len(responses))
+        for offset in reversed(responses):
+            builder.PrependUOffsetTRelative(offset)
+        vector = builder.EndVector()
+        BatchResponse.Start(builder)
+        BatchResponse.AddResponses(builder, vector)
+        batch = BatchResponse.End(builder)
+        Response.Start(builder)
+        Response.AddBatch(builder, batch)
+        builder.Finish(Response.End(builder))
+        data = bytes(builder.Output())
+        return data, Response.Response.GetRootAsResponse(data, 0).Batch()._tab.Pos
+
+    def test_each_response_is_read_or_left(self):
+        def add_responses(builder):
+            offsets = []
+            for kind, add_value in (
+                (V.IntVal, int_value(7)),
+                (V.StringVal, string_value("wörld")),
+                (V.BoolVal, bool_value(False)),
+                (V.NullVal, null_value),
+                (V.ObjectRef, object_value(12)),
+                (V.DoubleVal, double_value(2.5)),
+            ):
+                value = add_value(builder)
+                Response.Start(builder)
+                Response.AddReturnValType(builder, kind)
+                Response.AddReturnVal(builder, value)
+                offsets.append(Response.End(builder))
+            message = builder.CreateString("boom")
+            Response.Start(builder)
+            Response.AddIsError(builder, True)
+            Response.AddErrorMsg(builder, message)
+            offsets.append(Response.End(builder))
+            offsets.append(offsets[0])  # the same table twice
+            return offsets
+
+        data, batch = self.batch_response(add_responses)
+
+        assert wire.batch_values(data, batch, "client", as_pair) == [
+            7,
+            "wörld",
+            False,
+            None,
+            ("object", "client", 12),
+            2.5,
+            wire.NOT_PLAIN,
+            7,
+        ]
+
+    def test_no_responses(self):
+        data, batch = self.batch_response(lambda builder: [])
+
+        assert wire.batch_values(data, batch, None, as_pair) == []
+
+
 class TestPackedCalls:
     """The same answers whichever way a command was built."""
 
@@ -444,6 +585,106 @@ class TestPackedCalls:
 
         assert size.get() == 40
         assert items.get(39) == [19]
+
+    def test_batch_of_plain_commands(self, client):
+        items = client.create_object("java.util.ArrayList")
+        text = client.create_object("java.lang.StringBuilder", "hello")
+        with client.batch() as batch:
+            made = batch.create("java.util.ArrayList", 16)
+            adds = [batch.call(items, "add", value) for value in ("a", 7, 1.5, None)]
+            added = batch.call(items, "add", text)
+            size = batch.call(items, "size")
+            first = batch.call(items, "get", 0)
+            last = batch.call(items, "get", 4)
+            largest = batch.call_static("java.lang.Math", "max", 10, 20)
+            count = batch.get_field(text, "count")
+            cleared = batch.call(items, "clear")
+
+        assert isinstance(made.get(), JavaObject)
+        assert made.get().size() == 0
+        assert [add.get() for add in adds] == [True] * 4
+        assert added.get() is True
+        assert size.get() == 5
+        assert first.get() == "a"
+        assert last.get().toString() == "hello"
+        assert largest.get() == 20
+        assert count.get() == 5
+        assert cleared.get() is None
+        assert items.size() == 0
+
+    def test_batch_with_an_error_in_the_middle(self, client):
+        items = client.create_object("java.util.ArrayList")
+        with client.batch() as batch:
+            before = batch.call(items, "add", "first")
+            failed = batch.call_static("java.lang.Integer", "parseInt", "no")
+            after = batch.call(items, "size")
+
+        assert before.get() is True
+        assert failed.is_error
+        with pytest.raises(JavaNumberFormatException):
+            failed.get()
+        assert after.get() == 1
+
+        with client.batch(stop_on_error=True) as batch:
+            before = batch.call(items, "add", "second")
+            failed = batch.call_static("java.lang.Integer", "parseInt", "no")
+            after = batch.call(items, "add", "never")
+
+        assert before.get() is True
+        assert failed.is_error
+        assert after.get() is None
+        assert items.size() == 2
+
+    def test_batch_with_a_command_for_the_builder(self, client):
+        items = client.create_object("java.util.ArrayList")
+        with client.batch() as batch:
+            batch.call(items, "add", 1)
+            batch.call(items, "add", [2, 3])  # a list: the whole batch is built
+            batch.call(items, "add", TypeHint(4, "long"))
+            size = batch.call(items, "size")
+
+        assert size.get() == 3
+        assert items.get(1) == [2, 3]
+
+    def test_batch_of_many_commands(self, client):
+        items = client.create_object("java.util.ArrayList")
+        with client.batch() as batch:
+            results = [batch.call(items, "add", f"item {n}") for n in range(500)]
+            size = batch.call(items, "size")
+
+        assert all(result.get() is True for result in results)
+        assert size.get() == 500
+        assert items.get(499) == "item 499"
+
+    def test_a_string_that_only_the_builder_fits_in(self, client):
+        items = client.create_object("java.util.ArrayList")
+        text = "x" * 65_400
+
+        items.add(text)
+
+        assert items.get(0) == text
+
+    def test_a_batch_that_only_the_builder_fits_in(self, client):
+        items = client.create_object("java.util.ArrayList")
+        commands = [(INVOKE, items.object_id, "add", (n,)) for n in range(800)]
+        assert wire.pack_batch(commands, (JavaObject,), False) is None
+
+        with client.batch() as batch:
+            for n in range(800):
+                batch.call(items, "add", n)
+
+        assert items.size() == 800
+
+    def test_batch_too_large_for_a_command_is_refused(self, client):
+        items = client.create_object("java.util.ArrayList")
+        batch = client.batch()
+        for _ in range(100):
+            batch.call(items, "add", "x" * 1000)
+
+        with pytest.raises(PayloadTooLargeError):
+            batch.execute()
+
+        assert items.size() == 0
 
     async def test_async_client(self):
         client = await aconnect()
@@ -556,6 +797,21 @@ class TestRidingReleases:
 
         assert live_objects(client) == baseline
         assert requests_of(client, "FreeObject") == 1
+
+    def test_a_batch_takes_them_too(self, own_client):
+        client = own_client
+        kept = client.create_object("java.util.ArrayList")
+        baseline = live_objects(client)
+        for _ in range(10):
+            client.create_object("java.util.ArrayList")
+        gc.collect()
+
+        with client.batch() as batch:
+            size = batch.call(kept, "size")
+
+        assert size.get() == 0
+        assert live_objects(client) == baseline
+        assert requests_of(client, "FreeObject") == 0
 
     def test_releases_on_a_cancelled_command_are_sent_again(self, own_client):
         """The client cannot tell whether the server got to them, so it repeats them."""

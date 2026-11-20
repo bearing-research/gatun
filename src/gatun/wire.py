@@ -11,14 +11,17 @@ through the builder as before:
   arguments that are each an `int`, a `float`, a `bool`, a `str`, `None` or a
   Java object. That is every method call, static call and constructor call
   whose arguments are plain.
-- `with_frees`: the same command with object IDs to release added to it
+- `pack_batch`: a batch whose commands are all of that kind.
+- `with_frees`: one of those commands with object IDs to release added to it
   (`Command.free_ids`), so that dropping an object costs no round trip.
-- `read_plain`: the value of a response that is one such value and nothing else.
+- `read_plain`: the value of a response that is one such value and nothing else,
+  and `batch_values`, the same for each response of a batch.
 
 The layout below is written out by hand from `schemas/commands.fbs`. A vtable
 slot is 4 + 2 * (the field's position in its table), and a union field takes two
 positions, its type and its value. Change the order of the fields of `Command`,
-`Argument`, `Response` or the value tables there and this file must follow;
+`Argument`, `BatchCommand`, `Response`, `BatchResponse` or the value tables
+there and this file must follow;
 `tests/test_wire.py` reads what is packed here back with the generated classes.
 """
 
@@ -28,6 +31,12 @@ import struct
 from typing import Any
 
 from gatun.generated.org.gatun.protocol import Action, Value
+
+# What a command may take of the shared memory. A command packed here is some
+# tens of bytes longer than the builder's (every field of its tables is
+# present), so one that would pass this is left to the builder, which may still
+# fit it in.
+COMMAND_ZONE_SIZE = 65536
 
 _INT = Value.Value.IntVal
 _STRING = Value.Value.StringVal
@@ -110,19 +119,19 @@ _u32 = struct.Struct("<I")
 _i64 = struct.Struct("<q")
 
 
-def pack_command(
+def _command_parts(
+    base: int,
     action: int,
     name: str,
     target_id: int,
     args: tuple[Any, ...],
     ref_types: tuple[type, ...],
-    return_object_ref: bool = False,
-) -> bytes | None:
-    """The bytes of a command, or None if it has to go through the builder.
+    return_object_ref: bool,
+) -> tuple[bytes, ...] | None:
+    """A Command table that starts `base` bytes into the buffer, with its name
+    and arguments after it, or None if the builder has to make this command.
 
-    The exact type of an argument decides. A subclass of `int` or `str`, a
-    `TypeHint`, a collection, an integer that does not fit in 64 bits: all of
-    those get None, and the builder treats them as it always has.
+    `base` is a multiple of 8, and so is the length of what is returned.
     """
     if type(name) is not str or type(target_id) is not int:
         return None
@@ -132,24 +141,21 @@ def pack_command(
         string += _PADDING[-len(string) % 8]
         count = len(args)
         if not count:
-            return b"".join(
-                (
-                    _HEADER,
-                    _pack_command_table(
-                        _COMMAND - _VT_COMMAND,
-                        _NAME_DISTANCE,
-                        target_id,
-                        0,
-                        _NO_ARGS,
-                        _NO_FREE_IDS,
-                        action,
-                        return_object_ref,
-                    ),
-                    string,
-                )
+            return (
+                _pack_command_table(
+                    base - _VT_COMMAND,
+                    _NAME_DISTANCE,
+                    target_id,
+                    0,
+                    _NO_ARGS,
+                    _NO_FREE_IDS,
+                    action,
+                    return_object_ref,
+                ),
+                string,
             )
 
-        vector = _NAME + len(string)
+        vector = base + _NAME - _COMMAND + len(string)
         # The vector is a count and one distance per argument, each from its
         # own place in the vector to the argument's table
         at = vector + 4 + 4 * count
@@ -217,29 +223,132 @@ def pack_command(
             entry += 4
             blocks.append(block)
             at += len(block)
-        return b"".join(
-            (
-                _HEADER,
-                _pack_command_table(
-                    _COMMAND - _VT_COMMAND,
-                    _NAME_DISTANCE,
-                    target_id,
-                    0,
-                    vector - (_COMMAND + _AT_ARGS),
-                    _NO_FREE_IDS,
-                    action,
-                    return_object_ref,
-                ),
-                string,
-                struct.pack(f"<{count + 1}I", count, *distances),
-                _PADDING[skip],
-                *blocks,
-            )
+        return (
+            _pack_command_table(
+                base - _VT_COMMAND,
+                _NAME_DISTANCE,
+                target_id,
+                0,
+                vector - (base + _AT_ARGS),
+                _NO_FREE_IDS,
+                action,
+                return_object_ref,
+            ),
+            string,
+            struct.pack(f"<{count + 1}I", count, *distances),
+            _PADDING[skip],
+            *blocks,
         )
     except (struct.error, UnicodeError):
         # An integer past 64 bits, a string that is not valid Unicode: the
         # builder's error for it is the one callers know
         return None
+
+
+def pack_command(
+    action: int,
+    name: str,
+    target_id: int,
+    args: tuple[Any, ...],
+    ref_types: tuple[type, ...],
+    return_object_ref: bool = False,
+) -> bytes | None:
+    """The bytes of a command, or None if it has to go through the builder.
+
+    The exact type of an argument decides. A subclass of `int` or `str`, a
+    `TypeHint`, a collection, an integer that does not fit in 64 bits: all of
+    those get None, and the builder treats them as it always has.
+    """
+    parts = _command_parts(
+        _COMMAND, action, name, target_id, args, ref_types, return_object_ref
+    )
+    if parts is None:
+        return None
+    command = b"".join((_HEADER, *parts))
+    return command if len(command) <= COMMAND_ZONE_SIZE else None
+
+
+# A batch starts like any packed command, with the same vtables and a Command
+# table in the same place, so that `with_frees` works on it. That Command has
+# other fields (the action, the batch, and the two `with_frees` fills in) and
+# so a vtable of its own, which comes after it, as does the BatchCommand's.
+# The batch's commands follow, each laid out as `_command_parts` does.
+_VT_BATCH_OUTER = _EMPTY_VECTOR + 8
+_VT_BATCH = _VT_BATCH_OUTER + 40
+_BATCH = _VT_BATCH + 8
+_BATCH_COMMANDS = _BATCH + 16
+# The outer Command keeps its BatchCommand in the room after return_object_ref
+_AT_BATCH = 36
+
+_batch_outer_slots = [0] * 18
+_batch_outer_slots[0] = _AT_ACTION
+_batch_outer_slots[7] = _AT_BATCH
+_batch_outer_slots[14] = _AT_ANSWERS_SENT
+_batch_outer_slots[17] = _AT_FREE_IDS
+
+
+def _batch_header(stop_on_error: bool) -> bytes:
+    header = (
+        _HEADER
+        # The outer Command and the empty vector: the vtable's distance (it is
+        # behind the table, so negative), answers_sent, the distance of
+        # free_ids, the action, the distance of the batch
+        + struct.pack(
+            "<i12xq4xIB3xI8x",
+            _COMMAND - _VT_BATCH_OUTER,
+            0,
+            _NO_FREE_IDS,
+            Action.Action.Batch,
+            _BATCH - (_COMMAND + _AT_BATCH),
+        )
+        + struct.pack("<20H", 40, _COMMAND_SIZE, *_batch_outer_slots)
+        # BatchCommand: commands, stop_on_error
+        + struct.pack("<4H", 8, 12, 4, 8)
+        + struct.pack(
+            "<iI?7x", _BATCH - _VT_BATCH, _BATCH_COMMANDS - (_BATCH + 4), stop_on_error
+        )
+    )
+    assert len(header) == _BATCH_COMMANDS
+    return header
+
+
+_BATCH_HEADERS = (_batch_header(False), _batch_header(True))
+
+
+def pack_batch(
+    commands: list[tuple[int, int, Any, tuple[Any, ...]]],
+    ref_types: tuple[type, ...],
+    stop_on_error: bool,
+) -> bytes | None:
+    """The bytes of a Batch command, or None if the builder has to make it.
+
+    `commands` holds an action, an object ID, a name and the arguments for each
+    command of the batch. One command that `pack_command` would leave to the
+    builder leaves the whole batch to it, and so does a batch too long for the
+    command zone.
+    """
+    count = len(commands)
+    entry = _BATCH_COMMANDS + 4
+    base = entry + 4 * count
+    skip = -base % 8
+    base += skip
+    distances = []
+    parts = [_BATCH_HEADERS[bool(stop_on_error)], b"", _PADDING[skip]]
+    for action, target_id, name, args in commands:
+        block = _command_parts(base, action, name, target_id, args, ref_types, False)
+        if block is None or base > COMMAND_ZONE_SIZE:
+            return None
+        distances.append(base - entry)
+        entry += 4
+        parts += block
+        for part in block:
+            base += len(part)
+    try:
+        parts[1] = struct.pack(f"<{count + 1}I", count, *distances)
+    except struct.error:
+        # More than 4 GiB of commands: the builder refuses it in its own words
+        return None
+    return b"".join(parts) if base <= COMMAND_ZONE_SIZE else None
 
 
 def with_frees(command: bytes, ids: list[int], answers_sent: int = 0) -> bytes:
@@ -302,7 +411,28 @@ def read_plain(buf: bytes, client: Any, ref_class: Any) -> Any:
     an object, which becomes `ref_class(client, object_id)`. Everything else,
     errors and callbacks among it, is for the generated reader.
     """
-    table = _u32_at(buf, 0)[0]
+    return _plain_at(buf, _u32_at(buf, 0)[0], client, ref_class)
+
+
+def batch_values(buf: bytes, batch: int, client: Any, ref_class: Any) -> list[Any]:
+    """What `read_plain` makes of each response of the BatchResponse table that
+    starts `batch` bytes into `buf`: its value, or NOT_PLAIN.
+    """
+    vtable = batch - _i32(buf, batch)[0]
+    slot = _u16(buf, vtable + 4)[0] if _u16(buf, vtable)[0] > 4 else 0
+    if not slot:
+        return []
+    entry = batch + slot
+    entry += _u32_at(buf, entry)[0]
+    values = []
+    for _ in range(_u32_at(buf, entry)[0]):
+        entry += 4
+        values.append(_plain_at(buf, entry + _u32_at(buf, entry)[0], client, ref_class))
+    return values
+
+
+def _plain_at(buf: bytes, table: int, client: Any, ref_class: Any) -> Any:
+    """`read_plain` for the Response table that starts `table` bytes into `buf`."""
     vtable = table - _i32(buf, table)[0]
     if _u16(buf, vtable)[0] != _PLAIN_VTABLE_SIZE:
         return NOT_PLAIN
