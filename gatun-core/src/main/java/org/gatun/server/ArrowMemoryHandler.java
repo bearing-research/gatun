@@ -4,7 +4,9 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
@@ -13,6 +15,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Logger;
+import org.apache.arrow.flatbuf.Message;
+import org.apache.arrow.flatbuf.MessageHeader;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.OwnershipTransferResult;
@@ -138,7 +142,12 @@ public class ArrowMemoryHandler implements AutoCloseable {
    * overwrite data that batch still points at.
    */
   public long getLoadedEnd() {
-    return (loadedEnd + ALIGNMENT - 1) & ~((long) ALIGNMENT - 1);
+    return aligned(loadedEnd);
+  }
+
+  /** The first offset at or after {@code offset} where an Arrow buffer may start. */
+  static long aligned(long offset) {
+    return (offset + ALIGNMENT - 1) & ~((long) ALIGNMENT - 1);
   }
 
   /**
@@ -183,6 +192,124 @@ public class ArrowMemoryHandler implements AutoCloseable {
         throw t;
       }
     }
+  }
+
+  /**
+   * One message of an Arrow IPC stream.
+   *
+   * @param metadata a copy of the message's metadata
+   * @param start where the message starts in the stream, at its length prefix
+   * @param bodyStart where its body starts
+   * @param end one past the last byte of its body
+   */
+  record IpcMessage(Message metadata, long start, long bodyStart, long end) {
+    long bodyLength() {
+      return end - bodyStart;
+    }
+  }
+
+  private static final ValueLayout.OfInt STREAM_INT =
+      ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+  /**
+   * Find the messages of an Arrow IPC stream without reading their bodies: where each lies is all
+   * that is needed to hand the bytes on as they are.
+   *
+   * @param stream exactly the bytes of the stream
+   */
+  static List<IpcMessage> ipcMessages(MemorySegment stream) {
+    long size = stream.byteSize();
+    List<IpcMessage> messages = new ArrayList<>();
+    long position = 0;
+    try {
+      while (size - position >= 4) {
+        long start = position;
+        int metadataLength = stream.get(STREAM_INT, position);
+        position += 4;
+        if (metadataLength == -1) {
+          // The continuation marker; streams written before Arrow 0.15 have none
+          if (size - position < 4) {
+            throw new IllegalArgumentException("the stream ends inside a message's length");
+          }
+          metadataLength = stream.get(STREAM_INT, position);
+          position += 4;
+        }
+        if (metadataLength == 0) {
+          break; // the end-of-stream marker
+        }
+        if (metadataLength < 0 || metadataLength > size - position) {
+          throw new IllegalArgumentException(
+              "message metadata of " + metadataLength + " bytes at offset " + start);
+        }
+        // Parsed from a copy: the client can change shared memory while it is being read
+        byte[] metadata = new byte[metadataLength];
+        MemorySegment.copy(stream, ValueLayout.JAVA_BYTE, position, metadata, 0, metadataLength);
+        position += metadataLength;
+        Message message = Message.getRootAsMessage(ByteBuffer.wrap(metadata));
+        long bodyLength = message.bodyLength();
+        if (bodyLength < 0 || bodyLength > size - position) {
+          throw new IllegalArgumentException(
+              "message body of " + bodyLength + " bytes at offset " + position);
+        }
+        messages.add(new IpcMessage(message, start, position, position + bodyLength));
+        position += bodyLength;
+      }
+    } catch (IndexOutOfBoundsException | IllegalArgumentException e) {
+      throw new IllegalArgumentException("Not an Arrow IPC stream: " + e.getMessage(), e);
+    }
+    return messages;
+  }
+
+  /** The schema a stream starts with. Dictionary-encoded columns are refused. */
+  static Schema schemaOf(List<IpcMessage> messages) {
+    if (messages.isEmpty() || messages.get(0).metadata().headerType() != MessageHeader.Schema) {
+      throw new IllegalArgumentException(
+          "Not an Arrow IPC stream: it does not start with a schema");
+    }
+    Schema schema = MessageSerializer.deserializeSchema(messages.get(0).metadata());
+    for (Field field : schema.getFields()) {
+      requireNoDictionary(field);
+    }
+    return schema;
+  }
+
+  /** What {@link #readIpcBatches} found in a stream. */
+  public record Batches(ArrayList<byte[]> batches, long rows) {}
+
+  /**
+   * Copy each record batch of an Arrow IPC stream into a byte array that holds its IPC message,
+   * which is the form Spark passes Arrow data around in. Nothing is decoded.
+   *
+   * @param stream exactly the bytes of the stream
+   */
+  public static Batches readIpcBatches(MemorySegment stream) {
+    List<IpcMessage> messages = ipcMessages(stream);
+    schemaOf(messages);
+    ArrayList<byte[]> batches = new ArrayList<>(messages.size() - 1);
+    long rows = 0;
+    for (IpcMessage message : messages.subList(1, messages.size())) {
+      Message metadata = message.metadata();
+      if (metadata.headerType() != MessageHeader.RecordBatch) {
+        throw new IllegalArgumentException(
+            "Expected record batches after the schema, found "
+                + MessageHeader.name(metadata.headerType()));
+      }
+      long length = message.end() - message.start();
+      if (length > Integer.MAX_VALUE - 8) {
+        throw new IllegalArgumentException(
+            "A record batch of "
+                + length
+                + " bytes does not fit in a Java array; send the table in smaller batches");
+      }
+      byte[] batch = new byte[(int) length];
+      MemorySegment.copy(stream, ValueLayout.JAVA_BYTE, message.start(), batch, 0, (int) length);
+      batches.add(batch);
+      rows +=
+          ((org.apache.arrow.flatbuf.RecordBatch)
+                  metadata.header(new org.apache.arrow.flatbuf.RecordBatch()))
+              .length();
+    }
+    return new Batches(batches, rows);
   }
 
   private static void requireNoDictionary(Field field) {

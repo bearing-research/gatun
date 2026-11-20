@@ -500,3 +500,26 @@ class TestArrowTablesAsJavaObjects:
         view = client.arrow_from_java(produced, copy=False)
         assert view.to_pydict() == {"x": [2, 3], "name": ["b", "c"]}
         produced.close()
+
+    def test_lending_a_table(self, client):
+        import pyarrow as pa
+
+        from gatun import JavaException
+
+        table = pa.table({"x": [1, 2, 3], "name": ["a", "b", "c"]})
+
+        with client.arrow_to_java(table, copy=False) as root:
+            assert root.getRowCount() == 3
+
+        with pytest.raises(JavaException):
+            root.getRowCount()
+
+    def test_record_batches_as_byte_arrays(self, client):
+        import pyarrow as pa
+
+        table = pa.table({"x": [1, 2, 3], "name": ["a", "b", "c"]})
+
+        batches = client.arrow_to_java_batches(table, max_rows_per_batch=2)
+        assert batches.size() == 2
+        assert client.is_instance_of(batches, "java.util.ArrayList")
+        assert isinstance(batches.get(0), bytes)

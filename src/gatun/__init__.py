@@ -16,6 +16,7 @@ from gatun.client import (
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
     PROTOCOL_VERSION,
+    ArrowLoan,
     ArrowTableView,
     BatchContext,
     BatchResult,
@@ -50,6 +51,7 @@ from gatun.launcher import GatunSession, launch_gateway
 
 __all__ = [
     "PROTOCOL_VERSION",
+    "ArrowLoan",
     "ArrowTableView",
     "AsyncGatunClient",
     "AsyncJVMView",

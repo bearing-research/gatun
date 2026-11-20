@@ -601,6 +601,37 @@ produced.close()                   # Java-made tables are yours to close
 - Each transfer must fit in the shared memory payload zone (`PayloadTooLargeError` otherwise). Connect with more memory, or move a large table in pieces with `table.slice()` / `root.slice(start, length)`.
 - Dictionary-encoded columns are not supported; decode them first.
 
+##### Lending a Table Instead of Copying It
+
+By default Java copies a sent table into memory of its own. With `copy=False` it reads the table where Python wrote it, in shared memory, for as long as a `with` block lasts:
+
+```python
+with client.arrow_to_java(table, copy=False) as root:
+    root.getRowCount()             # 3
+    # client.jvm.com.example.Stats.summarize(root)
+# The loan is over: Java can no longer read the table
+```
+
+- `arrow_to_java(table, copy=False)` returns an `ArrowLoan`. Entering it gives the `VectorSchemaRoot` handle; leaving it (or `loan.close()`) ends the loan. A loan that is dropped without either ends with the client's next request after it was garbage collected.
+- The table is Java's to read during the loan and not after. Java code that kept it gets an exception from Arrow when it reads (an empty vector, or `IllegalStateException: Ref count should be >= 1`), not the bytes Python wrote there next. Code that needs the data for longer must copy it during the loan. Two things are not caught: a raw memory address taken from a buffer, and a JVM started with Arrow's bounds checks switched off.
+- While a loan is open its bytes stay put, and later transfers are written after them: an open loan takes room in the payload zone away from other transfers. `send_arrow_table()`, `send_arrow_buffers()` and `get_arrow_data()` use fixed places in the zone and raise `RuntimeError` if a loan is in the way. `reset_payload_arena()` ends every loan.
+- The data of a lent table takes no memory in the JVM and is not counted against `max_arrow_bytes`. One thing is: Arrow leaves the validity bitmap of a column without nulls out of the stream, and Java allocates one when it loads the column (one bit a row).
+- If Java code still holds buffers of a lent table when the connection closes, the server keeps that session's shared memory mapped until they are released, and logs a warning.
+- Sync client, on its own channel. Inside a callback that Java made from another thread the table is copied as usual, and the block frees the copy when it ends (`loan.in_place` is `False`).
+
+##### Record Batches as Byte Arrays
+
+Some Java code takes Arrow data as serialized record batches and not as a table. Spark does (`ArrowConverters.toDataFrame`). `arrow_to_java_batches()` hands the table over in that form, without building a table in the JVM first:
+
+```python
+batches = client.arrow_to_java_batches(table, max_rows_per_batch=2)
+batches.size()                     # 2: a java.util.ArrayList of byte[]
+```
+
+- Each element is one record batch as its Arrow IPC message. Each chunk of the table becomes a batch; `max_rows_per_batch` splits larger ones. A Java array holds less than 2 GiB, so a table with larger chunks needs it.
+- The arrays are ordinary Java objects on the heap. Nothing is decoded on the way, and nothing is counted against `max_arrow_bytes`.
+- Both clients have it, and it works inside a callback that Java made from another thread.
+
 The other methods on this page do not give Java code access to the data: `send_arrow_table()` reads and counts a table, and `send_arrow_buffers()` / `get_arrow_data()` hold one batch that can only be read back.
 
 #### Size Validation
