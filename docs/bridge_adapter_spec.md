@@ -5,18 +5,26 @@
 This document defines the minimal bridge contract between PySpark and a JVM backend (Py4J or Gatun).
 Instead of making Gatun emulate Py4J, we define a clean abstraction that both can implement.
 
-## BridgeAdapter Protocol
+## BridgeAdapter
+
+`gatun.bridge.BridgeAdapter` is an abstract base class: an implementation subclasses it, and
+every method below is abstract. `GatunAdapter` (`gatun.bridge_adapters`) is the one
+implementation in this repository; there is no Py4J adapter yet.
 
 ```python
-from typing import Protocol, Any, Callable, runtime_checkable
+from abc import ABC
+from typing import Any, Protocol, runtime_checkable
 
 @runtime_checkable
 class JVMRef(Protocol):
     """Opaque reference to a JVM object."""
-    pass
 
-@runtime_checkable
-class BridgeAdapter(Protocol):
+    @property
+    def object_id(self) -> int:
+        """Unique identifier for this object in the JVM."""
+        ...
+
+class BridgeAdapter(ABC):
     """Minimal bridge contract for PySpark <-> JVM communication."""
 
     # === Object Lifecycle ===
@@ -143,7 +151,7 @@ class BridgeAdapter(Protocol):
         """Stop serving a callback and let go of its handler."""
         ...
 
-    # === JVM View (Optional but Convenient) ===
+    # === JVM View ===
 
     @property
     def jvm(self) -> "JVMView":
@@ -190,13 +198,14 @@ class BridgeAdapter(Protocol):
 | `long` | `int` |
 | `float`, `double` | `float` |
 | `boolean` | `bool` |
+| `char` | `str` |
 | `String` | `str` |
 | `byte[]` | `bytes` |
 | `null` | `None` |
 | `List`, `ArrayList` | `list` |
 | `Map`, `HashMap` | `dict` |
 | Arrays (primitive) | `list` |
-| Arrays (object) | `list` |
+| Arrays (object) | `JVMRef` |
 | Other objects | `JVMRef` |
 
 ## Callbacks
@@ -244,409 +253,56 @@ passed through the gateway's callback server.
 class JavaException(Exception):
     """Base class for Java exceptions raised in Python."""
 
-    def __init__(self, class_name: str, message: str, stack_trace: str):
-        self.java_class = class_name
+    def __init__(self, java_class: str, message: str, stack_trace: str = ""):
+        self.java_class = java_class
         self.message = message
         self.stack_trace = stack_trace
-        super().__init__(f"{class_name}: {message}")
+        super().__init__(f"{java_class}: {message}")
 ```
 
-Common subclasses:
+Subclasses:
 - `JavaSecurityException`
 - `JavaIllegalArgumentException`
 - `JavaNoSuchMethodException`
+- `JavaNoSuchFieldException`
 - `JavaClassNotFoundException`
 - `JavaNullPointerException`
 - `JavaIndexOutOfBoundsException`
+- `JavaNumberFormatException`
+
+These are the classes in `gatun.bridge`. They are not the client's exceptions of the same
+names (`gatun.JavaException` and its subclasses, exported from the package's top level), and
+neither is a subclass of the other: catch `gatun.bridge.JavaException` around adapter calls.
+`GatunAdapter` raises them from its own methods (`new`, `call`, `call_static`, the field and
+array methods). A call made through `bridge.jvm` is the client's and raises the client's
+classes.
 
 ## Contract Tests
 
-These tests define the required behavior. Both Py4JAdapter and GatunAdapter must pass.
+The required behaviour is defined by `tests/test_bridge_contract.py`. `BridgeContractTests`
+there takes any adapter through a `bridge` fixture; an implementation subclasses it and
+provides the fixture, as `TestGatunAdapter` does:
 
 ```python
-import pytest
-from typing import Protocol
-
-class BridgeContractTests:
-    """Contract tests that any BridgeAdapter implementation must pass."""
-
+class TestGatunAdapter(BridgeContractTests):
     @pytest.fixture
-    def bridge(self) -> BridgeAdapter:
-        """Override in subclass to provide adapter instance."""
-        raise NotImplementedError
-
-    # === Object Creation ===
-
-    def test_create_object_no_args(self, bridge):
-        """Create object with no-arg constructor."""
-        obj = bridge.new("java.util.ArrayList")
-        assert obj is not None
-
-    def test_create_object_with_args(self, bridge):
-        """Create object with constructor arguments."""
-        obj = bridge.new("java.util.ArrayList", 100)
-        assert obj is not None
-
-    def test_create_object_with_string_arg(self, bridge):
-        """Create object with string argument."""
-        obj = bridge.new("java.lang.StringBuilder", "hello")
-        result = bridge.call(obj, "toString")
-        assert result == "hello"
-
-    # === Method Calls ===
-
-    def test_call_instance_method_no_args(self, bridge):
-        """Call instance method with no arguments."""
-        obj = bridge.new("java.util.ArrayList")
-        size = bridge.call(obj, "size")
-        assert size == 0
-
-    def test_call_instance_method_with_args(self, bridge):
-        """Call instance method with arguments."""
-        obj = bridge.new("java.util.ArrayList")
-        bridge.call(obj, "add", "hello")
-        size = bridge.call(obj, "size")
-        assert size == 1
-
-    def test_call_instance_method_returns_object(self, bridge):
-        """Method returning object returns JVMRef."""
-        obj = bridge.new("java.util.ArrayList")
-        bridge.call(obj, "add", "hello")
-        result = bridge.call(obj, "get", 0)
-        assert result == "hello"
-
-    def test_call_static_method(self, bridge):
-        """Call static method."""
-        result = bridge.call_static("java.lang.Integer", "parseInt", "42")
-        assert result == 42
-
-    def test_call_static_method_math(self, bridge):
-        """Call Math static methods."""
-        result = bridge.call_static("java.lang.Math", "max", 10, 20)
-        assert result == 20
-
-    def test_call_chained_methods(self, bridge):
-        """Chain multiple method calls."""
-        sb = bridge.new("java.lang.StringBuilder")
-        bridge.call(sb, "append", "hello")
-        bridge.call(sb, "append", " ")
-        bridge.call(sb, "append", "world")
-        result = bridge.call(sb, "toString")
-        assert result == "hello world"
-
-    # === Field Access ===
-
-    def test_get_static_field(self, bridge):
-        """Get static field value."""
-        result = bridge.get_static_field("java.lang.Integer", "MAX_VALUE")
-        assert result == 2147483647
-
-    def test_get_static_field_object(self, bridge):
-        """Get static field that is an object."""
-        result = bridge.get_static_field("java.lang.System", "out")
-        assert result is not None
-
-    # === Type Checking ===
-
-    def test_is_instance_of_true(self, bridge):
-        """is_instance_of returns True for matching class."""
-        obj = bridge.new("java.util.ArrayList")
-        assert bridge.is_instance_of(obj, "java.util.ArrayList")
-
-    def test_is_instance_of_interface(self, bridge):
-        """is_instance_of works with interfaces."""
-        obj = bridge.new("java.util.ArrayList")
-        assert bridge.is_instance_of(obj, "java.util.List")
-        assert bridge.is_instance_of(obj, "java.util.Collection")
-
-    def test_is_instance_of_false(self, bridge):
-        """is_instance_of returns False for non-matching class."""
-        obj = bridge.new("java.util.ArrayList")
-        assert not bridge.is_instance_of(obj, "java.util.HashMap")
-
-    # === Arrays ===
-
-    def test_new_array_object(self, bridge):
-        """Create object array."""
-        arr = bridge.new_array("java.lang.String", 3)
-        assert bridge.array_length(arr) == 3
-
-    def test_new_array_primitive(self, bridge):
-        """Create primitive array."""
-        arr = bridge.new_array("int", 5)
-        assert bridge.array_length(arr) == 5
-
-    def test_array_set_get(self, bridge):
-        """Set and get array elements."""
-        arr = bridge.new_array("java.lang.String", 3)
-        bridge.array_set(arr, 0, "hello")
-        bridge.array_set(arr, 1, "world")
-        assert bridge.array_get(arr, 0) == "hello"
-        assert bridge.array_get(arr, 1) == "world"
-        assert bridge.array_get(arr, 2) is None
-
-    def test_array_pass_to_method(self, bridge):
-        """Pass array to Java method."""
-        arr = bridge.new_array("java.lang.String", 2)
-        bridge.array_set(arr, 0, "b")
-        bridge.array_set(arr, 1, "a")
-        # Arrays.sort(arr)
-        bridge.call_static("java.util.Arrays", "sort", arr)
-        assert bridge.array_get(arr, 0) == "a"
-        assert bridge.array_get(arr, 1) == "b"
-
-    # === Type Conversion ===
-
-    def test_convert_int(self, bridge):
-        """Integer conversion."""
-        obj = bridge.new("java.util.ArrayList")
-        bridge.call(obj, "add", 42)
-        result = bridge.call(obj, "get", 0)
-        assert result == 42
-
-    def test_convert_long(self, bridge):
-        """Long integer conversion."""
-        obj = bridge.new("java.util.ArrayList")
-        big_num = 9223372036854775807  # Long.MAX_VALUE
-        bridge.call(obj, "add", big_num)
-        result = bridge.call(obj, "get", 0)
-        assert result == big_num
-
-    def test_convert_float(self, bridge):
-        """Float conversion."""
-        result = bridge.call_static("java.lang.Math", "sqrt", 16.0)
-        assert result == 4.0
-
-    def test_convert_bool(self, bridge):
-        """Boolean conversion."""
-        obj = bridge.new("java.util.ArrayList")
-        result = bridge.call(obj, "isEmpty")
-        assert result is True
-        bridge.call(obj, "add", "x")
-        result = bridge.call(obj, "isEmpty")
-        assert result is False
-
-    def test_convert_string(self, bridge):
-        """String conversion."""
-        result = bridge.call_static("java.lang.String", "valueOf", 123)
-        assert result == "123"
-
-    def test_convert_none(self, bridge):
-        """None/null conversion."""
-        obj = bridge.new("java.util.HashMap")
-        result = bridge.call(obj, "get", "nonexistent")
-        assert result is None
-
-    def test_convert_list(self, bridge):
-        """List conversion."""
-        obj = bridge.new("java.util.ArrayList")
-        bridge.call(obj, "addAll", [1, 2, 3])
-        size = bridge.call(obj, "size")
-        assert size == 3
-
-    def test_convert_dict(self, bridge):
-        """Dict conversion."""
-        obj = bridge.new("java.util.HashMap")
-        bridge.call(obj, "putAll", {"a": 1, "b": 2})
-        result = bridge.call(obj, "get", "a")
-        assert result == 1
-
-    def test_convert_bytes(self, bridge):
-        """Bytes conversion."""
-        data = b"hello"
-        result = bridge.call_static("java.util.Arrays", "toString", data)
-        # byte[] toString gives something like "[104, 101, 108, 108, 111]"
-        assert "104" in result  # 'h' = 104
-
-    # === Exception Handling ===
-
-    def test_exception_class_not_found(self, bridge):
-        """ClassNotFoundException raised properly."""
-        with pytest.raises(JavaException) as exc_info:
-            bridge.new("com.nonexistent.FakeClass")
-        assert "ClassNotFoundException" in str(exc_info.value)
-
-    def test_exception_no_such_method(self, bridge):
-        """NoSuchMethodException raised properly."""
-        obj = bridge.new("java.util.ArrayList")
-        with pytest.raises(JavaException) as exc_info:
-            bridge.call(obj, "nonExistentMethod")
-        assert "NoSuchMethod" in str(exc_info.value) or "not found" in str(exc_info.value).lower()
-
-    def test_exception_null_pointer(self, bridge):
-        """NullPointerException raised properly."""
-        obj = bridge.new("java.util.ArrayList")
-        bridge.call(obj, "add", None)
-        with pytest.raises(JavaException):
-            # Calling method on null element
-            elem = bridge.call(obj, "get", 0)
-            bridge.call(elem, "toString")  # elem is None/null
-
-    def test_exception_index_out_of_bounds(self, bridge):
-        """IndexOutOfBoundsException raised properly."""
-        obj = bridge.new("java.util.ArrayList")
-        with pytest.raises(JavaException) as exc_info:
-            bridge.call(obj, "get", 0)
-        assert "IndexOutOfBounds" in str(exc_info.value) or "index" in str(exc_info.value).lower()
-
-    def test_exception_has_stack_trace(self, bridge):
-        """Exceptions include Java stack trace."""
-        with pytest.raises(JavaException) as exc_info:
-            bridge.new("com.nonexistent.FakeClass")
-        assert exc_info.value.stack_trace is not None
-        assert len(exc_info.value.stack_trace) > 0
-
-    # === Object Lifecycle ===
-
-    def test_detach_prevents_cleanup(self, bridge):
-        """Detached objects remain valid."""
-        obj = bridge.new("java.util.ArrayList")
-        bridge.call(obj, "add", "hello")
-        bridge.detach(obj)
-        # Object should still be usable after detach
-        result = bridge.call(obj, "get", 0)
-        assert result == "hello"
-
-    def test_close_releases_resources(self, bridge):
-        """Close releases resources."""
-        bridge.close()
-        # After close, operations should fail
-        with pytest.raises(Exception):
-            bridge.new("java.util.ArrayList")
-
-    # === JVM View ===
-
-    def test_jvm_view_create_object(self, bridge):
-        """JVM view can create objects."""
-        arr = bridge.jvm.java.util.ArrayList()
-        bridge.call(arr, "add", "test")
-        assert bridge.call(arr, "size") == 1
-
-    def test_jvm_view_static_method(self, bridge):
-        """JVM view can call static methods."""
-        result = bridge.jvm.java.lang.Integer.parseInt("42")
-        assert result == 42
-
-    def test_jvm_view_static_field(self, bridge):
-        """JVM view can access static fields."""
-        result = bridge.jvm.java.lang.Integer.MAX_VALUE
-        assert result == 2147483647
-
-    def test_java_import_wildcard(self, bridge):
-        """java_import with wildcard."""
-        bridge.java_import("java.util.*")
-        arr = bridge.jvm.ArrayList()
-        assert bridge.call(arr, "size") == 0
-
-    def test_java_import_single_class(self, bridge):
-        """java_import single class."""
-        bridge.java_import("java.lang.StringBuilder")
-        sb = bridge.jvm.StringBuilder("hello")
-        assert bridge.call(sb, "toString") == "hello"
-
-    # === Scala Interop (for Spark) ===
-
-    def test_scala_object_access(self, bridge):
-        """Access Scala singleton objects."""
-        # scala.None$ is the singleton for scala.None
-        none = bridge.get_static_field("scala.None$", "MODULE$")
-        assert none is not None
-
-    def test_scala_tuple(self, bridge):
-        """Create and access Scala tuples."""
-        t = bridge.new("scala.Tuple2", "key", "value")
-        assert bridge.call(t, "_1") == "key"
-        assert bridge.call(t, "_2") == "value"
-
-    # === Iteration ===
-
-    def test_iterate_collection(self, bridge):
-        """Iterate over Java collection."""
-        arr = bridge.new("java.util.ArrayList")
-        bridge.call(arr, "add", "a")
-        bridge.call(arr, "add", "b")
-        bridge.call(arr, "add", "c")
-
-        # Get iterator
-        it = bridge.call(arr, "iterator")
-        items = []
-        while bridge.call(it, "hasNext"):
-            items.append(bridge.call(it, "next"))
-
-        assert items == ["a", "b", "c"]
-
-    def test_iterate_array(self, bridge):
-        """Iterate over Java array."""
-        arr = bridge.new_array("java.lang.String", 3)
-        bridge.array_set(arr, 0, "x")
-        bridge.array_set(arr, 1, "y")
-        bridge.array_set(arr, 2, "z")
-
-        items = []
-        for i in range(bridge.array_length(arr)):
-            items.append(bridge.array_get(arr, i))
-
-        assert items == ["x", "y", "z"]
-
-    # === Callbacks ===
-
-    def test_callback_function(self, bridge):
-        """A function implements an interface with one method."""
-        longest_first = bridge.register_callback(
-            lambda a, b: len(b) - len(a), "java.util.Comparator"
-        )
-        words = bridge.new("java.util.ArrayList")
-        for word in ("bb", "a", "ccc"):
-            bridge.call(words, "add", word)
-
-        bridge.call_static("java.util.Collections", "sort", words, longest_first)
-
-        assert [bridge.call(words, "get", i) for i in range(3)] == ["ccc", "bb", "a"]
-
-    def test_callback_object_with_named_methods(self, bridge):
-        """An object implements an interface with several methods."""
-
-        class Countdown:
-            def __init__(self):
-                self.left = 3
-
-            def hasMoreElements(self):
-                return self.left > 0
-
-            def nextElement(self):
-                self.left -= 1
-                return self.left
-
-        enumeration = bridge.register_callback(Countdown(), "java.util.Enumeration")
-
-        assert bridge.call_static("java.util.Collections", "list", enumeration) == [2, 1, 0]
-
-    def test_callback_exception(self, bridge):
-        """An exception in the callback is an exception in its JVM caller."""
-
-        def compare(a, b):
-            raise ValueError("cannot compare these")
-
-        comparator = bridge.register_callback(compare, "java.util.Comparator")
-        words = bridge.new("java.util.ArrayList")
-        bridge.call(words, "add", "b")
-        bridge.call(words, "add", "a")
-
-        with pytest.raises(JavaException, match="cannot compare these"):
-            bridge.call_static("java.util.Collections", "sort", words, comparator)
-
-    def test_unregister_callback(self, bridge):
-        """An unregistered callback fails in the JVM instead of reaching Python."""
-        comparator = bridge.register_callback(lambda a, b: 0, "java.util.Comparator")
-        words = bridge.new("java.util.ArrayList")
-        bridge.call(words, "add", "b")
-        bridge.call(words, "add", "a")
-
-        bridge.unregister_callback(comparator)
-
-        with pytest.raises(JavaException):
-            bridge.call_static("java.util.Collections", "sort", words, comparator)
+    def bridge(self):
+        from gatun.bridge_adapters import GatunAdapter
+
+        adapter = GatunAdapter()
+        yield adapter
+        adapter.close()
 ```
+
+It covers object creation, instance and static calls, static fields, `is_instance_of`,
+arrays, type conversion in both directions, exceptions, `detach` and `close`, callbacks
+(a function, an object with named methods, a default method overridden, a missing method, an
+exception in the handler, `unregister_callback`) and the JVM view with `java_import`.
+
+Where implementations may differ, the tests accept either answer. A class that does not
+exist is one case: Gatun checks its allowlist before it looks the class up, so the error for
+an unknown class is a `JavaSecurityException`, where another bridge would report
+`JavaClassNotFoundException`.
 
 ## PySpark Integration Points
 

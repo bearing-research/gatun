@@ -1,7 +1,8 @@
 """Bridge contract tests.
 
 These tests define the required behavior for any BridgeAdapter implementation.
-Both Py4JAdapter and GatunAdapter must pass these tests.
+GatunAdapter is the one there is; another subclasses BridgeContractTests and
+provides the `bridge` fixture.
 
 Run with: pytest tests/test_bridge_contract.py -v
 """

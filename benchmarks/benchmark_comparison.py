@@ -4,7 +4,6 @@ This script measures latency and throughput for all JVM bridge operations
 used by PySpark, based on analysis of the PySpark codebase.
 
 Usage:
-    cd python
     uv run python benchmarks/benchmark_comparison.py           # Full benchmark
     uv run python benchmarks/benchmark_comparison.py --quick   # Quick mode (~30s)
     uv run python benchmarks/benchmark_comparison.py --gatun-only  # Skip Py4J
@@ -19,8 +18,15 @@ Categories tested:
     6. Data Transfer (Java -> Python) - primitives, strings, object refs
     7. Error Propagation - bridge error transport vs Java-internal exceptions
     8. Type Checking - is_instance_of
+    9. The full `jvm.java.lang.Math` path on every call
 
 Fairness notes:
+    - Both JVMs run with the same heap settings, and every case, the throughput
+      loops included, is timed on a JVM that has been warmed up
+    - Classes are bound once on both sides (`Math = jvm.java.lang.Math`); section 9
+      times the full path
+    - A trial runs Gatun and then Py4J, so that a slow spell on the machine falls
+      on both
     - Py4J is tested with auto_convert=True (PySpark default) and auto_convert=False
     - Baseline measurements allow computing net bridge cost
     - Batch timing used for fast operations to reduce Python overhead
@@ -43,6 +49,10 @@ BENCHMARK_ITERATIONS = 1000
 BATCH_SIZE = 100  # For batch timing of fast operations
 BULK_SIZE = 10000
 NUM_TRIALS = 3  # Number of complete benchmark trials for median-of-medians
+THROUGHPUT_PASSES = 3  # Timed passes of each throughput loop, after one untimed
+
+# The same for both servers. A fixed heap keeps resizing out of the timings.
+JVM_FLAGS = ["-Xms512m", "-Xmx512m"]
 
 # Quick mode settings
 QUICK_WARMUP_SECONDS = 0.5
@@ -374,6 +384,17 @@ def run_batch_benchmark(
     }
 
 
+def median_pass(loop: Callable[[], None]) -> float:
+    """Seconds one pass of `loop` takes: the median of several, after one untimed."""
+    loop()
+    times = []
+    for _ in range(THROUGHPUT_PASSES):
+        start = time.perf_counter()
+        loop()
+        times.append(time.perf_counter() - start)
+    return statistics.median(times)
+
+
 def _noop():
     """Empty function for measuring call overhead."""
 
@@ -533,16 +554,28 @@ def print_comparison(
     print()
 
 
-def benchmark_gatun() -> tuple[list[dict], dict]:
+def benchmark_gatun() -> tuple[list[dict], dict, list[dict]]:
     """Run comprehensive Gatun benchmarks.
 
     Returns:
-        Tuple of (results list, baseline dict)
+        Tuple of (latency results, baseline dict, throughput results)
     """
     from gatun import JavaException, connect
 
-    client = connect()
+    client = connect(extra_jvm_flags=JVM_FLAGS)
     results = []
+
+    # Classes are bound once, as on the Py4J side and as a program that calls
+    # them more than once would do. Section 9 times the full path.
+    jvm = client.jvm
+    ArrayList = jvm.java.util.ArrayList
+    HashMap = jvm.java.util.HashMap
+    Arrays = jvm.java.util.Arrays
+    StringBuilder = jvm.java.lang.StringBuilder
+    System = jvm.java.lang.System
+    Math = jvm.java.lang.Math
+    Integer = jvm.java.lang.Integer
+    String = jvm.java.lang.String
 
     # =========================================================================
     # 0. BASELINE MEASUREMENTS
@@ -557,7 +590,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "1.1 new() no args",
-            lambda: client.create_object("java.util.ArrayList"),
+            lambda: ArrayList(),
         )
     )
 
@@ -565,7 +598,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "1.2 new() int arg",
-            lambda: client.create_object("java.util.ArrayList", 100),
+            lambda: ArrayList(100),
         )
     )
 
@@ -573,7 +606,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "1.3 new() string arg",
-            lambda: client.create_object("java.lang.StringBuilder", "hello world"),
+            lambda: StringBuilder("hello world"),
         )
     )
 
@@ -581,7 +614,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "1.4 new() HashMap(int)",
-            lambda: client.create_object("java.util.HashMap", 16),
+            lambda: HashMap(16),
         )
     )
 
@@ -593,7 +626,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "2.1 static() no args",
-            lambda: client.jvm.java.lang.System.currentTimeMillis(),
+            lambda: System.currentTimeMillis(),
         )
     )
 
@@ -601,7 +634,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "2.2 static() int args",
-            lambda: client.jvm.java.lang.Math.max(10, 20),
+            lambda: Math.max(10, 20),
         )
     )
 
@@ -609,7 +642,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "2.3 static() double args",
-            lambda: client.jvm.java.lang.Math.pow(2.0, 10.0),
+            lambda: Math.pow(2.0, 10.0),
         )
     )
 
@@ -617,7 +650,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "2.4 static() string arg",
-            lambda: client.jvm.java.lang.Integer.parseInt("42"),
+            lambda: Integer.parseInt("42"),
         )
     )
 
@@ -625,7 +658,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_benchmark(
             "2.5 static() string->string",
-            lambda: client.jvm.java.lang.String.valueOf(12345),
+            lambda: String.valueOf(12345),
         )
     )
 
@@ -634,7 +667,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     # =========================================================================
 
     # 3.1 Instance method - no args, int return (fast op, use batch timing)
-    arr = client.create_object("java.util.ArrayList")
+    arr = ArrayList()
     results.append(
         run_batch_benchmark(
             "3.1 call() no args->int",
@@ -643,7 +676,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     )
 
     # 3.2 Instance method - int arg
-    arr2 = client.create_object("java.util.ArrayList")
+    arr2 = ArrayList()
     counter = [0]
 
     def add_int():
@@ -653,7 +686,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(run_benchmark("3.2 call() int arg", add_int))
 
     # 3.3 Instance method - string arg
-    arr3 = client.create_object("java.util.ArrayList")
+    arr3 = ArrayList()
     results.append(
         run_benchmark(
             "3.3 call() string arg",
@@ -662,7 +695,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     )
 
     # 3.4 Instance method - object return
-    arr4 = client.create_object("java.util.ArrayList")
+    arr4 = ArrayList()
     arr4.add("item")
     results.append(
         run_benchmark(
@@ -672,7 +705,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     )
 
     # 3.5 Instance method - string return
-    sb = client.create_object("java.lang.StringBuilder", "hello")
+    sb = StringBuilder("hello")
     results.append(
         run_benchmark(
             "3.5 call() string return",
@@ -681,7 +714,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     )
 
     # 3.6 Two consecutive calls (simulates chaining pattern)
-    sb_chain = client.create_object("java.lang.StringBuilder", "hello")
+    sb_chain = StringBuilder("hello")
 
     def chain_call():
         # Append returns StringBuilder, then call toString
@@ -698,7 +731,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_batch_benchmark(
             "4.1 field static int",
-            lambda: client.jvm.java.lang.Integer.MAX_VALUE,
+            lambda: Integer.MAX_VALUE,
         )
     )
 
@@ -706,7 +739,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     results.append(
         run_batch_benchmark(
             "4.2 field static object",
-            lambda: client.jvm.java.lang.System.out,
+            lambda: System.out,
         )
     )
 
@@ -719,13 +752,13 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     small_list = list(range(10))
 
     def transfer_list_10():
-        java_list = client.create_object("java.util.ArrayList", small_list)
+        java_list = ArrayList(small_list)
         # Force materialization: call size and get (results discarded)
         java_list.size()
         java_list.get(5)
 
     # Verify correctness once outside timed region
-    _test_list = client.create_object("java.util.ArrayList", small_list)
+    _test_list = ArrayList(small_list)
     assert _test_list.size() == 10, "list(10) transfer verification failed"
 
     results.append(run_benchmark("5.1 list(10) materialized", transfer_list_10))
@@ -734,13 +767,13 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     medium_list = list(range(100))
 
     def transfer_list_100():
-        java_list = client.create_object("java.util.ArrayList", medium_list)
+        java_list = ArrayList(medium_list)
         # Force materialization: call size and get (results discarded)
         java_list.size()
         java_list.get(50)
 
     # Verify correctness once outside timed region
-    _test_list = client.create_object("java.util.ArrayList", medium_list)
+    _test_list = ArrayList(medium_list)
     assert _test_list.size() == 100, "list(100) transfer verification failed"
 
     results.append(run_benchmark("5.2 list(100) materialized", transfer_list_100))
@@ -749,13 +782,13 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     test_dict = {"key1": "value1", "key2": 42, "key3": True}
 
     def transfer_dict():
-        java_map = client.create_object("java.util.HashMap", test_dict)
+        java_map = HashMap(test_dict)
         # Force materialization: call size and get (results discarded)
         java_map.size()
         java_map.get("key1")
 
     # Verify correctness once outside timed region
-    _test_map = client.create_object("java.util.HashMap", test_dict)
+    _test_map = HashMap(test_dict)
     assert _test_map.size() == 3, "dict(3) transfer verification failed"
 
     results.append(run_benchmark("5.3 dict(3) materialized", transfer_dict))
@@ -765,14 +798,14 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     small_bytes = b"hello world" * 10  # 110 bytes
 
     def transfer_bytes_small():
-        arr = client.create_object("java.util.ArrayList")
+        arr = ArrayList()
         arr.add(small_bytes)
         # Force consumption entirely in Java: get ref and compute hash (no Python conversion)
         byte_arr = arr.get(0)
-        client.jvm.java.util.Arrays.hashCode(byte_arr)
+        Arrays.hashCode(byte_arr)
 
     # Verify correctness once outside timed region
-    _test_arr = client.create_object("java.util.ArrayList")
+    _test_arr = ArrayList()
     _test_arr.add(small_bytes)
     _test_bytes = _test_arr.get(0)
     assert client.jvm.java.lang.reflect.Array.getLength(_test_bytes) == 110, (
@@ -785,14 +818,14 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     medium_bytes = b"x" * 1000
 
     def transfer_bytes_1kb():
-        arr = client.create_object("java.util.ArrayList")
+        arr = ArrayList()
         arr.add(medium_bytes)
         # Force consumption entirely in Java
         byte_arr = arr.get(0)
-        client.jvm.java.util.Arrays.hashCode(byte_arr)
+        Arrays.hashCode(byte_arr)
 
     # Verify correctness once outside timed region
-    _test_arr = client.create_object("java.util.ArrayList")
+    _test_arr = ArrayList()
     _test_arr.add(medium_bytes)
     _test_bytes = _test_arr.get(0)
     assert client.jvm.java.lang.reflect.Array.getLength(_test_bytes) == 1000, (
@@ -806,7 +839,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     # =========================================================================
 
     # Setup: create Java objects with data
-    arr_return = client.create_object("java.util.ArrayList")
+    arr_return = ArrayList()
     for i in range(10):
         arr_return.add(f"item{i}")
 
@@ -827,7 +860,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     )
 
     # 6.3 Get object reference
-    hm = client.create_object("java.util.HashMap")
+    hm = HashMap()
     hm.put("key", "value")
     results.append(
         run_benchmark(
@@ -844,7 +877,7 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
     # This measures the full cost: Java exception creation + cross-language transport
     def catch_bridge_exception():
         try:
-            client.jvm.java.lang.Integer.parseInt("not_a_number")
+            Integer.parseInt("not_a_number")
         except JavaException:
             pass
 
@@ -852,24 +885,16 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
         run_benchmark("7.1 bridge error propagation", catch_bridge_exception)
     )
 
-    # 7.2 Java-side try/catch (exception thrown and caught on Java side, call succeeds)
-    # This isolates Java exception creation cost from cross-language transport
-    # We use Integer.decode which catches NumberFormatException internally for hex/octal
-    # and returns successfully for valid decimal input
-    def java_internal_exception():
-        # This triggers internal parsing attempts (hex, octal) that throw/catch exceptions
-        # before successfully parsing as decimal. The call itself succeeds.
-        client.jvm.java.lang.Integer.decode("12345")
-
+    # 7.2 The same call succeeding: what 7.1 costs beyond it is the exception
     results.append(
-        run_benchmark("7.2 java internal try/catch", java_internal_exception)
+        run_benchmark("7.2 same call, no error", lambda: Integer.parseInt("12345"))
     )
 
     # =========================================================================
     # 8. TYPE CHECKING (fast ops, use batch timing)
     # =========================================================================
 
-    arr_check = client.create_object("java.util.ArrayList")
+    arr_check = ArrayList()
     results.append(
         run_batch_benchmark(
             "8.1 is_instance_of (true)",
@@ -884,8 +909,28 @@ def benchmark_gatun() -> tuple[list[dict], dict]:
         )
     )
 
+    # =========================================================================
+    # 9. THE FULL PATH ON EVERY CALL
+    # =========================================================================
+
+    results.append(
+        run_benchmark(
+            "9.1 static() via jvm path",
+            lambda: client.jvm.java.lang.Math.max(10, 20),
+        )
+    )
+    results.append(
+        run_benchmark(
+            "9.2 new() via jvm path",
+            lambda: client.jvm.java.util.ArrayList(),
+        )
+    )
+
+    # On the server the latency cases have warmed up, like Py4J's
+    throughput = benchmark_gatun_throughput(client)
+
     client.close()
-    return results, baseline
+    return results, baseline, throughput
 
 
 def benchmark_payload_sweep() -> tuple[list[dict], list[dict]]:
@@ -896,7 +941,8 @@ def benchmark_payload_sweep() -> tuple[list[dict], list[dict]]:
     """
     from gatun import connect
 
-    client = connect()
+    client = connect(extra_jvm_flags=JVM_FLAGS)
+    arrays = client.jvm.java.util.Arrays
 
     # String sizes to test: 0, 8, 32, 128, 512, 2K, 8K bytes
     string_sizes = [0, 8, 32, 128, 512, 2048, 8192]
@@ -945,14 +991,15 @@ def benchmark_payload_sweep() -> tuple[list[dict], list[dict]]:
         string_results.append(result)
 
     # =========================================================================
-    # Bytes send-only sweep (Python -> Java, returns boolean)
+    # Bytes send-only sweep (Python -> Java, returns an int)
+    # Java reads the array and keeps nothing: a list that held every array sent
+    # would fill the heap, and the case would time the garbage collector
     # =========================================================================
     for size in bytes_sizes:
         test_bytes = b"x" * size
-        arr = client.create_object("java.util.ArrayList")
 
-        def bytes_send_test(data=test_bytes, container=arr):
-            container.add(data)
+        def bytes_send_test(data=test_bytes):
+            arrays.hashCode(data)
 
         result = run_benchmark(
             f"bytes_send_{size}B",
@@ -1106,15 +1153,12 @@ def print_sweep_results(
     print()
 
 
-def benchmark_gatun_throughput() -> list[dict]:
-    """Run Gatun throughput benchmarks.
+def benchmark_gatun_throughput(client) -> list[dict]:
+    """Run Gatun throughput benchmarks on a client whose server is warm.
 
     NOTE: All callables are pre-bound before timing loops to measure pure bridge
     overhead, matching how real applications (like PySpark) cache method references.
     """
-    from gatun import connect
-
-    client = connect()
     results = []
 
     # Pre-bind classes and methods (matching Py4J benchmark pattern)
@@ -1123,11 +1167,13 @@ def benchmark_gatun_throughput() -> list[dict]:
     HashMap = client.jvm.java.util.HashMap
 
     # Bulk static calls - prebind the method
-    abs_fn = Math.abs  # Pre-bind the static method
-    start = time.perf_counter()
-    for i in range(BULK_SIZE):
-        abs_fn(i)
-    elapsed = time.perf_counter() - start
+    abs_fn = Math.abs
+
+    def static_calls():
+        for i in range(BULK_SIZE):
+            abs_fn(i)
+
+    elapsed = median_pass(static_calls)
     results.append(
         {
             "name": f"Bulk static calls ({BULK_SIZE})",
@@ -1137,10 +1183,11 @@ def benchmark_gatun_throughput() -> list[dict]:
     )
 
     # Bulk object creation - use prebound class
-    start = time.perf_counter()
-    for _ in range(BULK_SIZE):
-        ArrayList()
-    elapsed = time.perf_counter() - start
+    def creations():
+        for _ in range(BULK_SIZE):
+            ArrayList()
+
+    elapsed = median_pass(creations)
     results.append(
         {
             "name": f"Bulk object creation ({BULK_SIZE})",
@@ -1151,11 +1198,13 @@ def benchmark_gatun_throughput() -> list[dict]:
 
     # Bulk instance method calls - prebind the method
     arr = ArrayList()
-    add_fn = arr.add  # Pre-bind the instance method
-    start = time.perf_counter()
-    for i in range(BULK_SIZE):
-        add_fn(i)
-    elapsed = time.perf_counter() - start
+    add_fn = arr.add
+
+    def instance_calls():
+        for i in range(BULK_SIZE):
+            add_fn(i)
+
+    elapsed = median_pass(instance_calls)
     results.append(
         {
             "name": f"Bulk instance calls ({BULK_SIZE})",
@@ -1168,17 +1217,16 @@ def benchmark_gatun_throughput() -> list[dict]:
     # Each iteration = 5 bridge operations: create(1) + put(2) + get(1) + size(1)
     iterations = BULK_SIZE // 10
     ops_per_iteration = 5
-    start = time.perf_counter()
-    for i in range(iterations):
-        # Create object (1 op) - use prebound class
-        hm = HashMap()
-        # Call instance methods (2 ops)
-        hm.put("key1", i)
-        hm.put("key2", f"value{i}")
-        # Get values back (2 ops)
-        hm.get("key1")
-        hm.size()
-    elapsed = time.perf_counter() - start
+
+    def mixed():
+        for i in range(iterations):
+            hm = HashMap()
+            hm.put("key1", i)
+            hm.put("key2", f"value{i}")
+            hm.get("key1")
+            hm.size()
+
+    elapsed = median_pass(mixed)
     total_ops = iterations * ops_per_iteration
     results.append(
         {
@@ -1191,7 +1239,6 @@ def benchmark_gatun_throughput() -> list[dict]:
         }
     )
 
-    client.close()
     return results
 
 
@@ -1263,10 +1310,23 @@ import subprocess
 import sys
 import time
 
-WARMUP_SECONDS = 2.0
-WARMUP_MIN_ITERATIONS = 1000
-BENCHMARK_ITERATIONS = 1000
-BULK_SIZE = 10000
+# The settings of the process that started this one (--quick changes them)
+WARMUP_SECONDS = float(os.environ["BENCH_WARMUP_SECONDS"])
+WARMUP_MIN_ITERATIONS = int(os.environ["BENCH_WARMUP_MIN_ITERATIONS"])
+BENCHMARK_ITERATIONS = int(os.environ["BENCH_ITERATIONS"])
+BULK_SIZE = int(os.environ["BENCH_BULK_SIZE"])
+THROUGHPUT_PASSES = int(os.environ["BENCH_THROUGHPUT_PASSES"])
+JVM_FLAGS = json.loads(os.environ["BENCH_JVM_FLAGS"])
+
+
+def median_pass(loop):
+    loop()
+    times = []
+    for _ in range(THROUGHPUT_PASSES):
+        start = time.perf_counter()
+        loop()
+        times.append(time.perf_counter() - start)
+    return statistics.median(times)
 
 
 def _noop():
@@ -1519,10 +1579,8 @@ def run_latency_benchmarks(gateway, auto_convert):
             pass
     results.append(run_benchmark("7.1 bridge error propagation", catch_bridge_exception))
 
-    # 7.2 Java-side try/catch (exception thrown and caught internally, call succeeds)
-    def java_internal_exception():
-        Integer.decode("12345")
-    results.append(run_benchmark("7.2 java internal try/catch", java_internal_exception))
+    # 7.2 The same call succeeding: what 7.1 costs beyond it is the exception
+    results.append(run_benchmark("7.2 same call, no error", lambda: Integer.parseInt("12345")))
 
     # 8. TYPE CHECKING (fast ops, use batch timing)
     from py4j.java_gateway import is_instance_of
@@ -1531,6 +1589,12 @@ def run_latency_benchmarks(gateway, auto_convert):
         lambda: is_instance_of(gateway, arr_check, "java.util.List")))
     results.append(run_batch_benchmark("8.2 is_instance_of (false)",
         lambda: is_instance_of(gateway, arr_check, "java.util.Map")))
+
+    # 9. THE FULL PATH ON EVERY CALL
+    results.append(run_benchmark("9.1 static() via jvm path",
+        lambda: gateway.jvm.java.lang.Math.max(10, 20)))
+    results.append(run_benchmark("9.2 new() via jvm path",
+        lambda: gateway.jvm.java.util.ArrayList()))
 
     return results
 
@@ -1548,11 +1612,13 @@ def run_throughput_benchmarks(gateway):
     throughput_results = []
 
     # Bulk static calls - prebind the method
-    abs_fn = Math.abs  # Pre-bind the static method
-    start = time.perf_counter()
-    for i in range(BULK_SIZE):
-        abs_fn(i)
-    elapsed = time.perf_counter() - start
+    abs_fn = Math.abs
+
+    def static_calls():
+        for i in range(BULK_SIZE):
+            abs_fn(i)
+
+    elapsed = median_pass(static_calls)
     throughput_results.append({
         "name": f"Bulk static calls ({BULK_SIZE})",
         "total_ms": elapsed * 1000,
@@ -1560,10 +1626,11 @@ def run_throughput_benchmarks(gateway):
     })
 
     # Bulk object creation
-    start = time.perf_counter()
-    for _ in range(BULK_SIZE):
-        ArrayList()
-    elapsed = time.perf_counter() - start
+    def creations():
+        for _ in range(BULK_SIZE):
+            ArrayList()
+
+    elapsed = median_pass(creations)
     throughput_results.append({
         "name": f"Bulk object creation ({BULK_SIZE})",
         "total_ms": elapsed * 1000,
@@ -1572,11 +1639,13 @@ def run_throughput_benchmarks(gateway):
 
     # Bulk instance method calls - prebind the method
     arr = ArrayList()
-    add_fn = arr.add  # Pre-bind the instance method
-    start = time.perf_counter()
-    for i in range(BULK_SIZE):
-        add_fn(i)
-    elapsed = time.perf_counter() - start
+    add_fn = arr.add
+
+    def instance_calls():
+        for i in range(BULK_SIZE):
+            add_fn(i)
+
+    elapsed = median_pass(instance_calls)
     throughput_results.append({
         "name": f"Bulk instance calls ({BULK_SIZE})",
         "total_ms": elapsed * 1000,
@@ -1587,14 +1656,16 @@ def run_throughput_benchmarks(gateway):
     # Each iteration = 5 bridge operations: create(1) + put(2) + get(1) + size(1)
     iterations = BULK_SIZE // 10
     ops_per_iteration = 5
-    start = time.perf_counter()
-    for i in range(iterations):
-        hm = HashMap()
-        hm.put("key1", i)
-        hm.put("key2", f"value{i}")
-        hm.get("key1")
-        hm.size()
-    elapsed = time.perf_counter() - start
+
+    def mixed():
+        for i in range(iterations):
+            hm = HashMap()
+            hm.put("key1", i)
+            hm.put("key2", f"value{i}")
+            hm.get("key1")
+            hm.size()
+
+    elapsed = median_pass(mixed)
     total_ops = iterations * ops_per_iteration
     throughput_results.append({
         "name": f"Mixed workload ({iterations} iter × {ops_per_iteration} ops)",
@@ -1639,12 +1710,11 @@ def run_payload_sweep(gateway):
         result["size_bytes"] = size
         string_results.append(result)
 
-    # Bytes send-only sweep (Python -> Java, returns boolean)
+    # Bytes send-only sweep (Python -> Java, returns an int; nothing is kept)
     for size in bytes_sizes:
         test_bytes = b"x" * size
-        arr = ArrayList()
-        def bytes_send_test(data=test_bytes, container=arr):
-            container.add(data)
+        def bytes_send_test(data=test_bytes):
+            Arrays.hashCode(data)
         result = run_benchmark(f"bytes_send_{size}B", bytes_send_test, iterations=sweep_iterations)
         result["size_bytes"] = size
         bytes_results.append(result)
@@ -1680,16 +1750,12 @@ if not jar_path:
 print("PY4J_JAR:" + jar_path)
 print("PY4J_PORT:" + str(port))
 
-java_home = os.environ.get("JAVA_HOME", "/opt/homebrew/opt/openjdk")
-java_cmd = os.path.join(java_home, "bin", "java")
+java_home = os.environ.get("JAVA_HOME")
+java_cmd = os.path.join(java_home, "bin", "java") if java_home else "java"
 
-# JVM tuning for stable microbenchmarking:
-# - Fixed heap size to avoid GC resize pauses
-jvm_opts = [
-    "-Xms512m", "-Xmx512m",  # Fixed heap size (larger to avoid GC during benchmarks)
-]
+# The heap settings Gatun's server runs with
 proc = subprocess.Popen(
-    [java_cmd] + jvm_opts + ["-cp", jar_path, "py4j.GatewayServer", str(port)],
+    [java_cmd] + JVM_FLAGS + ["-cp", jar_path, "py4j.GatewayServer", str(port)],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,  # Avoid pipe blocking
 )
 
@@ -1756,7 +1822,15 @@ def run_py4j_benchmarks() -> dict:
         capture_output=True,
         text=True,
         check=False,  # returncode is inspected below
-        env={**os.environ},
+        env={
+            **os.environ,
+            "BENCH_WARMUP_SECONDS": str(WARMUP_SECONDS),
+            "BENCH_WARMUP_MIN_ITERATIONS": str(WARMUP_MIN_ITERATIONS),
+            "BENCH_ITERATIONS": str(BENCHMARK_ITERATIONS),
+            "BENCH_BULK_SIZE": str(BULK_SIZE),
+            "BENCH_THROUGHPUT_PASSES": str(THROUGHPUT_PASSES),
+            "BENCH_JVM_FLAGS": json.dumps(JVM_FLAGS),
+        },
         cwd=cwd,
         timeout=1800,  # 30 minutes for full benchmark suite with warmup
     )
@@ -1894,38 +1968,23 @@ def main():
     print("  6. Data Transfer (Java -> Python)")
     print("  7. Exception Handling")
     print("  8. Type Checking")
+    print("  9. Full jvm path on every call")
     print()
     print("Fairness notes:")
+    print(f"  - Both JVMs run with {' '.join(JVM_FLAGS)}, and are warm for every case")
+    print("  - Classes are bound once on both sides; section 9 times the full path")
+    print("  - Each trial runs Gatun and then Py4J")
     print(
         "  - Py4J tested with both auto_convert=True (PySpark) and auto_convert=False"
     )
     print("  - Baseline measurements included for computing net bridge cost")
     print("  - Multiple trials aggregated using median-of-medians for robustness")
 
-    # Run Gatun benchmarks with multiple trials
+    # A trial is Gatun and then Py4J: a slow spell on the machine falls on both
     print("\n" + "-" * 80)
     gatun_latency_trials = []
     gatun_throughput_trials = []
     gatun_baseline = None
-
-    for trial in range(NUM_TRIALS):
-        print(f"[Trial {trial + 1}/{NUM_TRIALS}] Running Gatun latency benchmarks...")
-        latency, baseline = benchmark_gatun()
-        gatun_latency_trials.append(latency)
-        if gatun_baseline is None:
-            gatun_baseline = baseline
-
-        print(
-            f"[Trial {trial + 1}/{NUM_TRIALS}] Running Gatun throughput benchmarks..."
-        )
-        throughput = benchmark_gatun_throughput()
-        gatun_throughput_trials.append(throughput)
-
-    # Aggregate Gatun trials using median-of-medians
-    gatun_latency = aggregate_trials(gatun_latency_trials)
-    gatun_throughput = aggregate_throughput_trials(gatun_throughput_trials)
-
-    # Run Py4J benchmarks with multiple trials (unless --gatun-only)
     py4j_latency_auto_trials = []
     py4j_latency_no_auto_trials = []
     py4j_throughput_auto_trials = []
@@ -1933,28 +1992,39 @@ def main():
     py4j_baseline = None
     py4j_sweep = None
 
-    if not args.gatun_only:
-        for trial in range(NUM_TRIALS):
-            print(f"[Trial {trial + 1}/{NUM_TRIALS}] Running Py4J benchmarks...")
-            py4j_results = run_py4j_benchmarks()
-
-            if py4j_baseline is None:
-                py4j_baseline = py4j_results.get("baseline")
-            if py4j_sweep is None:
-                py4j_sweep = py4j_results.get("payload_sweep")
-
-            if py4j_results.get("latency_auto_true"):
-                py4j_latency_auto_trials.append(py4j_results["latency_auto_true"])
-            if py4j_results.get("latency_auto_false"):
-                py4j_latency_no_auto_trials.append(py4j_results["latency_auto_false"])
-            if py4j_results.get("throughput_auto_true"):
-                py4j_throughput_auto_trials.append(py4j_results["throughput_auto_true"])
-            if py4j_results.get("throughput_auto_false"):
-                py4j_throughput_no_auto_trials.append(
-                    py4j_results["throughput_auto_false"]
-                )
-    else:
+    if args.gatun_only:
         print("[Skipping Py4J benchmarks (--gatun-only)]")
+
+    for trial in range(NUM_TRIALS):
+        print(f"[Trial {trial + 1}/{NUM_TRIALS}] Running Gatun benchmarks...")
+        latency, baseline, throughput = benchmark_gatun()
+        gatun_latency_trials.append(latency)
+        gatun_throughput_trials.append(throughput)
+        if gatun_baseline is None:
+            gatun_baseline = baseline
+
+        if args.gatun_only:
+            continue
+        print(f"[Trial {trial + 1}/{NUM_TRIALS}] Running Py4J benchmarks...")
+        py4j_results = run_py4j_benchmarks()
+
+        if py4j_baseline is None:
+            py4j_baseline = py4j_results.get("baseline")
+        if py4j_sweep is None:
+            py4j_sweep = py4j_results.get("payload_sweep")
+
+        if py4j_results.get("latency_auto_true"):
+            py4j_latency_auto_trials.append(py4j_results["latency_auto_true"])
+        if py4j_results.get("latency_auto_false"):
+            py4j_latency_no_auto_trials.append(py4j_results["latency_auto_false"])
+        if py4j_results.get("throughput_auto_true"):
+            py4j_throughput_auto_trials.append(py4j_results["throughput_auto_true"])
+        if py4j_results.get("throughput_auto_false"):
+            py4j_throughput_no_auto_trials.append(py4j_results["throughput_auto_false"])
+
+    # Aggregate Gatun trials using median-of-medians
+    gatun_latency = aggregate_trials(gatun_latency_trials)
+    gatun_throughput = aggregate_throughput_trials(gatun_throughput_trials)
 
     # Aggregate Py4J trials
     py4j_latency_auto = (
@@ -1968,11 +2038,6 @@ def main():
     py4j_throughput_auto = (
         aggregate_throughput_trials(py4j_throughput_auto_trials)
         if py4j_throughput_auto_trials
-        else None
-    )
-    py4j_throughput_no_auto = (
-        aggregate_throughput_trials(py4j_throughput_no_auto_trials)
-        if py4j_throughput_no_auto_trials
         else None
     )
 
@@ -2003,6 +2068,12 @@ def main():
             py4j_throughput_auto, "Py4J Throughput (auto_convert=True)"
         )
         print_throughput_comparison(gatun_throughput, py4j_throughput_auto)
+
+    if py4j_throughput_no_auto_trials:
+        print_throughput_results(
+            aggregate_throughput_trials(py4j_throughput_no_auto_trials),
+            "Py4J Throughput (auto_convert=False)",
+        )
 
     # Summary
     print("=" * 80)
@@ -2050,20 +2121,6 @@ def main():
                 print(
                     f"Gatun vs Py4J (auto_convert=False): {geo_mean:.2f}x faster (geometric mean)"
                 )
-
-    if py4j_throughput_auto and gatun_throughput:
-        gatun_ops = sum(r["ops_per_sec"] for r in gatun_throughput)
-        py4j_ops = sum(r["ops_per_sec"] for r in py4j_throughput_auto)
-        print(
-            f"\nTotal throughput: Gatun {gatun_ops:,.0f} ops/s vs Py4J {py4j_ops:,.0f} ops/s"
-        )
-
-    if py4j_throughput_no_auto and gatun_throughput:
-        gatun_ops = sum(r["ops_per_sec"] for r in gatun_throughput)
-        py4j_ops = sum(r["ops_per_sec"] for r in py4j_throughput_no_auto)
-        print(
-            f"Total throughput (no auto): Gatun {gatun_ops:,.0f} ops/s vs Py4J {py4j_ops:,.0f} ops/s"
-        )
 
     # Run payload sweep to identify crossover points
     print("\n" + "-" * 80)
