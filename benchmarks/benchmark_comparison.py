@@ -2128,6 +2128,48 @@ def main():
     string_sweep, bytes_sweep = benchmark_payload_sweep()
     print_sweep_results(string_sweep, bytes_sweep, py4j_sweep)
 
+    if args.json:
+        with open(args.json, "w") as out:
+            json.dump(
+                {
+                    "environment": {
+                        "system": platform.platform(),
+                        "machine": platform.machine(),
+                        "python": platform.python_version(),
+                    },
+                    "settings": {
+                        "warmup_seconds": WARMUP_SECONDS,
+                        "warmup_min_iterations": WARMUP_MIN_ITERATIONS,
+                        "iterations": BENCHMARK_ITERATIONS,
+                        "bulk_size": BULK_SIZE,
+                        "trials": NUM_TRIALS,
+                        "jvm_flags": JVM_FLAGS,
+                    },
+                    "baseline": {"gatun": gatun_baseline, "py4j": py4j_baseline},
+                    "latency": {
+                        "gatun": gatun_latency,
+                        "py4j_auto_convert": py4j_latency_auto,
+                        "py4j_no_auto_convert": py4j_latency_no_auto,
+                    },
+                    "throughput": {
+                        "gatun": gatun_throughput,
+                        "py4j_auto_convert": py4j_throughput_auto,
+                        "py4j_no_auto_convert": (
+                            aggregate_throughput_trials(py4j_throughput_no_auto_trials)
+                            if py4j_throughput_no_auto_trials
+                            else None
+                        ),
+                    },
+                    "payload_sweep": {
+                        "gatun": {"string": string_sweep, "bytes": bytes_sweep},
+                        "py4j": py4j_sweep,
+                    },
+                },
+                out,
+                indent=1,
+            )
+        print(f"\nwrote {args.json}")
+
     print()
 
 
