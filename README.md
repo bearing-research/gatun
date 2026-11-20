@@ -25,65 +25,69 @@ High-performance Python-to-Java bridge using shared memory and Unix domain socke
 
 ## Performance
 
-Gatun uses shared memory IPC which provides different trade-offs vs Py4J (PySpark's default TCP-based bridge):
+Measured on Linux (8 vCPUs of a shared AMD EPYC 7713, OpenJDK 22.0.2, Python 3.13.12); every figure is a median. [docs/benchmarks.md](docs/benchmarks.md) has all the cases, the method, and the commands to run them. Times depend on the machine, and so may the comparison with Py4J.
 
-### Latency (Single Operations)
+### Single Calls
 
-Gatun has **2-3x lower latency** for individual operations:
+A call is a round trip, and on this machine a round trip through Py4J (PySpark's bridge) takes about half the time of one through Gatun. Gatun is ahead where a call carries a collection or returns something large:
 
-| Operation | Gatun | Py4J | Speedup |
-|-----------|------:|-----:|--------:|
-| Method call (no args) | 120 μs | 350 μs | **2.9x** |
-| Method call (with args) | 140 μs | 380 μs | **2.7x** |
-| Object creation | 150 μs | 400 μs | **2.7x** |
-| Static method | 130 μs | 360 μs | **2.8x** |
+| Operation | Gatun | Py4J | |
+|-----------|------:|-----:|---|
+| Instance method call (`list.size()`) | 149 μs | 77 μs | Py4J 1.9x faster |
+| Static method call (`Math.max(10, 20)`) | 291 μs | 204 μs | Py4J 1.4x faster |
+| Create an object and drop it (`ArrayList()`) | 359 μs | 88 μs | Py4J 4.1x faster |
+| Calls in a loop | 5,500 /s | 9,500 /s | Py4J 1.7x faster |
+| Python list of 100 as an argument | 2.1 ms | 10.8 ms | Gatun 5.2x faster |
+| `is_instance_of` | 145 μs | 519 μs | Gatun 3.6x faster |
+| Return a 16 KB `byte[]` | 193 μs | 42 ms | Gatun 218x faster |
 
-### Throughput (Bulk Operations)
+Both bridges were given the same JVM settings and a warm JVM, with classes bound once (`Math = jvm.java.lang.Math`). Creating an object and dropping it costs Gatun a second round trip, to release it.
 
-For tight loops with **pre-bound methods** (where class/method resolution is cached), Py4J achieves higher ops/sec:
+### Fewer Round Trips
 
-| Operation | Gatun | Py4J | Notes |
-|-----------|------:|-----:|-------|
-| Bulk static calls (10K) | ~45K ops/s | ~60K ops/s | Pre-bound: `fn = Math.abs; fn(i)` |
-| Bulk instance calls (10K) | ~40K ops/s | ~55K ops/s | Pre-bound: `fn = arr.add; fn(i)` |
-| Mixed workload | ~35K ops/s | ~30K ops/s | Gatun faster for varied operations |
+Since the round trip is the cost, sending operations together is what helps most:
 
-**Why the difference?** Latency benchmarks measure full `client.jvm.java.lang.Math.max(10, 20)` calls including package navigation and method resolution (~120μs). Throughput benchmarks pre-bind methods first, measuring only the IPC cost (~22μs for Gatun). Py4J's TCP protocol has lower per-call IPC overhead than Gatun's shared memory protocol for small payloads.
-
-**Recommendation**: Use vectorized APIs or Arrow for bulk data instead of tight loops.
+| Work | One at a Time | `batch()` | Vectorized Call |
+|------|--------------:|----------:|----------------:|
+| 10 method calls on one object | 2.05 ms | 809 μs | 677 μs |
+| 100 method calls on one object | 19.2 ms | 5.14 ms | 4.28 ms |
+| 100 objects created | 16.4 ms | 4.39 ms | 3.85 ms |
 
 ### Arrow Data Transfer
 
-For bulk data, Arrow zero-copy transfer provides massive speedups over per-element transfer:
+Time for the call to return with the table on the other side:
 
-| Data Size | IPC Format | Zero-Copy Buffers | Throughput |
-|-----------|----------:|------------------:|-----------:|
-| 1K rows | 800 μs | 520 μs | 54 MB/s |
-| 10K rows | 890 μs | 570 μs | 509 MB/s |
-| 100K rows | 1.4 ms | 1.0 ms | **1.5 GB/s** |
-| 500K rows | 5.9 ms | 3.6 ms | **2.1 GB/s** |
+| Method | 16 KB | 1.6 MB | 16 MB | |
+|--------|------:|-------:|------:|---|
+| `arrow_to_java` | 466 μs | 572 μs | 2.61 ms | Java gets its own copy |
+| `arrow_to_java(copy=False)` | 498 μs | 512 μs | 1.29 ms | Java reads in place |
+| `send_arrow_buffers` | 466 μs | 499 μs | 1.34 ms | Loaded in place, not visible to Java code |
+| `arrow_from_java` | 212 μs | 323 μs | 2.18 ms | Python gets its own copy |
+| `arrow_from_java(copy=False)` | 204 μs | 260 μs | 1.06 ms | Python reads in place |
 
-### Vectorized APIs
+At 128 MiB, `arrow_to_java` takes 24 ms and `arrow_to_java(copy=False)` 12 ms, where an Arrow IPC stream over a Unix socket takes 106 ms.
 
-Reduce round-trips with batch operations:
+Next to the other ways of getting 500 integers into Java:
 
-| Operation | Individual Calls | Vectorized | Speedup |
-|-----------|----------------:|-----------:|--------:|
-| 3 method calls | 720 μs | 490 μs | **1.5x** |
-| 10 method calls | 1,600 μs | 490 μs | **3.3x** |
-| 10 object creations | 2,400 μs | 1,100 μs | **2.2x** |
+| How | Time |
+|-----|-----:|
+| 500 `add()` calls | 92 ms |
+| 500 `add()` calls in a `batch()` | 24 ms |
+| A Python list as a constructor argument | 6.7 ms |
+| A `pyarrow.Array` argument (arrives as `int[]`) | 0.25 ms |
+
+### Callbacks
+
+A callback made during a request (a Python comparator in `Collections.sort`) costs about 390 μs. With `connect(callback_timeout=None)` it costs 230 μs: a timeout, 30 seconds by default, has each callback run on a thread of its own. Sorting 1,000 elements took about 8,700 of them and 3.4 seconds, so a comparator in Python is for short lists.
 
 ### When to Use Gatun vs Py4J
 
 | Use Case | Recommendation |
 |----------|----------------|
-| Interactive/exploratory work | Gatun (lower latency) |
-| Bulk data transfer | Gatun (Arrow support) |
-| Simple tight loops | Py4J may be faster |
-| Mixed operations | Gatun |
-| PySpark integration | Either (Gatun via BridgeAdapter) |
-
-*Benchmarks run on Apple M1, Java 22, Python 3.13. See [docs/benchmarks.md](docs/benchmarks.md) for full methodology.*
+| Many small calls, one at a time | Py4J: about twice the calls per second |
+| Bulk data | Gatun: Arrow tables through shared memory |
+| Collections as arguments, large return values | Gatun |
+| Many operations that can be sent together | Gatun: `batch()` and the vectorized calls |
 
 ## Installation
 
