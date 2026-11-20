@@ -104,13 +104,15 @@ Both directories are gitignored, as is the built JAR in `src/gatun/jars/` — ne
 
 `FLATBUFFERS_RUNTIME_VERSION` in the backend must match the `flatbuffers-java` version in `gatun-core/build.gradle.kts`; bump them together.
 
-The shadow JAR relocates Netty (`gatun.shaded.io.netty`) so it can coexist with Spark's Netty, and pins Jackson to Spark 4.x's version unshaded so the two share classes. Keep that in mind when changing Java dependencies.
+The shadow JAR relocates Netty (`gatun.shaded.io.netty`) so it can coexist with Spark's Netty, and pins Jackson to Spark 4.x's version unshaded so the two share classes. Keep that in mind when changing Java dependencies. The relocation renames Netty's system properties too: the server's Netty reads `gatun.shaded.io.netty.*` (`DEFAULT_JVM_FLAGS` in `launcher.py` passes `tryReflectionSetAccessible` under both names, the plain one for a Netty on the classpath). With it the server's Arrow memory is counted by Netty (`gatun.shaded.io.netty.maxDirectMemory`), not by the JVM's direct memory limit.
 
 ## Key Implementation Details
 
 - Java 22+ required. 22 is the first release where the Foreign Function & Memory API (`java.lang.foreign`, used to map the shared memory) is final; on 21 it needed `--enable-preview`. The Gradle toolchain and `--release` are pinned to 22 so the JAR runs on 22 and later, and CI runs on 22 to exercise that floor. Do not raise it casually.
 - Python 3.13+ required (3.14 also supported)
 - Arrow memory requires JVM flags: `--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED`
+- Arrow's debug allocator is off by default (it costs about 2 ms per small `arrow_to_java`); `extra_jvm_flags=["-Darrow.memory.debug.allocator=true"]` turns it on to find where a leaked buffer was allocated
+- Copies of Arrow data go into memory that gets reused (`_read_arrow_stream` copies into `pa.allocate_buffer`, not a `bytes` object; pyarrow's default mimalloc or jemalloc pool keeps the memory of a dropped table): from 32 MiB up, glibc gives a new mapping for every allocation, and the page faults of touching new memory cost several times the copy
 - Both clients use `weakref.finalize` for automatic Java object cleanup (`detach()` opts a handle out). The finalizer only queues the object ID (`GatunClient._queue_free`); the queue is sent as chunked `FreeObject` commands just before the next request, because a finalizer can fire in the middle of another exchange. Never send on the socket from a finalizer. An explicit `client.free_object(id)` is sent immediately.
 - `_build_value` must not make Java calls: the outer command is half-built in a pooled builder and the channel carries one request at a time. Values that need a Java-side object are encoded on the wire instead (see `TemporalVal` for `datetime` / `date` / `time`).
 - Socket path: Generated randomly in `/tmp/gatun_<pid>_<random>.sock` by default. The launcher refuses a fixed `socket_path` that a live server is listening on

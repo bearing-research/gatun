@@ -1667,7 +1667,20 @@ def _read_arrow_stream(
     if in_place:
         data = pa.py_buffer(memoryview(client.shm)[start : start + length])
     else:
-        data = client.shm[start : start + length]
+        # The copy goes into Arrow's memory pool, which (mimalloc, jemalloc)
+        # hands back the memory of a table that was dropped. A bytes object of
+        # 32 MiB or more is new memory from the OS every time, and so is the
+        # pool's with the system allocator behind it; the page faults of
+        # touching new memory cost several times the copy.
+        data = pa.allocate_buffer(length)
+        target = memoryview(data).cast("B")
+        source = memoryview(client.shm)[start : start + length]
+        try:
+            target[:] = source
+        finally:
+            # A view left behind would keep close() from unmapping the memory
+            source.release()
+            target.release()
     return pa.ipc.open_stream(data).read_all()
 
 

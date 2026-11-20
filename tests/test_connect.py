@@ -5,6 +5,7 @@ import glob
 import os
 import weakref
 
+import pyarrow as pa
 import pytest
 
 from gatun import GatunClient, aconnect, connect
@@ -160,6 +161,40 @@ class TestServerLifetime:
         await client.close()
 
         assert process.poll() is not None
+
+
+class TestServerDefaults:
+    """What the launcher's default JVM flags leave the server with."""
+
+    def test_netty_allocates_without_zero_filling(self):
+        """The server's Netty is relocated in the JAR, and the name of the
+        switch that lets it hand out direct memory unfilled is relocated too.
+        Under the plain name the server's Netty never sees it, and every Arrow
+        buffer is filled with zeros before the data is copied over them."""
+        platform = "gatun.shaded.io.netty.util.internal.PlatformDependent"
+        with connect(allowed_classes=[platform]) as client:
+            unfilled = client.invoke_static_method(platform, "useDirectBufferNoCleaner")
+
+            assert unfilled is True
+
+    def test_arrow_debug_allocator_is_off(self, client):
+        """It records a stack trace for each buffer operation, and a small
+        arrow_to_java() took more than twice as long with it."""
+        system = client.jvm.java.lang.System
+
+        assert system.getProperty("arrow.memory.debug.allocator") is None
+
+    def test_arrow_debug_allocator_on_request(self):
+        """Still the way to find out where a leaked Arrow buffer came from."""
+        table = pa.table({"x": [1, 2, 3], "s": ["a", "b", "c"]})
+        debug = ["-Darrow.memory.debug.allocator=true"]
+        with connect(extra_jvm_flags=debug) as client:
+            system = client.jvm.java.lang.System
+            assert system.getProperty("arrow.memory.debug.allocator") == "true"
+
+            root = client.arrow_to_java(table)
+
+            assert client.arrow_from_java(root).equals(table)
 
 
 class TestTimeoutArguments:
