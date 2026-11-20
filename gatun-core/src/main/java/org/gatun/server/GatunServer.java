@@ -269,7 +269,8 @@ public class GatunServer {
   // would also pick up what other threads registered for the same session meanwhile.
   private static final ThreadLocal<List<Long>> packRecorder = new ThreadLocal<>();
 
-  private final BufferAllocator allocator = new RootAllocator();
+  private final ArrowBlockPool arrowPool;
+  private final BufferAllocator allocator;
 
   // Delegate to ReflectionCache for all caching operations
   private static java.lang.reflect.Constructor<?> getNoArgConstructor(Class<?> clazz)
@@ -334,6 +335,15 @@ public class GatunServer {
     this.memorySize = memorySize;
     this.responseOffset = memorySize - RESPONSE_ZONE_SIZE;
     this.threadPool = Executors.newVirtualThreadPerTaskExecutor();
+    // Large Arrow buffers come from a pool of the server's own (see ArrowBlockPool)
+    this.arrowPool = ArrowBlockPool.fromProperties(memorySize);
+    this.allocator =
+        new RootAllocator(
+            RootAllocator.configBuilder()
+                .allocationManagerFactory(arrowPool)
+                .roundingPolicy(arrowPool.rounding())
+                .build());
+    Metrics.getInstance().setArrowPoolReport(arrowPool::report);
   }
 
   public void start() throws IOException {
