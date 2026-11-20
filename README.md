@@ -29,29 +29,31 @@ Measured on Linux (8 vCPUs of a shared AMD EPYC 7713, OpenJDK 22.0.2, Python 3.1
 
 ### Single Calls
 
-A call is a round trip, and on this machine a round trip through Py4J (PySpark's bridge) takes about half the time of one through Gatun. Gatun is ahead where a call carries a collection or returns something large:
+A call with plain arguments is one round trip and takes 31 to 39 μs. Py4J (PySpark's bridge) takes 41 to 67 μs for an instance call and makes two round trips for a static one. The gap is wider where a call carries a collection or returns something large:
 
 | Operation | Gatun | Py4J | |
 |-----------|------:|-----:|---|
-| Instance method call (`list.size()`) | 149 μs | 77 μs | Py4J 1.9x faster |
-| Static method call (`Math.max(10, 20)`) | 291 μs | 204 μs | Py4J 1.4x faster |
-| Create an object and drop it (`ArrayList()`) | 359 μs | 88 μs | Py4J 4.1x faster |
-| Calls in a loop | 5,500 /s | 9,500 /s | Py4J 1.7x faster |
-| Python list of 100 as an argument | 0.55 ms | 6.2 ms | Gatun 11x faster |
-| `is_instance_of` | 145 μs | 519 μs | Gatun 3.6x faster |
-| Return a 16 KB `byte[]` | 193 μs | 42 ms | Gatun 218x faster |
+| Instance method call (`list.size()`) | 33 μs | 42 μs | Gatun 1.3x faster |
+| Static method call (`Math.max(10, 20)`) | 39 μs | 113 μs | Gatun 2.9x faster |
+| Create an object and drop it (`ArrayList()`) | 46 μs | 47 μs | the same |
+| Calls in a loop | 28,500 /s | 18,800 /s | Gatun 1.5x faster |
+| Python list of 100 as an argument | 0.28 ms | 5.6 ms | Gatun 20x faster |
+| `is_instance_of` | 31 μs | 275 μs | Gatun 8.8x faster |
+| Return a 16 KB `byte[]` | 66 μs | 42 ms | Gatun 640x faster |
 
-Both bridges were given the same JVM settings and a warm JVM, with classes bound once (`Math = jvm.java.lang.Math`). Creating an object and dropping it costs Gatun a second round trip, to release it. The list row is from a later run than the others, on another host of the same kind where every round trip was shorter; both of its figures are from that run.
+Both bridges were given the same JVM settings and a warm JVM, with classes bound once (`Math = jvm.java.lang.Math`). A handle that is dropped is released with the next call, not with a round trip of its own. Two runs on this shared machine differ by up to a third on a single row, so read the small differences as "about the same".
 
 ### Fewer Round Trips
 
-Since the round trip is the cost, sending operations together is what helps most:
+A call sent on its own costs a round trip. In a `batch()` it costs about 5 μs:
 
 | Work | One at a Time | `batch()` | Vectorized Call |
 |------|--------------:|----------:|----------------:|
-| 10 method calls on one object | 2.05 ms | 809 μs | 677 μs |
-| 100 method calls on one object | 19.2 ms | 5.14 ms | 4.28 ms |
-| 100 objects created | 16.4 ms | 4.39 ms | 3.85 ms |
+| 10 method calls on one object | 502 μs | 132 μs | 423 μs |
+| 100 method calls on one object | 4.20 ms | 560 μs | 2.68 ms |
+| 100 objects created | 4.22 ms | 573 μs | 2.31 ms |
+
+The vectorized calls (`invoke_methods`, `create_objects`) are slower than a batch of the same size: their commands are still built with the FlatBuffers library, where single calls and batches are packed by hand.
 
 ### Arrow Data Transfer
 
@@ -59,32 +61,32 @@ Time for the call to return with the table on the other side:
 
 | Method | 16 KB | 1.6 MB | 16 MB | |
 |--------|------:|-------:|------:|---|
-| `arrow_to_java` | 466 μs | 572 μs | 2.61 ms | Java gets its own copy |
-| `arrow_to_java(copy=False)` | 498 μs | 512 μs | 1.29 ms | Java reads in place |
-| `send_arrow_buffers` | 466 μs | 499 μs | 1.34 ms | Loaded in place, not visible to Java code |
-| `arrow_from_java` | 212 μs | 323 μs | 2.18 ms | Python gets its own copy |
-| `arrow_from_java(copy=False)` | 204 μs | 260 μs | 1.06 ms | Python reads in place |
+| `arrow_to_java` | 261 μs | 384 μs | 2.06 ms | Java gets its own copy |
+| `arrow_to_java(copy=False)` | 268 μs | 346 μs | 957 μs | Java reads in place |
+| `send_arrow_buffers` | 367 μs | 379 μs | 1.13 ms | Loaded in place, not visible to Java code |
+| `arrow_from_java` | 167 μs | 240 μs | 1.93 ms | Python gets its own copy |
+| `arrow_from_java(copy=False)` | 193 μs | 175 μs | 881 μs | Python reads in place |
 
-At 128 MiB, `arrow_to_java` takes 24 ms and `arrow_to_java(copy=False)` 12 ms, where an Arrow IPC stream over a Unix socket takes 106 ms.
+At 128 MiB, `arrow_to_java` takes 24 ms and `arrow_to_java(copy=False)` 11 ms, where an Arrow IPC stream over a Unix socket takes 102 ms.
 
 Next to the other ways of getting 500 integers into Java:
 
 | How | Time |
 |-----|-----:|
-| 500 `add()` calls | 78 ms |
-| 500 `add()` calls in a `batch()` | 22 ms |
-| A Python list as a constructor argument | 0.35 ms |
-| A `pyarrow.Array` argument (arrives as `int[]`) | 0.19 ms |
+| 500 `add()` calls | 21 ms |
+| 500 `add()` calls in a `batch()` | 2.4 ms |
+| A Python list as a constructor argument | 0.22 ms |
+| A `pyarrow.Array` argument (arrives as `int[]`) | 0.17 ms |
 
 ### Callbacks
 
-A callback made during a request (a Python comparator in `Collections.sort`) costs about 390 μs. With `connect(callback_timeout=None)` it costs 230 μs: a timeout, 30 seconds by default, has each callback run on a thread of its own. Sorting 1,000 elements took about 8,700 of them and 3.4 seconds, so a comparator in Python is for short lists.
+A callback made during a request (a Python comparator in `Collections.sort`) costs about 330 μs. With `connect(callback_timeout=None)` it costs 160 μs: a timeout, 30 seconds by default, has each callback run on a thread of its own. Sorting 1,000 elements took about 8,700 of them and 2.8 seconds, so a comparator in Python is for short lists.
 
 ### When to Use Gatun vs Py4J
 
 | Use Case | Recommendation |
 |----------|----------------|
-| Many small calls, one at a time | Py4J: about twice the calls per second |
+| Many small calls, one at a time | Either: Gatun made about 1.5 times the calls per second on the test machine |
 | Bulk data | Gatun: Arrow tables through shared memory |
 | Collections as arguments, large return values | Gatun |
 | Many operations that can be sent together | Gatun: `batch()` and the vectorized calls |
@@ -483,7 +485,9 @@ values = client.get_fields(sb, ["count"])  # [5]
 | `invoke_methods` | Multiple method calls on **same object** |
 | `create_objects` | Creating multiple objects at startup |
 | `get_fields` | Reading multiple fields from one object |
-| `batch` | Mixed operations on **different objects** |
+| `batch` | Mixed operations on **different objects**, and whenever speed matters |
+
+A `batch()` is the fastest of the four, several times faster than the vectorized call for the same work (see [Performance](#performance)).
 
 ### JavaArray for Primitive Arrays
 

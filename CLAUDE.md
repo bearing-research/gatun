@@ -373,7 +373,7 @@ client.is_instance_of(arr, "java.util.Map")        # False
 ```
 
 ### Batch API
-Execute multiple commands in a single round-trip (100 calls take about a quarter of the time; numbers in `docs/benchmarks.md`):
+Execute multiple commands in a single round-trip (100 calls take about an eighth of the time; numbers in `docs/benchmarks.md`):
 ```python
 arr = client.create_object("java.util.ArrayList")
 
@@ -404,7 +404,7 @@ print(r2.is_error)   # True
 ```
 
 ### Vectorized APIs
-For several operations on the same target, the vectorized APIs take the whole list in one command (a tenth to a fifth faster than a batch of the same size):
+For several operations on the same target, the vectorized APIs take the whole list in one command and return a list. A `batch()` of the same operations is several times faster: batches are packed by hand (`wire.py`) and these commands are not:
 
 ```python
 # invoke_methods - Multiple method calls on same object in one round-trip
@@ -447,7 +447,7 @@ values = client.get_fields(sb, ["count"])  # [5]
 | `invoke_methods` | Multiple method calls on **same object** |
 | `create_objects` | Creating multiple objects at startup |
 | `get_fields` | Reading multiple fields from one object |
-| `batch` | Mixed operations on **different objects** |
+| `batch` | Mixed operations on **different objects**, and whenever speed matters |
 
 ### Low-Level API
 For direct control:

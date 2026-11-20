@@ -5128,9 +5128,9 @@ class GatunClient(_ValueEncoder):
     def batch(self, stop_on_error: bool = False) -> BatchContext:
         """Create a batch context for executing multiple commands in one round-trip.
 
-        Batching amortizes the per-call overhead (~100-150μs) across multiple
-        operations. Commands are queued locally and sent together when the
-        context exits or execute() is called.
+        A command sent on its own costs a round trip; in a batch it costs a
+        few microseconds. Commands are queued locally and sent together when
+        the context exits or execute() is called.
 
         Args:
             stop_on_error: If True, stop executing on first error.
@@ -5249,8 +5249,8 @@ class BatchContext:
     """Context manager for batching multiple commands into a single round-trip.
 
     Commands queued in a batch are sent together when execute() is called
-    (or automatically when exiting a context manager). This reduces per-call
-    overhead from ~100-150μs to ~10μs per operation.
+    (or automatically when exiting a context manager). An operation in a
+    batch costs a few microseconds instead of a round trip.
 
     Attributes:
         stop_on_error: If True, Java stops executing after first error.
