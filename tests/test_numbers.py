@@ -539,6 +539,19 @@ class TestNumbersOfOtherLibraries:
         }
         assert numbers.echo(list(np.arange(4))) == [0, 1, 2, 3]
 
+    def test_numpy_bool(self, numbers):
+        """numpy's bool registers with no number class, so it says what it is
+        through its dtype."""
+        assert numbers.describe(np.bool_(True)) == "java.lang.Boolean true"
+        assert numbers.echo(np.bool_(False)) is False
+        assert numbers.echo([np.bool_(True), np.bool_(False)]) == [True, False]
+        assert numbers.echo(np.array(True)) is True
+
+    def test_an_array_of_bools_is_still_refused(self, numbers):
+        """`bool()` of an array with several elements is an error, not a value."""
+        with pytest.raises(TypeError, match="Unsupported argument type"):
+            numbers.describe(np.array([True, False]))
+
     def test_a_fraction_is_a_real_number(self, numbers):
         assert numbers.which(fractions.Fraction(1, 2)) == "double"
         assert numbers.echo(fractions.Fraction(1, 4)) == 0.25
@@ -548,8 +561,9 @@ class TestNumbersOfOtherLibraries:
         with client.batch() as b:
             b.call(items, "add", np.int64(7))
             b.call(items, "add", np.float32(0.5))
+            b.call(items, "add", np.bool_(True))
         items.add(np.int16(9))
-        assert list(items) == [7, 0.5, 9]
+        assert list(items) == [7, 0.5, True, 9]
 
     def test_a_complex_number_is_still_refused(self, numbers):
         with pytest.raises(TypeError, match="Unsupported argument type"):
@@ -767,6 +781,7 @@ class TestAsyncClient:
         assert await invoke("Numbers", "which", 2**70) == "BigInteger"
         assert await invoke("Numbers", "which", Decimal("1.5")) == "BigDecimal"
         assert await invoke("Numbers", "which", np.int64(5)) == "long"
+        assert await invoke("Numbers", "echo", np.bool_(True)) is True
         result = await invoke("Numbers", "decimal", "1.50")
         assert result.as_tuple() == Decimal("1.50").as_tuple()
         assert await invoke("Numbers", "several") == [2**70, Decimal("1.50"), 7]

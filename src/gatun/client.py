@@ -2448,6 +2448,11 @@ class _ValueEncoder:
                 return self._build_value(builder, int(value))
             if isinstance(value, numbers.Real):
                 return self._build_value(builder, float(value))
+            # numpy's bool registers with neither, so it is known by its dtype
+            # (a 0-d array of bools too); an array of several has no one value
+            dtype = getattr(value, "dtype", None)
+            if getattr(dtype, "kind", None) == "b" and getattr(value, "ndim", 1) == 0:
+                return self._build_value(builder, bool(value))
             raise TypeError(f"Unsupported argument type: {type(value)}")
 
     def _build_big_int(self, builder, value: int):
