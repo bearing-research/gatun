@@ -1093,17 +1093,17 @@ client = connect(extra_jvm_flags=["-Dgatun.limits.max_objects=500000"])
 
 | Property (`gatun.limits.`) | Default | Limits |
 |---|---|---|
-| `max_objects` | 100,000 | Java objects a session holds at once (handles not yet freed) |
-| `max_string_length` | 10 MB | One string, decimal or big integer sent from Python |
+| `max_objects` | 100,000 | Java objects a session holds at once (handles not yet freed). Making one past it is refused; objects that arrive inside a returned collection or as a callback's arguments are counted without being refused, so they can take a session past it, and calls that make an object then fail until handles are freed |
+| `max_string_length` | 10,485,760 | Characters (UTF-16 units) of one string or decimal sent from Python; bytes of one big integer |
 | `max_list_entries` | 100,000 | Entries of one list or map sent from Python |
 | `max_nesting_depth` | 100 | Lists and maps inside each other, sent from Python |
 | `max_batch_size` | 10,000 | Commands in one `batch()` |
 | `max_method_calls` / `max_create_objects` | 10,000 | Entries of one `invoke_methods` / `create_objects` |
-| `max_arrow_bytes` | 1 GB | Arrow memory the server holds for a session |
+| `max_arrow_bytes` | 1 GB | Arrow memory charged to a session: tables made by `arrow_to_java` until their handles are freed, and the payload arena since its last reset. The data of a lent table (`copy=False`) is not charged |
 | `max_sessions` | 0 (no limit) | Sessions the server serves at once |
-| `session_idle_timeout_ms` | 0 (none) | Idle time after which a session is closed, counted from the end of its last request on any of the client's channels |
+| `session_idle_timeout_ms` | 0 (none) | Time without activity after which a session is closed. Activity is a request ending on any of the client's channels, and an object or Arrow memory taken or released |
 
-The string, list and nesting limits apply to what Python sends: arguments, values set into fields, and what a callback answers with. `bytes` and arrays are not counted as strings or lists; like what Java returns, they are bounded by the memory size and the largest message a session may receive, and nothing else. A list of a million entries that a Java method builds comes back whole, and the same list passed back to Java is refused unless `max_list_entries` is raised.
+The string, list and nesting limits apply to what Python sends: arguments, values set into fields, and what a callback answers with. The length of `bytes` and of an array is not checked against them, though each element of a `String` or `Object` array is checked like any other argument. Values Java returns are not checked against them either; they are bounded by the memory size and the largest message a session may receive. A list of a million numbers that a Java method builds comes back whole, and the same list passed back to Java is refused unless `max_list_entries` is raised.
 
 ## Supported Types
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from gatun import JavaArray, JavaObject, aconnect, connect, java_import
+from gatun import JavaArray, JavaException, JavaObject, aconnect, connect, java_import
 
 
 class TestQuickStart:
@@ -547,6 +547,21 @@ class TestBigNumbersAndConverters:
             client.unregister_converter(Money)
             with pytest.raises(TypeError):
                 prices.add(Money("1", "EUR"))
+        finally:
+            client.close()
+
+
+class TestResourceLimits:
+    """Mirrors the README's "Resource Limits" section."""
+
+    def test_limits_are_set_per_server(self):
+        client = connect(extra_jvm_flags=["-Dgatun.limits.max_list_entries=1000"])
+        try:
+            # What Java returns is not checked, what Python sends is
+            big = client.jvm.java.util.Collections.nCopies(5000, 7)
+            assert len(big) == 5000
+            with pytest.raises(JavaException, match="Collection too large"):
+                client.jvm.java.util.ArrayList(big)
         finally:
             client.close()
 
