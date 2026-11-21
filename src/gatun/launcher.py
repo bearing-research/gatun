@@ -15,7 +15,7 @@ import weakref
 from pathlib import Path
 
 from gatun.client import COMMAND_ZONE_SIZE, RESPONSE_ZONE_SIZE
-from gatun.config import get_config
+from gatun.config import get_config, parse_switch
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +127,15 @@ def _checked_names(names: list[str], option: str) -> list[str]:
             elif bare.endswith("."):
                 bare = bare[:-1]
         if not _JAVA_NAME.fullmatch(bare):
+            hint = (
+                " To allow every class, pass allow_all=True."
+                if option == "allowed_prefixes" and bare in ("", "*")
+                else ""
+            )
             raise ValueError(
                 f"Invalid entry in {option}: {name!r}. Expected a dotted Java name "
                 "such as 'com.example.Thing' (a class) or 'com.example' (a package prefix)."
+                + hint
             )
         if name not in checked:
             checked.append(name)
@@ -405,6 +411,7 @@ def launch_gateway(
     extra_jvm_flags: list[str] | None = None,
     allowed_classes: list[str] | None = None,
     allowed_prefixes: list[str] | None = None,
+    allow_all: bool | None = None,
 ):
     """
     Launches the embedded Java server.
@@ -429,6 +436,12 @@ def launch_gateway(
                          call static members on, in addition to the built-in list.
         allowed_prefixes: Package prefixes (e.g. "com.example") whose classes, and
                           those of their subpackages, are allowed likewise.
+        allow_all: True lifts the class allowlist: every class can be used, and
+                   so can reflection objects, class loaders, `Runtime` and the
+                   other types that are otherwise restricted. `System.exit`,
+                   `System.load`, `System.loadLibrary` and `Class.newInstance`
+                   stay refused. False keeps the list whatever the environment
+                   or pyproject.toml say; None (the default) leaves it to them.
 
     The allow lists from the arguments, the environment and pyproject.toml are
     combined; everything else follows arguments > environment > pyproject.toml.
@@ -440,6 +453,7 @@ def launch_gateway(
         jvm_flags = ["-Xmx512m"]
         allowed_classes = ["java.util.concurrent.atomic.AtomicLong"]
         allowed_prefixes = ["com.example"]
+        allow_all = false
 
     Environment variables for observability:
         GATUN_TRACE=true     - Enable trace mode
@@ -503,6 +517,21 @@ def launch_gateway(
         jvm_flags.append(f"-Dgatun.allowlist.classes={','.join(all_classes)}")
     if all_prefixes:
         jvm_flags.append(f"-Dgatun.allowlist.prefixes={','.join(all_prefixes)}")
+
+    # Or no list at all. A flag the caller set directly counts like the
+    # environment: the argument, when given, decides.
+    if allow_all is not None and not isinstance(allow_all, bool):
+        raise TypeError(
+            f"allow_all must be True or False, got {type(allow_all).__name__}: "
+            f"{allow_all!r}"
+        )
+    lift_list = config.allow_all
+    for value in _take_property(jvm_flags, "gatun.allowlist.all"):
+        lift_list = parse_switch(value, "-Dgatun.allowlist.all")
+    if allow_all is not None:
+        lift_list = allow_all
+    if lift_list:
+        jvm_flags.append("-Dgatun.allowlist.all=true")
 
     # 3c. The process the server belongs to. The server runs in its own session
     # (see Popen below), so nothing else ends it when this process is killed

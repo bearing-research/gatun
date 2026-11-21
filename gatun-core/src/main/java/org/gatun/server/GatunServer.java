@@ -87,7 +87,8 @@ public class GatunServer {
           "Class not allowed: "
               + className
               + ". To allow it, pass allowed_classes or allowed_prefixes to connect(), or set"
-              + " the gatun.allowlist.classes / gatun.allowlist.prefixes system properties.");
+              + " the gatun.allowlist.classes / gatun.allowlist.prefixes system properties."
+              + " allow_all=True allows every class.");
     }
   }
 
@@ -381,7 +382,12 @@ public class GatunServer {
       Files.setPosixFilePermissions(socketPath, OWNER_ONLY);
       serverUser = Files.getOwner(socketPath);
       LOG.info("Server ready at: " + socketPath);
-      if (allowlist.hasAdditions()) {
+      if (allowlist.allowsEverything()) {
+        LOG.info(
+            "The class allowlist is off ("
+                + ClassAllowlist.ALL_PROPERTY
+                + "=true): every class can be used, reflection objects included");
+      } else if (allowlist.hasAdditions()) {
         LOG.info("Class allowlist additions: " + allowlist.describeAdditions());
       }
 

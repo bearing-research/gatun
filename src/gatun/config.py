@@ -9,6 +9,7 @@ Example pyproject.toml:
     jvm_flags = ["-Xmx512m"]
     allowed_classes = ["java.util.concurrent.atomic.AtomicLong"]
     allowed_prefixes = ["com.example"]
+    allow_all = false
 
 Configuration precedence (highest to lowest):
     1. Function arguments (e.g., connect(memory="32MB"))
@@ -18,7 +19,8 @@ Configuration precedence (highest to lowest):
 
 The allow lists are the exception: allowed_classes and allowed_prefixes from every
 source (arguments, GATUN_ALLOWED_CLASSES / GATUN_ALLOWED_PREFIXES, pyproject.toml)
-are combined and added to the server's built-in list.
+are combined and added to the server's built-in list. allow_all (GATUN_ALLOW_ALL),
+which lifts the list, follows the precedence above like any other setting.
 """
 
 import os
@@ -41,6 +43,8 @@ class GatunConfig:
     # Classes and package prefixes allowed in addition to the server's built-in list
     allowed_classes: list[str] = field(default_factory=list)
     allowed_prefixes: list[str] = field(default_factory=list)
+    # Allow every class, lifting that list
+    allow_all: bool = False
 
     # Timeouts
     connect_timeout: float = 5.0  # seconds
@@ -82,6 +86,20 @@ def find_pyproject_toml(start_path: Path | None = None) -> Path | None:
 def _split_names(value: str) -> list[str]:
     """Split a comma-separated list of names, dropping blanks."""
     return [name.strip() for name in value.split(",") if name.strip()]
+
+
+def parse_switch(value: str, source: str) -> bool:
+    """Read "true" or "false" (in any case) from an environment variable or a flag.
+
+    Anything else is an error: for a setting that opens the server up, "1" or
+    "yes" must not be quietly read as one or the other.
+    """
+    lowered = value.strip().lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    raise ValueError(f"Invalid value for {source}: {value!r}. Expected true or false.")
 
 
 def load_config(pyproject_path: Path | None = None) -> GatunConfig:
@@ -126,6 +144,15 @@ def load_config(pyproject_path: Path | None = None) -> GatunConfig:
                         f"strings, got {type(value).__name__}: {value!r}"
                     )
                 setattr(config, option, list(value))
+        if "allow_all" in gatun_config:
+            value = gatun_config["allow_all"]
+            # A string is true whatever it says
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"[tool.gatun] allow_all in {pyproject_path} must be true or "
+                    f"false, got {type(value).__name__}: {value!r}"
+                )
+            config.allow_all = value
 
     # 2. Override with environment variables
     if env_memory := os.environ.get("GATUN_MEMORY"):
@@ -142,6 +169,8 @@ def load_config(pyproject_path: Path | None = None) -> GatunConfig:
         config.allowed_classes += _split_names(env_classes)
     if env_prefixes := os.environ.get("GATUN_ALLOWED_PREFIXES"):
         config.allowed_prefixes += _split_names(env_prefixes)
+    if env_allow_all := os.environ.get("GATUN_ALLOW_ALL"):
+        config.allow_all = parse_switch(env_allow_all, "GATUN_ALLOW_ALL")
 
     # Reprocess paths after env override
     config.__post_init__()

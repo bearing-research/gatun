@@ -38,6 +38,7 @@ class GatunAdapter(BridgeAdapter):
         allowed_prefixes: list[str] | None = None,
         socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
         callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
+        allow_all: bool | None = None,
     ):
         """Create a new GatunAdapter.
 
@@ -48,6 +49,7 @@ class GatunAdapter(BridgeAdapter):
             allowed_prefixes: Package prefixes allowed beyond the built-in list
             socket_timeout: Seconds to wait for one call's response; None for no limit
             callback_timeout: Seconds a Python callback may run; None for no limit
+            allow_all: True lifts the class allowlist: every class can be used
         """
         # connect() launches the server and returns a connected client
         self._client: GatunClient | None = gatun_connect(
@@ -57,6 +59,7 @@ class GatunAdapter(BridgeAdapter):
             allowed_prefixes=allowed_prefixes,
             socket_timeout=socket_timeout,
             callback_timeout=callback_timeout,
+            allow_all=allow_all,
         )
 
     # === Object Lifecycle ===

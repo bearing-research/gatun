@@ -453,6 +453,16 @@ class TestAllowingYourOwnClasses:
         finally:
             client.close()
 
+    def test_allow_all(self):
+        client = connect(allow_all=True)
+        try:
+            AtomicLong = client.jvm.java.util.concurrent.atomic.AtomicLong
+            assert AtomicLong(41).incrementAndGet() == 42
+            runtime = client.jvm.java.lang.Runtime.getRuntime()
+            assert runtime.availableProcessors() >= 1
+        finally:
+            client.close()
+
 
 class TestBigNumbersAndConverters:
     """The 'Big Numbers' and 'Converters for Your Own Types' examples."""
