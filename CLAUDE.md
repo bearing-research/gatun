@@ -932,7 +932,7 @@ Nothing in this repo or in stock PySpark switches PySpark over to Gatun; there i
 Gatun uses specificity scoring to resolve overloaded Java methods:
 1. Exact type matches get highest priority
 2. Compatible types (e.g., `String` matching `CharSequence`) get medium priority
-3. `Object` parameters get lowest priority
+3. `Object` parameters get lowest priority, just below a supertype of the argument's wrapper: a Python `int`, `float` or `bool` matches a `Number`, `Comparable` or `Serializable` parameter as Java's boxing would, after every match that needs no boxing
 4. Non-varargs methods are preferred over varargs
 5. A Python `int` matches a `BigInteger` or `BigDecimal` parameter below all of the above
 6. A bridge method (the compiler's `compareTo(Object)` beside `compareTo(BigDecimal)`) is called only when nothing else matches: its `Object` parameter would outscore every conversion the real method needs

@@ -1,5 +1,8 @@
 """Choosing a Java method for Python arguments, and converting the arguments."""
 
+import os
+import subprocess
+
 import pytest
 
 from gatun import (
@@ -65,6 +68,81 @@ class TestPythonNumbers:
         assert first == 1
         # Long.equals(Integer) is false in Java: a mix made such lookups miss
         assert boxed.contains(TypeHint(1, "java.lang.Long")) is True
+
+
+_SUPERTYPES = """
+import java.io.Serializable;
+
+public class Supertypes {
+  public final String made;
+
+  public Supertypes(Number n) { made = describe(n); }
+
+  static String describe(Object o) { return o.getClass().getSimpleName() + ":" + o; }
+
+  public static String number(Number n) { return describe(n); }
+  public static String comparable(Comparable<?> c) { return describe(c); }
+  public static String serializable(Serializable s) { return describe(s); }
+  public static String numbers(Number... ns) { return String.valueOf(ns.length); }
+
+  public static String which(Number n) { return "Number"; }
+  public static String which(Object o) { return "Object"; }
+
+  public static String closer(long x) { return "long"; }
+  public static String closer(Number n) { return "Number"; }
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def supertypes(tmp_path_factory):
+    out = tmp_path_factory.mktemp("supertypes")
+    source = out / "Supertypes.java"
+    source.write_text(_SUPERTYPES)
+    java_home = os.environ.get("JAVA_HOME")
+    javac = os.path.join(java_home, "bin", "javac") if java_home else "javac"
+    subprocess.run([javac, "--release", "22", "-d", str(out), str(source)], check=True)
+    client = connect(
+        memory="16MB", classpath=[str(out)], allowed_classes=["Supertypes"]
+    )
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+class TestBoxingToASupertype:
+    """Java boxes a primitive and then widens the box: an int reaches a `Number`,
+    `Comparable` or `Serializable` parameter as an Integer."""
+
+    def test_number_parameter(self, supertypes):
+        Supertypes = supertypes.jvm.Supertypes
+        assert Supertypes.number(5) == "Integer:5"
+        assert Supertypes.number(2**40) == "Long:1099511627776"
+        assert Supertypes.number(2.5) == "Double:2.5"
+
+    def test_interface_parameters(self, supertypes):
+        Supertypes = supertypes.jvm.Supertypes
+        assert Supertypes.comparable(5) == "Integer:5"
+        assert Supertypes.comparable(True) == "Boolean:true"
+        assert Supertypes.serializable(2.5) == "Double:2.5"
+
+    def test_constructor_and_varargs(self, supertypes):
+        made = supertypes.jvm.Supertypes(7)
+        assert supertypes.get_field(made, "made") == "Integer:7"
+        assert supertypes.jvm.Supertypes.numbers(1, 2.5, 3) == "3"
+
+    def test_in_a_batch(self, supertypes):
+        with supertypes.batch() as b:
+            result = b.call_static("Supertypes", "number", 5)
+        assert result.get() == "Integer:5"
+
+    def test_the_box_is_preferred_to_object(self, supertypes):
+        assert supertypes.jvm.Supertypes.which(5) == "Number"
+
+    def test_a_primitive_parameter_is_preferred_to_the_box(self, supertypes):
+        """Java tries widening before boxing: `closer(long)` is chosen for an int."""
+        assert supertypes.jvm.Supertypes.closer(5) == "long"
 
 
 class TestTypeHints:

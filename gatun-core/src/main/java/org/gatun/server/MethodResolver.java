@@ -636,6 +636,8 @@ public final class MethodResolver {
     // Object accepts anything (primitives auto-box at runtime)
     if (paramType == Object.class) return true;
 
+    if (isBoxedToSupertype(paramType, argType)) return true;
+
     if (isPythonNarrowing(paramType, argType)) return true;
     if (isPythonBigNumber(paramType, argType)) return true;
 
@@ -644,6 +646,20 @@ public final class MethodResolver {
     if (argType == Object.class && !paramType.isPrimitive()) return true;
 
     return false;
+  }
+
+  /**
+   * Boxing followed by widening reference conversion (JLS 5.3): an {@code int} for a {@code
+   * Number}, {@code Comparable} or {@code Serializable} parameter, as an {@code Integer}. Python
+   * numbers and booleans arrive with primitive types, so without this they matched no supertype of
+   * their wrapper but {@code Object}.
+   */
+  private static boolean isBoxedToSupertype(Class<?> paramType, Class<?> argType) {
+    if (!argType.isPrimitive() || paramType.isPrimitive()) {
+      return false;
+    }
+    Class<?> wrapper = PRIMITIVE_TO_WRAPPER.get(argType);
+    return wrapper != null && paramType.isAssignableFrom(wrapper);
   }
 
   /**
@@ -786,6 +802,12 @@ public final class MethodResolver {
     // Object parameter accepts primitives (auto-boxing at runtime)
     if (paramType == Object.class && argType.isPrimitive()) {
       return 10; // Same as Object accepting reference types
+    }
+
+    // A primitive boxed and the box widened (int -> Number): more specific than Object,
+    // and below every match that needs no boxing, as in Java
+    if (isBoxedToSupertype(paramType, argType)) {
+      return paramType.isInterface() ? 15 : 20;
     }
 
     // Object.class arg (null or untyped) to reference type

@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `reset_payload_arena()` gives back the Arrow bytes of the calling thread's connection, and a connection that closes gives back its own
 
 ### Fixed
+- A Python `int`, `float` or `bool` reaches a parameter typed as a supertype of its wrapper, as Java's boxing does: `f(Number)`, `f(Comparable)`, `f(Serializable)` called with `5` gets an `Integer`. They matched nothing but `Object`, so such a call raised `NoSuchMethodException`, and beside an `f(Object)` overload that one was chosen. A method that takes the value without boxing (`f(long)`) is still preferred
 - `gatun.limits.max_objects` could be exceeded when a session created objects on several threads at once (callbacks from Java threads, and now the threads of a client): the check and the count were two steps
 - A command length of zero, or one that is negative as Java reads it, ends the session after its error. The server answered and went on reading, so the next four bytes on the socket were taken for a length, and bytes that passed for the size of the command still in shared memory ran that command a second time. The clients never send such a length
 - The request log kept the whole error text of a session's last 64 failed requests; it keeps the 100 characters a log line shows
