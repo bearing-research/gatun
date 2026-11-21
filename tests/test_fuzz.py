@@ -152,7 +152,12 @@ class TestMalformedCommandHandling:
         size = struct.unpack("<I", client.sock.recv(4))[0]
         client.shm.seek(client.response_offset)
         assert b"Invalid command size" in client.shm.read(size)
-        assert client.sock.recv(4) == b""
+        # The end of the stream. Linux reports it as a reset, because the
+        # server closed with the four bytes unread.
+        try:
+            assert client.sock.recv(4) == b""
+        except ConnectionResetError:
+            pass
         items.detach()
 
         other = make_client()
