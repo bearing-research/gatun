@@ -65,6 +65,10 @@ class TestObjectCountLimit:
             with client.batch() as b:
                 failed = [b.create("java.util.ArrayList", -1) for _ in range(5)]
             assert all(result.is_error for result in failed)
+            # A failed result holds the exception that was thrown, which is an
+            # object of the session for as long as the result is kept, and the
+            # batch keeps its results
+            del failed, b
             with pytest.raises(JavaException):
                 client.create_objects([("java.util.ArrayList", (-1,))] * 3)
 

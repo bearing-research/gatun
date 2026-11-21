@@ -385,6 +385,11 @@ table Response {
   // On the callback connection, with callback_id and nothing else: the callback's proxy was
   // garbage collected, so Java will not call it again and the client may drop its function
   callback_released: bool;
+
+  // If is_error is true: the ID of the exception that was thrown, registered for the session like
+  // a returned object. 0 when there is none (an error the server made up without an exception, or
+  // a session at its object limit).
+  error_object: long;
 }
 
 // Batch of responses (one per command in BatchCommand)

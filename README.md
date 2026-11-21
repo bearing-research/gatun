@@ -1132,6 +1132,23 @@ except JavaNumberFormatException as e:
 
 `JavaNoSuchFieldException` and `JavaRuntimeException` are mapped the same way, a Java `InterruptedException` arrives as `CancelledException` (see [Cancelling a Request](#cancelling-a-request)), and any other Java exception as the base `JavaException`.
 
+A `JavaException` has `java_class`, `message` and `stack_trace` (which is also its `str()`), and `java_exception`: the exception that was thrown, as a Java object.
+
+```python
+try:
+    client.jvm.java.lang.Integer.parseInt("not_a_number")
+except JavaException as e:
+    thrown = e.java_exception
+    thrown.getMessage()                        # 'For input string: "not_a_number"'
+    thrown.getCause()                          # None here; a JavaObject when there is one
+    thrown.getStackTrace()[0].getMethodName()  # 'forInputString'
+    client.is_instance_of(thrown, "java.lang.IllegalArgumentException")  # True
+```
+
+- Methods of the exception's own class work as well (`thrown.getErrorCode()` on an `SQLException`), and it can be passed back to Java like any object.
+- It is an object of the session and is released when the Python exception is collected. To use it for longer, keep the exception or the object.
+- It is there for single calls, each failed result of a batch, the vectorized calls, both clients, and calls made inside a callback. It is `None` for an exception that was not thrown in Java (`JavaException(...)` made in Python), and when the session is at `gatun.limits.max_objects`: the error then arrives without it.
+
 ## Architecture
 
 Gatun uses a client-server architecture with shared memory for high-performance IPC:

@@ -49,7 +49,7 @@ On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which
 
 ### Protocol Handshake
 Format: `[4 bytes: version][4 bytes: arena_epoch][8 bytes: memory size][2 bytes: shm_path_len][N bytes: shm_path]`
-- Protocol version (currently 6) is verified on connect
+- Protocol version (currently 7) is verified on connect
 - Version mismatch raises RuntimeError with upgrade instructions
 - SHM path is the per-client shared memory file path (e.g., `/tmp/gatun.sock.1.shm`)
 
@@ -671,6 +671,13 @@ Java exceptions are mapped to Python exceptions:
 - `java.lang.InterruptedException` -> `CancelledException`
 - `java.lang.RuntimeException` -> `JavaRuntimeException`
 - Anything else -> the base `JavaException`
+
+A `JavaException` carries the thrown exception as a Java object, `java_exception` (Py4J's name):
+- The server registers the `Throwable` for the session when it packs the error (`GatunServer.packThrown`, `Response.error_object`), at all three places a command's failure is packed: `handleClient`, a batch's sub-command (`runBatch`) and a nested command on the callback connection (`runNested`). Errors the server writes without an exception (a response that is too large, `CALL_ENDED`) have none.
+- It is an ordinary object of the session: counted against `max_objects`, released by the wrapper's finalizer when the Python exception is collected, and its ID goes into the list of what the response registered (`packedIds`, `registered`), so that a response that is never delivered takes it along. A late response nobody reads releases it too (`_release_unread_response`).
+- A session at its object limit gets the error without the object (`java_exception` is None): the failure being reported must not become a complaint about the limit.
+- The exception must die with its last reference, not with the garbage collector: `_raise_java_exception_impl` raises without binding the exception to a local, which would tie it into a cycle with its own traceback. `tests/test_exception_object.py` raises 10,000 with the collector off and 50 objects allowed. A batch's errors are kept by the `BatchContext` and go with it.
+- `CancelledException` and `PayloadTooLargeError` have no place for it; the wrapper is dropped, which releases the object.
 
 Python-side exceptions:
 - `ReentrancyError` - Raised when attempting nested Java calls from within a callback
