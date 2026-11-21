@@ -16,6 +16,7 @@ High-performance Python-to-Java bridge using shared memory and Unix domain socke
 - **Sync & Async Clients**: Both blocking and asyncio support
 - **Python Callbacks**: Register Python functions as Java interfaces
 - **Request Cancellation**: Cancel long-running operations
+- **Threads**: The threads of a client call Java at the same time, each on a JVM thread of its own, on the same objects
 - **JVM View API**: Pythonic package-style navigation (`client.jvm.java.util.ArrayList`)
 - **Spark from Python**: Load Spark's JARs and drive its JVM classes directly; a `BridgeAdapter` interface for porting PySpark
 - **Pythonic JavaObjects**: Iteration, indexing, and len() support on Java collections
@@ -341,18 +342,18 @@ asyncio.run(main())
 
 Java can call a callback from any thread and at any time, including when the client is doing nothing: a listener, a timer, an executor's worker, a parallel stream. How the call reaches Python depends on the thread that makes it:
 
-- **The thread running your request** (a comparator passed to `Collections.sort`) calls back on the request's own channel. Such a callback cannot call Java (`ReentrancyError`), and neither can a task it awaits: the request is waiting for it on the only channel the call could use. In the sync client, do not make it wait for another *thread* that calls Java on the same client either: that thread waits for the request to finish, and the request is waiting for the callback. The callback timeout ends the wait with `CallbackTimeoutError`; with `callback_timeout=None` nothing does. Work queued by a callback and run after the request is fine.
+- **The thread running your request** (a comparator passed to `Collections.sort`) calls back on the request's own channel. Such a callback cannot call Java (`ReentrancyError`), and neither can a task it awaits: the request is waiting for it on the only channel the call could use. Work queued by a callback and run after the request is fine. So is, in the sync client, work the callback hands to another *thread*: a thread has a connection of its own ([Threads](#threads)), and its calls run while the request waits for the callback.
 - **Any other thread** calls on a second connection, which the client opens with its first `register_callback`. Each of these calls runs on a thread of its own (a task of its own in the async client), so several run at the same time, alongside your own code; what they touch has to be safe for that. These callbacks can call Java: create objects, call methods, read and write fields, use the objects they were passed. Their calls travel on the same connection and are run by the Java thread that is waiting for the callback, so they do not wait for the client's own channel, which may be busy with a long request (a stream's `awaitTermination()`) or with the very request that is waiting for the callback (`executor.submit(callback).get()`).
 
   They can also move Arrow tables with `arrow_to_java` and `arrow_from_java` (a `foreachBatch` function that fetches its batch, for example). The client's shared memory belongs to its own channel, so each such call gets shared memory of its own, as large as the client's, when it first moves a table; the limit on one table is the same `memory` setting. A table read in place there (`copy=False`) is good until the callback's next transfer.
 
-  `batch()`, the vectorized calls (`invoke_methods`, `create_objects`, `get_fields`), `register_callback` and `get_metrics` work there too. What such a callback cannot do is whatever goes through the client's own shared memory: the other Arrow transfers (`send_arrow_table`, `send_arrow_buffers`, `get_arrow_data`, `arrow_context`) raise `ReentrancyError`. A command or a result may be as large there as anywhere else (see [Large Values](#large-values)). In the sync client a plain thread the callback starts does not inherit the route; its calls take their turn on the client's channel, as do those of a callback Java has stopped waiting for because it timed out.
+  `batch()`, the vectorized calls (`invoke_methods`, `create_objects`, `get_fields`), `register_callback` and `get_metrics` work there too. What such a callback cannot do is whatever goes through the client's own shared memory: the other Arrow transfers (`send_arrow_table`, `send_arrow_buffers`, `get_arrow_data`, `arrow_context`) raise `ReentrancyError`. A command or a result may be as large there as anywhere else (see [Large Values](#large-values)). In the sync client a plain thread the callback starts does not inherit the route; its calls travel on a connection of its own, like any thread's ([Threads](#threads)), as do those of a callback Java has stopped waiting for because it timed out.
 
 A callback stays registered, and its function alive, for as long as it can still be called: until `unregister_callback`, the end of the session, or the moment nothing holds the proxy any more. That last one means the object `register_callback` returned has been garbage collected in Python and Java code has let go of the proxy too; the JVM's garbage collector then reports it and the client drops the function, some time later. So keep the returned object for as long as the callback should work when the Java code you give it to holds it only weakly (a registry of weak listeners). A proxy called after that throws `IllegalStateException` in the calling Java thread.
 
 ### Cancelling a Request
 
-`client.cancel()` interrupts the request that is running on the client, from another thread:
+`client.cancel()` interrupts the requests that are running on the client, from another thread:
 
 ```python
 import threading
@@ -371,9 +372,40 @@ client.ping()  # the client is still usable
 
 It works by interrupting the Java thread, so it stops code that responds to interruption (blocking calls, `GatunServer.checkCancelled()`), and returns `False` when nothing was running. A request that never checks for interruption runs to its end. `cancel()` makes a short connection of its own, so on a server with `gatun.limits.max_sessions` set it needs a free slot.
 
+When several threads of the client are inside a request, `cancel()` interrupts them all and `cancel(thread)` the request of that one thread.
+
 ### Threads
 
-A `GatunClient` can be shared between threads. Requests are serialized: one runs at a time, and the others wait. For parallel work, give each thread its own client (`GatunClient(client.socket_path)` connects another session to the same server).
+A `GatunClient` can be shared between threads, and the threads do not wait for each other. Each thread that calls Java gets a connection of its own to the client's session, with its first call, and a JVM thread of its own that runs every call it makes:
+
+```python
+import threading
+from gatun import connect
+
+client = connect(allowed_classes=["java.lang.Thread"])
+items = client.jvm.java.util.ArrayList()
+
+def slow():
+    client.jvm.java.lang.Thread.sleep(1500)
+
+worker = threading.Thread(target=slow)
+worker.start()
+
+items.add("x")        # returns at once; the other thread is still asleep in Java
+items.size()          # 1
+
+worker.join()
+```
+
+- **Objects belong to the client, not to a thread.** An object made on one thread can be used, passed and released on any other, and the resource limits count what all threads hold together.
+- **One Python thread, one JVM thread**, for the life of the Python thread. Java code that keeps state in a `ThreadLocal` (a Spark session's active session, a transaction, a logging context) finds it again on the next call from the same Python thread, and never sees another thread's. This holds for a thread pool's workers too.
+- **When a Python thread ends, its JVM thread and its connection go with it.** The thread that called `connect()` is the exception: its connection is the session and stays until `close()`.
+- **Callbacks** work from every thread. A callback made by the thread that runs a request runs during that request, whichever thread registered it.
+- **Arrow** transfers of two threads do not disturb each other: each connection has shared memory of its own. A table view (`copy=False`) can be read from any thread and ends with the next transfer of the thread that made it, or with that thread. A lent table (`arrow_to_java(table, copy=False)`) can be used and ended from any thread, and ends at the latest with the thread that lent it. A payload arena belongs to the thread that asked for it.
+- **A timeout or an interrupted call** on a thread other than the one that connected costs that thread its connection, not the client: its next call opens a new one, on a new JVM thread. On the thread that connected it ends the client, as before.
+- `close()` closes every thread's connection. A thread that is inside a call gets `DeadConnectionError`.
+
+The async client has one connection. Calls awaited together (`asyncio.gather`) run one after the other on one JVM thread, as before.
 
 ### Type Checking with is_instance_of
 
@@ -1226,6 +1258,8 @@ Gatun uses a client-server architecture with shared memory for high-performance 
 5. Python reads response from shared memory
 
 A command or a response larger than its 64 KB zone is not written to shared memory: its bytes follow the length on the socket ([Large Values](#large-values)).
+
+Each thread of a client that calls Java has such a connection of its own, with its own shared memory and its own thread on the server ([Threads](#threads)). They share the session: the objects, the limits and the callbacks.
 
 ### Memory Layout
 

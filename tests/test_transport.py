@@ -6,7 +6,7 @@ import time
 import pytest
 
 import gatun.client as client_module
-from gatun import JavaException, PayloadTooLargeError, connect
+from gatun import PayloadTooLargeError, connect
 from gatun.client import DeadConnectionError, GatunClient, SocketTimeoutError
 
 
@@ -125,11 +125,12 @@ class TestThreads:
 
 
 class TestCallbackThatWaitsForAnotherThread:
-    def test_helper_thread_runs_once_the_callback_times_out(self, java_gateway):
-        """A callback that waits for a thread calling Java waits for itself: the
-        helper needs the channel, which the callback's own request holds. The
-        callback timeout is what ends it."""
-        client = GatunClient(str(java_gateway.socket_path), callback_timeout=1.0)
+    def test_helper_thread_calls_java_while_the_request_waits(self, java_gateway):
+        """A callback may wait for a thread that calls Java: the thread has a
+        channel of its own and does not need the one the callback's request
+        holds. (With one channel for all threads the callback waited for
+        itself, until the callback timeout.)"""
+        client = GatunClient(str(java_gateway.socket_path), callback_timeout=5.0)
         assert client.connect()
         try:
             outcome: list = []
@@ -151,13 +152,12 @@ class TestCallbackThatWaitsForAnotherThread:
             items.add(2)
             items.add(1)
 
-            with pytest.raises(JavaException, match="CallbackTimeoutError"):
-                client.jvm.java.util.Collections.sort(items, comparator)
+            client.jvm.java.util.Collections.sort(items, comparator)
 
-            deadline = time.monotonic() + 10
-            while not outcome and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert outcome == [True]
+            # Each comparison started a helper, and each had its answer before
+            # the callback returned
+            assert outcome
+            assert set(outcome) == {True}
         finally:
             client.close()
 

@@ -578,6 +578,37 @@ class TestCancellingARequest:
             client.close()
 
 
+class TestThreads:
+    """Test examples from Threads section."""
+
+    def test_threads_do_not_wait_for_each_other(self):
+        import threading
+        import time
+
+        from gatun import connect
+
+        client = connect(allowed_classes=["java.lang.Thread"])
+        try:
+            items = client.jvm.java.util.ArrayList()
+
+            def slow():
+                client.jvm.java.lang.Thread.sleep(1500)
+
+            worker = threading.Thread(target=slow)
+            worker.start()
+            time.sleep(0.5)  # the worker is asleep in Java by now
+
+            started = time.perf_counter()
+            items.add("x")
+            assert items.size() == 1
+            assert time.perf_counter() - started < 0.8
+            assert worker.is_alive()
+
+            worker.join()
+        finally:
+            client.close()
+
+
 class TestArrowTablesAsJavaObjects:
     """Test the 'Arrow Tables as Java Objects' example."""
 

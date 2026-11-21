@@ -577,12 +577,18 @@ class GatunSession:
                 _terminate(process)
                 self._finish_draining(process)
         finally:
-            # Clean up the socket and the per-session files: shared memory
-            # (<socket>.<session id>.shm) and the socket a callback connection
-            # is made to (<socket>.<session id>.cb). The server removes them
-            # itself on a clean shutdown; this covers a server that was killed.
+            # Clean up the socket and the files beside it: each channel's
+            # shared memory (<socket>.<id>.shm), the socket a callback
+            # connection is made to (<socket>.<session id>.cb) and the one a
+            # client's further threads join on (<socket>.join). The server
+            # removes them itself on a clean shutdown; this covers a server
+            # that was killed.
             base = glob.escape(self.socket_path)
-            for path in (*glob.glob(f"{base}.*.shm"), *glob.glob(f"{base}.*.cb")):
+            for path in (
+                *glob.glob(f"{base}.*.shm"),
+                *glob.glob(f"{base}.*.cb"),
+                f"{self.socket_path}.join",
+            ):
                 try:
                     os.unlink(path)
                 except OSError:
