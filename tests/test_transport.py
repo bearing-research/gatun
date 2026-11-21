@@ -162,6 +162,24 @@ class TestCallbackThatWaitsForAnotherThread:
             client.close()
 
 
+class TestBeforeConnect:
+    def test_a_client_that_never_connected_says_so(self, java_gateway):
+        """Not that its command is too large for a memory of zero bytes."""
+        client = GatunClient(str(java_gateway.socket_path) + ".nobody")
+        assert client.connect() is False
+
+        with pytest.raises(DeadConnectionError, match="not connected"):
+            client.ping()
+        with pytest.raises(DeadConnectionError, match="not connected"):
+            client.create_object("java.util.ArrayList", 10)
+        with (
+            pytest.raises(DeadConnectionError, match="not connected"),
+            client.batch() as b,
+        ):
+            b.call_static("java.lang.Math", "abs", -1)
+        client.close()
+
+
 class TestInterruptedExchange:
     def test_interrupt_while_waiting_marks_the_client_dead(
         self, make_client, monkeypatch

@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A callback's result or arguments, and a frame on the callback connection, may be as large as a command: the 64 KB limits there are gone
 
 ### Fixed
+- A command length of zero, or one that is negative as Java reads it, ends the session after its error. The server answered and went on reading, so the next four bytes on the socket were taken for a length, and bytes that passed for the size of the command still in shared memory ran that command a second time. The clients never send such a length
+- The request log kept the whole error text of a session's last 64 failed requests; it keeps the 100 characters a log line shows
 - README and `docs/benchmarks.md` said a plain instance call is 1.3 times faster through Gatun than through Py4J. Plain instance calls and object creation cost about the same: a second machine had Py4J level or ahead on them. The claims for static calls, `is_instance_of`, collections as arguments and bulk data stand
 - The same two documents gave Py4J's 40 ms for returning a value of 8 KB or more without its cause. It is Nagle's algorithm with a delayed acknowledgement: Py4J's server does not set `TCP_NODELAY`. They now say so, and give the comparison with the option set as well, where Gatun is about 3 times faster and not 640 times
 - The 0.3.0 notes said a single call through Gatun takes about twice as long as one through Py4J. That was measured before single calls were packed by hand, and stood beside the entry that says the opposite

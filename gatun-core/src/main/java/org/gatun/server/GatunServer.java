@@ -718,7 +718,7 @@ public class GatunServer {
     if (notice.action() != Action.FreeObject) {
       throw new IllegalArgumentException("Unexpected action " + notice.action());
     }
-    checkArgumentCount(notice.argsLength());
+    checkArgumentCount(notice.argsLength(), notice.getByteBuffer());
     // For the session ID in what the registry logs; this is the connection's reader thread
     sessionContext.set(ctx);
     try {
@@ -904,6 +904,12 @@ public class GatunServer {
         // session closes; the reaper may not have got to this session yet
         if (quota.isTimedOut()) {
           LOG.warning("Session " + sessionId + " timed out due to inactivity");
+          // The client is still sending a command that follows its length, and would get a
+          // broken pipe in place of the reason
+          int announced = lengthBuf.getInt(0);
+          if (announced > PAYLOAD_OFFSET && announced <= maxMessageSize) {
+            skip(client, announced);
+          }
           writeErrorResponse(
               client,
               sharedMem,
@@ -930,12 +936,10 @@ public class GatunServer {
               sharedMem,
               "Invalid command size: " + commandSize + " bytes (max: " + maxMessageSize + ")",
               "java.lang.IllegalArgumentException");
-          if (commandSize > PAYLOAD_OFFSET) {
-            // Its bytes are on the socket, or it is no length at all: either way what comes
-            // next is not a length. The client refuses such a command before it sends one.
-            break;
-          }
-          continue;
+          // Its bytes are on the socket, or it is no length at all: either way what comes next
+          // is not a length, and taking it for one could run the bytes still in the command
+          // zone, the command before, a second time. The clients send no such length.
+          break;
         }
 
         ByteBuffer cmdBuf;
@@ -1013,7 +1017,7 @@ public class GatunServer {
 
         control.beginRequest();
         try {
-          checkArgumentCount(cmd.argsLength());
+          checkArgumentCount(cmd.argsLength(), cmd.getByteBuffer());
           if (cmd.action() == Action.FreeObject || cmd.freeIdsLength() > 0) {
             awaitAnswersBefore(cmd);
           }
@@ -1636,16 +1640,67 @@ public class GatunServer {
       }
       return;
     }
-    ByteBuffer[] parts = {length, message};
-    while (message.hasRemaining()) {
-      client.write(parts);
+    while (length.hasRemaining()) {
+      client.write(length);
     }
+    writeSliced(client, message);
+  }
+
+  /**
+   * The most that one read or write hands the JDK from a heap buffer. The JDK copies a heap buffer
+   * through a direct one as large as what remains of it, and keeps that buffer for the thread: a
+   * session that moved one message of 500 MB whole would hold 500 MB of direct memory until it
+   * ends.
+   */
+  static final int IO_SLICE = 1 << 20;
+
+  /** Write all of a buffer, however large, {@link #IO_SLICE} at a time. */
+  static void writeSliced(SocketChannel channel, ByteBuffer message) throws IOException {
+    int end = message.limit();
+    try {
+      while (message.position() < end) {
+        message.limit(Math.min(end, message.position() + IO_SLICE));
+        channel.write(message);
+      }
+    } finally {
+      message.limit(end);
+    }
+  }
+
+  /** Fill a buffer, however large, {@link #IO_SLICE} at a time. False at the end of the stream. */
+  static boolean readSliced(SocketChannel channel, ByteBuffer buffer) throws IOException {
+    int end = buffer.limit();
+    try {
+      while (buffer.position() < end) {
+        buffer.limit(Math.min(end, buffer.position() + IO_SLICE));
+        if (channel.read(buffer) == -1) {
+          return false;
+        }
+      }
+      return true;
+    } finally {
+      buffer.limit(end);
+    }
+  }
+
+  /** Read and drop the next {@code count} bytes. False at the end of the stream. */
+  private static boolean skip(SocketChannel channel, long count) throws IOException {
+    ByteBuffer scratch = ByteBuffer.allocate((int) Math.min(count, PAYLOAD_OFFSET));
+    while (count > 0) {
+      scratch.clear().limit((int) Math.min(count, scratch.capacity()));
+      int read = channel.read(scratch);
+      if (read == -1) {
+        return false;
+      }
+      count -= read;
+    }
+    return true;
   }
 
   /** Read a command that was too large for the command zone, and so follows its length. */
   private static ByteBuffer readMessage(SocketChannel client, int size) throws IOException {
     ByteBuffer message = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN);
-    if (!readFully(client, message)) {
+    if (!readSliced(client, message)) {
       throw new IOException("Connection closed in the middle of a command of " + size + " bytes");
     }
     message.flip();
@@ -1653,15 +1708,16 @@ public class GatunServer {
   }
 
   // No vector in a command has more elements than the command has bytes. The counts are read
-  // from the command itself, and a forged one would otherwise size an allocation.
-  private void checkArgumentCount(int count) {
-    if (count < 0 || count > maxMessageSize) {
+  // from the command itself, and a forged one would otherwise size an allocation: so the bound
+  // is the size of the command the count came in, not the largest a command may be.
+  private static void checkArgumentCount(int count, ByteBuffer command) {
+    if (count < 0 || count > command.limit()) {
       throw new IllegalArgumentException("Argument count " + count + " is not possible");
     }
   }
 
-  private int arrayLength(int length) {
-    if (length < 0 || length > maxMessageSize) {
+  private static int arrayLength(int length, ByteBuffer command) {
+    if (length < 0 || length > command.limit()) {
       throw new IllegalArgumentException("Array length " + length + " is not possible");
     }
     return length;
@@ -1890,7 +1946,7 @@ public class GatunServer {
       throw new IllegalArgumentException("Cancel action cannot be used in batch");
     }
 
-    checkArgumentCount(cmd.argsLength());
+    checkArgumentCount(cmd.argsLength(), cmd.getByteBuffer());
     Object result = null;
 
     if (cmd.action() == Action.CreateObject) {
@@ -2441,21 +2497,21 @@ public class GatunServer {
     byte elemType = av.elementType();
 
     if (elemType == ElementType.Int) {
-      int len = arrayLength(av.intValuesLength());
+      int len = arrayLength(av.intValuesLength(), av.getByteBuffer());
       int[] arr = new int[len];
       for (int i = 0; i < len; i++) {
         arr[i] = av.intValues(i);
       }
       return arr;
     } else if (elemType == ElementType.Long) {
-      int len = arrayLength(av.longValuesLength());
+      int len = arrayLength(av.longValuesLength(), av.getByteBuffer());
       long[] arr = new long[len];
       for (int i = 0; i < len; i++) {
         arr[i] = av.longValues(i);
       }
       return arr;
     } else if (elemType == ElementType.Double) {
-      int len = arrayLength(av.doubleValuesLength());
+      int len = arrayLength(av.doubleValuesLength(), av.getByteBuffer());
       double[] arr = new double[len];
       for (int i = 0; i < len; i++) {
         arr[i] = av.doubleValues(i);
@@ -2463,21 +2519,21 @@ public class GatunServer {
       return arr;
     } else if (elemType == ElementType.Float) {
       // Float was widened to double, narrow back
-      int len = arrayLength(av.doubleValuesLength());
+      int len = arrayLength(av.doubleValuesLength(), av.getByteBuffer());
       float[] arr = new float[len];
       for (int i = 0; i < len; i++) {
         arr[i] = (float) av.doubleValues(i);
       }
       return arr;
     } else if (elemType == ElementType.Bool) {
-      int len = arrayLength(av.boolValuesLength());
+      int len = arrayLength(av.boolValuesLength(), av.getByteBuffer());
       boolean[] arr = new boolean[len];
       for (int i = 0; i < len; i++) {
         arr[i] = av.boolValues(i);
       }
       return arr;
     } else if (elemType == ElementType.Byte) {
-      int len = arrayLength(av.byteValuesLength());
+      int len = arrayLength(av.byteValuesLength(), av.getByteBuffer());
       byte[] arr = new byte[len];
       for (int i = 0; i < len; i++) {
         arr[i] = (byte) av.byteValues(i);
@@ -2485,7 +2541,7 @@ public class GatunServer {
       return arr;
     } else if (elemType == ElementType.Short) {
       // Short was widened to int, narrow back
-      int len = arrayLength(av.intValuesLength());
+      int len = arrayLength(av.intValuesLength(), av.getByteBuffer());
       short[] arr = new short[len];
       for (int i = 0; i < len; i++) {
         arr[i] = (short) av.intValues(i);
@@ -2493,7 +2549,7 @@ public class GatunServer {
       return arr;
     } else if (elemType == ElementType.Char) {
       // Char was widened to int, narrow back
-      int len = arrayLength(av.intValuesLength());
+      int len = arrayLength(av.intValuesLength(), av.getByteBuffer());
       char[] arr = new char[len];
       for (int i = 0; i < len; i++) {
         arr[i] = (char) av.intValues(i);
@@ -2501,7 +2557,7 @@ public class GatunServer {
       return arr;
     } else if (elemType == ElementType.String) {
       // String array stored as object_values
-      int len = arrayLength(av.objectValuesLength());
+      int len = arrayLength(av.objectValuesLength(), av.getByteBuffer());
       String[] arr = new String[len];
       for (int i = 0; i < len; i++) {
         Argument item = av.objectValues(i);
@@ -2511,7 +2567,7 @@ public class GatunServer {
       return arr;
     } else {
       // Object array
-      int len = arrayLength(av.objectValuesLength());
+      int len = arrayLength(av.objectValuesLength(), av.getByteBuffer());
       Object[] arr = new Object[len];
       for (int i = 0; i < len; i++) {
         Argument item = av.objectValues(i);

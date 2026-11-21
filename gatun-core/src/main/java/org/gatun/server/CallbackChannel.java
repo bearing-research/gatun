@@ -216,7 +216,7 @@ final class CallbackChannel {
         throw new IOException("Invalid callback frame size: " + size);
       }
       ByteBuffer frame = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN);
-      if (!readFully(frame)) {
+      if (!GatunServer.readSliced(socket, frame)) {
         return;
       }
       frame.flip();
@@ -272,9 +272,7 @@ final class CallbackChannel {
         while (lengthBuf.hasRemaining()) {
           socket.write(lengthBuf);
         }
-        while (frame.hasRemaining()) {
-          socket.write(frame);
-        }
+        GatunServer.writeSliced(socket, frame);
       }
     } catch (InterruptedException e) {
       // run() is done with the connection

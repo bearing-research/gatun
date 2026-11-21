@@ -318,19 +318,33 @@ class TestTheBorder:
             def __getattr__(self, name):
                 return getattr(real, name)
 
+        # Looked up first: on a new client the lookup is a request of its own
+        length = client.jvm.Large.length
         client.sock = Recording()
         try:
-            assert client.jvm.Large.length("abc") == 3
-            assert client.jvm.Large.length("x" * 60_000) == 60_000
+            assert length("abc") == 3
+            assert length("x" * 60_000) == 60_000
             assert sent == [4, 4]
-            assert client.jvm.Large.length("x" * 70_000) == 70_000
+            assert length("x" * 70_000) == 70_000
             assert sent[2] == 4 and sent[3] > 70_000
         finally:
             client.sock = real
 
     def test_a_large_builder_is_not_kept(self, client):
+        """Not until the thread's next command of that kind either: its later
+        calls may all be packed by hand, which takes no builder."""
         client.jvm.Large.length("x" * (4 * MB))
-        assert len(client._get_builder(large=True).Bytes) <= MB
+
+        pool = client._builders
+        assert len(pool.large.Bytes) <= MB
+        assert len(pool.small.Bytes) <= MB
+
+    def test_a_large_builder_is_not_kept_after_a_batch(self, client):
+        with client.batch() as b:
+            result = b.call_static("Large", "length", "x" * (4 * MB))
+        assert result.get() == 4 * MB
+
+        assert len(client._builders.large.Bytes) <= MB
 
 
 class TestLimits:

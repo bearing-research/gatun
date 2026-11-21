@@ -2908,6 +2908,19 @@ class GatunClient(_ValueEncoder):
         builder.Clear()
         return builder
 
+    def _drop_grown_builders(self) -> None:
+        """Let go of this thread's pooled builders that a large command grew.
+
+        Called when a large command is sent: the builder that made it would
+        keep the buffer until this thread next asks for a builder of the same
+        kind, and a thread whose later calls are all packed by hand never does.
+        """
+        pool = self._builders
+        for kind, size in (("small", 256), ("large", 1024)):
+            builder = getattr(pool, kind, None)
+            if builder is not None and len(builder.Bytes) > _KEPT_BUILDER_SIZE:
+                setattr(pool, kind, flatbuffers.Builder(size))
+
     @property
     def max_message_size(self) -> int:
         """The largest command or response, in bytes: the size of the shared
@@ -3067,9 +3080,11 @@ class GatunClient(_ValueEncoder):
         # 0a. Fail fast on a connection that cannot be used
         self._require_usable()
 
-        # 1. Validate command size
-        if len(data) > self._max_message:
-            raise PayloadTooLargeError(len(data), self._max_message, "Command")
+        # 1. Validate command size. Before connect() there is no size to
+        # validate against, and _write_command says what is wrong.
+        limit = self._max_message
+        if limit and len(data) > limit:
+            raise PayloadTooLargeError(len(data), limit, "Command")
 
         if not expects_response:
             # A CallbackResponse: part of an exchange that is already under way
@@ -3154,6 +3169,8 @@ class GatunClient(_ValueEncoder):
         own channel.
         """
         frame = _nested_command(call.call_id, data, self._max_message)
+        if len(data) > COMMAND_ZONE_SIZE:
+            self._drop_grown_builders()
         # A callback that runs for hours would otherwise hold on to every
         # object it dropped until it returns
         if self._pending_frees:
@@ -3197,6 +3214,8 @@ class GatunClient(_ValueEncoder):
         # A command that fits the command zone goes there. A larger one follows
         # its length on the socket, and the length is what tells Java which.
         in_zone = len(data) <= COMMAND_ZONE_SIZE
+        if not in_zone:
+            self._drop_grown_builders()
         if in_zone:
             # No flush: both processes map the same pages, so the bytes are visible
             # to Java as soon as they are written, and the length sent on the socket
@@ -5777,7 +5796,7 @@ class BatchContext:
                 ]
             data = self._build()
         limit = self._client._max_message
-        if len(data) > limit:
+        if limit and len(data) > limit:
             raise PayloadTooLargeError(len(data), limit, "Command")
         call = _channel_call_of(self._client)
         if call is not None:

@@ -225,6 +225,33 @@ class TestIdleTimeout:
         finally:
             client.close()
 
+    def test_a_large_command_after_the_timeout_is_told_the_reason(self):
+        """A command over 64 KB follows its length on the socket. The server
+        reads it to its end before it answers, or the client fails writing it
+        and never sees why."""
+        seen = []
+        # Between the timeout and the reaper's next round the session's own
+        # thread answers. The reaper may get there first: try again then.
+        for attempt in range(6):
+            client = connect(
+                memory="16MB",
+                extra_jvm_flags=["-Dgatun.limits.session_idle_timeout_ms=2000"],
+            )
+            try:
+                text = client.jvm.java.lang.StringBuilder()
+                time.sleep(2.02 + 0.15 * attempt)
+                try:
+                    text.append("x" * 3_000_000)
+                except JavaException as e:
+                    seen.append(str(e))
+                    break
+                except Exception as e:  # noqa: BLE001 - closed by the reaper
+                    seen.append(type(e).__name__)
+            finally:
+                client.close()
+
+        assert "session_idle_timeout_ms" in seen[-1], seen
+
     def test_busy_session_is_not_closed(self):
         client = connect(
             memory="16MB",
