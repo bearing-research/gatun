@@ -89,6 +89,21 @@ final class ClassAllowlist {
 
   // Members of allowed classes that stay refused: they end the server for every session, load
   // native code, or create an object of a class that was never checked.
+  // Members that run static initializers of classes the call does not name: getEnumConstants
+  // initializes the enum, and reading annotations initializes the enums their values are
+  // (AnnotationParser builds them with Enum.valueOf). Looking a class up never initializes it,
+  // so these would be the way to run one that is not allowed.
+  private static final Set<String> INITIALIZING_MEMBERS =
+      Set.of(
+          "getEnumConstants",
+          "getAnnotation",
+          "getAnnotations",
+          "getAnnotationsByType",
+          "getDeclaredAnnotation",
+          "getDeclaredAnnotations",
+          "getDeclaredAnnotationsByType",
+          "isAnnotationPresent");
+
   private static final Map<String, Set<String>> REFUSED_MEMBERS =
       Map.of(
           "java.lang.System", Set.of("exit", "load", "loadLibrary"),
@@ -198,6 +213,30 @@ final class ClassAllowlist {
               + " system property.");
     }
     checkStaticMember(type.getName(), member);
+    if (target instanceof java.lang.reflect.AnnotatedElement element
+        && INITIALIZING_MEMBERS.contains(member)) {
+      checkInitializingMember(element, member);
+    }
+  }
+
+  /**
+   * A class's enum constants and annotations are for a class that is allowed. An annotated element
+   * that is not a class (a package, a record component, an annotated type) has no class to allow,
+   * and its annotations are read only with the list lifted.
+   */
+  private void checkInitializingMember(java.lang.reflect.AnnotatedElement element, String member) {
+    if (element instanceof Class<?> c ? isAllowed(c.getName()) : allowAll) {
+      return;
+    }
+    String what =
+        element instanceof Class<?> c ? "class " + c.getName() : element.getClass().getName();
+    throw new SecurityException(
+        member
+            + " on "
+            + what
+            + " is not allowed: it can run the static initializers of classes that are not"
+            + " allowed. Allow the class to use it (allowed_classes, allowed_prefixes or"
+            + " allow_all).");
   }
 
   // The name to allow for a class whose instances are restricted, or "" if they are not. Cached

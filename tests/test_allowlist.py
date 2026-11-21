@@ -358,6 +358,56 @@ class TestReflectionIsNotAWayAround:
         finally:
             client.close()
 
+    def test_enum_constants_and_annotations_do_not_initialize(self, compile_java):
+        """A class looked up by name is not initialized, and neither are the
+        enums its constants or annotations would make."""
+        classes = compile_java(
+            "Quiet",
+            "import java.lang.annotation.Retention;\n"
+            "import java.lang.annotation.RetentionPolicy;\n"
+            "enum Noisy { ONE;\n"
+            '  static { System.setProperty("gatun.test.noisy", "ran"); } }\n'
+            "enum Level { LOW;\n"
+            '  static { System.setProperty("gatun.test.level", "ran"); } }\n'
+            "@Retention(RetentionPolicy.RUNTIME) @interface Tag { Level value(); }\n"
+            "@Tag(Level.LOW) public class Quiet {}\n",
+        )
+
+        client = connect(memory="16MB", classpath=[classes])
+        try:
+            Class = client.jvm.java.lang.Class
+            with pytest.raises(JavaSecurityException, match="getEnumConstants"):
+                Class.forName("Noisy").getEnumConstants()
+            quiet = Class.forName("Quiet")
+            for read in ("getAnnotations", "getDeclaredAnnotations"):
+                with pytest.raises(JavaSecurityException, match=read):
+                    getattr(quiet, read)()
+            with pytest.raises(JavaSecurityException, match="getAnnotations"):
+                quiet.getPackage().getAnnotations()
+            System = client.jvm.java.lang.System
+            assert System.getProperty("gatun.test.noisy") is None
+            assert System.getProperty("gatun.test.level") is None
+            # On an allowed class they work as before
+            allowed = Class.forName("java.util.ArrayList")
+            assert allowed.getEnumConstants() is None
+            assert len(allowed.getAnnotations()) == 0
+        finally:
+            client.close()
+
+        # Allowed, they are what they are
+        client = connect(
+            memory="16MB", classpath=[classes], allowed_classes=["Noisy", "Quiet"]
+        )
+        try:
+            Class = client.jvm.java.lang.Class
+            assert len(Class.forName("Noisy").getEnumConstants()) == 1
+            assert len(Class.forName("Quiet").getAnnotations()) == 1
+            System = client.jvm.java.lang.System
+            assert System.getProperty("gatun.test.noisy") == "ran"
+            assert System.getProperty("gatun.test.level") == "ran"
+        finally:
+            client.close()
+
     def test_restricted_type_can_be_allowed(self):
         client = connect(memory="16MB", allowed_classes=["java.lang.reflect.Method"])
         try:
