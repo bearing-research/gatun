@@ -103,7 +103,7 @@ pip install gatun
 
 ## Requirements
 
-- **Python**: 3.13+
+- **Python**: 3.11+
 - **Java**: 22+
 - **OS**: Linux, macOS (Windows is not supported - Unix domain sockets required)
 

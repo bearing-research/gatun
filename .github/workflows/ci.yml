@@ -15,7 +15,7 @@ jobs:
       matrix:
         # Windows excluded: Unix domain sockets not supported in Python on Windows
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v7

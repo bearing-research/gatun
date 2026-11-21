@@ -29,7 +29,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import flatbuffers
 import pyarrow as pa
@@ -119,7 +119,10 @@ def get_default_executor() -> ThreadPoolExecutor:
     return _default_executor
 
 
-async def run_sync[T](
+T = TypeVar("T")
+
+
+async def run_sync(
     func: Callable[..., T],
     *args,
     executor: ThreadPoolExecutor | None = None,

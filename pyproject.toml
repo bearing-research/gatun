@@ -4,7 +4,7 @@ version = "0.3.0"
 description = "High-performance Python-to-Java bridge using shared memory and Apache Arrow"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 authors = [
     { name = "Fangchen Li", email = "fangchen.li@outlook.com" },
 ]
@@ -22,6 +22,8 @@ keywords = [
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Java",
@@ -81,7 +83,7 @@ extend-exclude = ["*.md"]
 known-first-party = ["gatun"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.11"
 warn_unused_configs = true
 warn_return_any = true
 warn_unreachable = true
