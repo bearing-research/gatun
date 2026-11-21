@@ -370,6 +370,7 @@ def test_gatun_adapter_passes_classpath(monkeypatch):
         allowed_prefixes=["com.example.lib"],
         socket_timeout=120.0,
         callback_timeout=None,
+        allow_all=True,
     )
 
     assert seen == {
@@ -379,4 +380,5 @@ def test_gatun_adapter_passes_classpath(monkeypatch):
         "allowed_prefixes": ["com.example.lib"],
         "socket_timeout": 120.0,
         "callback_timeout": None,
+        "allow_all": True,
     }

@@ -2,13 +2,14 @@
 
 import os
 import subprocess
+import time
 
 import pytest
 
-from gatun import JavaSecurityException, aconnect, connect
+from gatun import GatunClient, JavaSecurityException, aconnect, connect
 from gatun.bridge_adapters import GatunAdapter
 from gatun.config import load_config, reset_config
-from gatun.launcher import DEFAULT_JVM_FLAGS, JAR_PATH, _checked_names
+from gatun.launcher import DEFAULT_JVM_FLAGS, JAR_PATH, _checked_names, launch_gateway
 
 ATOMIC_INT = "java.util.concurrent.atomic.AtomicInteger"
 ATOMIC_LONG = "java.util.concurrent.atomic.AtomicLong"
@@ -407,3 +408,223 @@ class TestNestedClasses:
     def test_nested_class_is_refused_unless_allowed(self, client):
         with pytest.raises(JavaSecurityException, match="Class not allowed"):
             client.jvm.java.util.AbstractMap.SimpleEntry("k", 1)
+
+
+class TestAllowAll:
+    """`allow_all=True` lifts the class list and the restriction on reflection."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_config(self):
+        reset_config()
+        yield
+        reset_config()
+
+    def test_any_class_can_be_created_and_called(self):
+        client = connect(allow_all=True)
+        try:
+            assert client.create_object(ATOMIC_LONG, 3).get() == 3
+            assert client.jvm.java.util.concurrent.atomic.AtomicInteger(7).get() == 7
+            assert client.invoke_static_method("java.util.Objects", "isNull", None)
+            assert client.get_static_field("java.lang.Long", "MAX_VALUE") == 2**63 - 1
+            with client.batch() as b:
+                created = b.create(ATOMIC_INT, 5)
+                called = b.call_static("java.util.Objects", "hash", 1)
+            assert created.get().get() == 5
+            assert not called.is_error
+        finally:
+            client.close()
+
+    def test_reflection_objects_can_be_used(self):
+        client = connect(allow_all=True)
+        try:
+            size = client.jvm.java.lang.Class.forName("java.util.ArrayList").getMethod(
+                "size"
+            )
+            items = client.jvm.java.util.ArrayList()
+            items.add("a")
+            assert size.invoke(items) == 1
+
+            runtime = client.jvm.java.lang.Runtime.getRuntime()
+            assert runtime.availableProcessors() >= 1
+            assert client.jvm.java.lang.Thread.currentThread().isAlive() is True
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [("exit", (0,)), ("load", ("/tmp/x.dylib",)), ("loadLibrary", ("x",))],
+    )
+    def test_refused_members_stay_refused(self, method, args):
+        client = connect(allow_all=True)
+        try:
+            with pytest.raises(JavaSecurityException, match=f"System.{method}"):
+                client.invoke_static_method("java.lang.System", method, *args)
+            builder = client.jvm.java.lang.Class.forName("java.lang.StringBuilder")
+            with pytest.raises(
+                JavaSecurityException, match="newInstance is not allowed"
+            ):
+                builder.newInstance()
+            assert client.ping() is True
+        finally:
+            client.close()
+
+    def test_off_unless_asked_for(self):
+        client = connect()
+        try:
+            with pytest.raises(JavaSecurityException, match="Class not allowed"):
+                client.create_object(ATOMIC_LONG)
+        finally:
+            client.close()
+
+    def test_environment(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)  # no pyproject.toml here
+        monkeypatch.setenv("GATUN_ALLOW_ALL", "true")
+
+        client = connect()
+        try:
+            assert client.create_object(ATOMIC_LONG, 2).get() == 2
+        finally:
+            client.close()
+
+    def test_argument_wins_over_environment(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GATUN_ALLOW_ALL", "true")
+
+        client = connect(allow_all=False)
+        try:
+            with pytest.raises(JavaSecurityException, match="Class not allowed"):
+                client.create_object(ATOMIC_LONG)
+        finally:
+            client.close()
+
+    def test_pyproject(self, tmp_path, monkeypatch):
+        (tmp_path / "pyproject.toml").write_text("[tool.gatun]\nallow_all = true\n")
+        monkeypatch.chdir(tmp_path)
+        assert load_config().allow_all is True
+
+        client = connect()
+        try:
+            assert client.create_object(ATOMIC_LONG, 2).get() == 2
+        finally:
+            client.close()
+
+    def test_environment_wins_over_pyproject(self, tmp_path, monkeypatch):
+        (tmp_path / "pyproject.toml").write_text("[tool.gatun]\nallow_all = true\n")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GATUN_ALLOW_ALL", "false")
+        assert load_config().allow_all is False
+
+    def test_jvm_flag(self):
+        client = connect(extra_jvm_flags=["-Dgatun.allowlist.all=true"])
+        try:
+            assert client.create_object(ATOMIC_LONG, 2).get() == 2
+        finally:
+            client.close()
+
+    def test_argument_wins_over_jvm_flag(self):
+        client = connect(
+            allow_all=False, extra_jvm_flags=["-Dgatun.allowlist.all=true"]
+        )
+        try:
+            with pytest.raises(JavaSecurityException, match="Class not allowed"):
+                client.create_object(ATOMIC_LONG)
+        finally:
+            client.close()
+
+    async def test_async_client(self):
+        client = await aconnect(allow_all=True)
+        try:
+            counter = await client.create_object(ATOMIC_INT, 1)
+            assert await counter.incrementAndGet() == 2
+        finally:
+            await client.close()
+
+    def test_bridge_adapter(self):
+        bridge = GatunAdapter(memory="16MB", allow_all=True)
+        try:
+            counter = bridge.new(ATOMIC_INT, 9)
+            assert bridge.call(counter, "get") == 9
+        finally:
+            bridge.close()
+
+    def test_server_says_so_once_at_start(self):
+        session = launch_gateway(allow_all=True)
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                lines = [
+                    line for line in session._stderr_lines if "allowlist is off" in line
+                ]
+                if lines:
+                    break
+                time.sleep(0.05)
+            assert len(lines) == 1, session._stderr_lines
+            assert "gatun.allowlist.all" in lines[0]
+        finally:
+            session.stop()
+
+    def test_server_says_nothing_when_it_is_off(self):
+        session = launch_gateway()
+        try:
+            client = GatunClient(session.socket_path)
+            assert client.connect()
+            client.close()
+            assert not [
+                line for line in session._stderr_lines if "allowlist is off" in line
+            ]
+        finally:
+            session.stop()
+
+    @pytest.mark.parametrize("value", ["yes", "1", "all"])
+    def test_environment_value_must_be_true_or_false(
+        self, value, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GATUN_ALLOW_ALL", value)
+        with pytest.raises(ValueError, match="GATUN_ALLOW_ALL"):
+            connect()
+
+    def test_pyproject_value_must_be_a_boolean(self, tmp_path, monkeypatch):
+        (tmp_path / "pyproject.toml").write_text('[tool.gatun]\nallow_all = "true"\n')
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(TypeError, match="allow_all .* must be true or false"):
+            connect()
+
+    def test_argument_must_be_a_boolean(self):
+        """A string would count as true whatever it says."""
+        with pytest.raises(TypeError, match="allow_all must be True or False"):
+            connect(allow_all="false")
+
+    def test_jvm_flag_must_be_true_or_false(self):
+        with pytest.raises(ValueError, match=r"gatun\.allowlist\.all"):
+            connect(extra_jvm_flags=["-Dgatun.allowlist.all=yes"])
+
+    def test_server_rejects_a_bad_property(self, tmp_path):
+        """The server checks too, for launches that bypass the Python launcher."""
+        java_home = os.environ.get("JAVA_HOME")
+        java = os.path.join(java_home, "bin", "java") if java_home else "java"
+
+        result = subprocess.run(
+            [
+                java,
+                *DEFAULT_JVM_FLAGS,
+                "-Dgatun.allowlist.all=yes",
+                "-jar",
+                str(JAR_PATH),
+                "1048576",
+                str(tmp_path / "never.sock"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "Invalid value for gatun.allowlist.all" in result.stderr
+
+    def test_an_empty_prefix_is_not_the_way(self):
+        """An empty prefix would match every class; the error names the option
+        that is meant for that."""
+        with pytest.raises(ValueError, match="allow_all=True"):
+            connect(allowed_prefixes=[""])

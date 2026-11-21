@@ -706,6 +706,8 @@ The same lists can come from `[tool.gatun] allowed_classes` / `allowed_prefixes`
 
 In tests, pass `allowed_classes` to `connect()` rather than editing the built-in list. A nested class may be listed, and named, as `a.b.Outer.Inner` or `a.b.Outer$Inner`.
 
+`allow_all=True` (`connect()`, `aconnect()`, `launch_gateway()`, `GatunAdapter`; `[tool.gatun] allow_all`; `GATUN_ALLOW_ALL`) lifts the list: `ClassAllowlist.isAllowed` answers true for every name, which also opens the instances of `RESTRICTED_TYPES`, since they are restricted only until their type is allowed. `REFUSED_MEMBERS` stay refused. It is one setting, not a list, so it follows the usual precedence (argument > environment > `pyproject.toml`), and anything but true or false is an error in every source: the launcher passes `-Dgatun.allowlist.all=true`, and the server logs one line at start. An empty prefix is still a `ValueError`; its message names `allow_all`.
+
 What the allowlist covers, and what it does not (the README's "What the Allowlist Is and Is Not" is the user-facing version; keep the two in step):
 - It gates object creation and static method/field access by class name (`requireClassAllowed`).
 - Instance members are open on whatever an allowed call returns, except objects of `ClassAllowlist.RESTRICTED_TYPES` (reflection objects, method handles, class loaders, `Runtime`, `Process*`, `Thread`, `Module`), which need their type in `allowed_classes` (`checkInstanceMember`, called at every instance method/field site). `REFUSED_MEMBERS` (`System.exit` / `load` / `loadLibrary`, `Class.newInstance`) are refused whatever is allowed.
@@ -814,6 +816,7 @@ jvm_flags = ["-Xmx512m"]         # Appended to the launcher's default flags
 connect_timeout = 5.0            # seconds
 startup_timeout = 5.0            # seconds to wait for the server socket
 allowed_prefixes = ["com.example"]  # added to the built-in class allowlist
+allow_all = false                # true lifts the class allowlist
 ```
 
 Or environment variables:

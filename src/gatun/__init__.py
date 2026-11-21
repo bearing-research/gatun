@@ -132,6 +132,7 @@ def connect(
     allowed_prefixes: list[str] | None = None,
     socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
     callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
+    allow_all: bool | None = None,
 ):
     """Convenience: Launches server and returns connected client.
 
@@ -155,6 +156,10 @@ def connect(
                         without limit.
         callback_timeout: Seconds a Python callback may run before Java is told it
                           failed. None waits without limit.
+        allow_all: True lifts the class allowlist: every class can be used, reflection
+                   objects included. `System.exit`, `System.load`, `System.loadLibrary`
+                   and `Class.newInstance` stay refused. False keeps the list whatever
+                   GATUN_ALLOW_ALL or pyproject.toml say; None leaves it to them.
 
     Configuration can be set in pyproject.toml:
         [tool.gatun]
@@ -166,6 +171,7 @@ def connect(
         GATUN_MEMORY=64MB
         GATUN_SOCKET_PATH=/tmp/gatun.sock
         GATUN_ALLOWED_PREFIXES=com.example,org.acme
+        GATUN_ALLOW_ALL=true
         GATUN_TRACE=true
         GATUN_LOG_LEVEL=FINE
         GATUN_DEBUG=true
@@ -187,6 +193,7 @@ def connect(
         extra_jvm_flags=extra_jvm_flags,
         allowed_classes=allowed_classes,
         allowed_prefixes=allowed_prefixes,
+        allow_all=allow_all,
     )
 
     client = GatunClient(
@@ -215,6 +222,7 @@ async def aconnect(
     allowed_prefixes: list[str] | None = None,
     socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
     callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
+    allow_all: bool | None = None,
 ) -> AsyncGatunClient:
     """Async convenience: Launches server and returns connected async client.
 
@@ -238,6 +246,10 @@ async def aconnect(
                         without limit.
         callback_timeout: Seconds a Python callback may run before Java is told it
                           failed. None waits without limit.
+        allow_all: True lifts the class allowlist: every class can be used, reflection
+                   objects included. `System.exit`, `System.load`, `System.loadLibrary`
+                   and `Class.newInstance` stay refused. False keeps the list whatever
+                   GATUN_ALLOW_ALL or pyproject.toml say; None leaves it to them.
 
     Example:
         async with await aconnect() as client:
@@ -253,6 +265,7 @@ async def aconnect(
         GATUN_MEMORY=64MB
         GATUN_SOCKET_PATH=/tmp/gatun.sock
         GATUN_ALLOWED_PREFIXES=com.example,org.acme
+        GATUN_ALLOW_ALL=true
         GATUN_TRACE=true
         GATUN_LOG_LEVEL=FINE
         GATUN_DEBUG=true
@@ -267,6 +280,7 @@ async def aconnect(
         extra_jvm_flags=extra_jvm_flags,
         allowed_classes=allowed_classes,
         allowed_prefixes=allowed_prefixes,
+        allow_all=allow_all,
     )
 
     client = AsyncGatunClient(

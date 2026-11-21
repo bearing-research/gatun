@@ -20,10 +20,15 @@ import java.util.regex.Pattern;
  * </ul>
  *
  * <p>The Python launcher sets them from {@code connect(allowed_classes=..., allowed_prefixes=...)}.
+ *
+ * <p>A third property, {@code gatun.allowlist.all=true} ({@code connect(allow_all=True)}), lifts
+ * the list: every class is allowed, and with it the types whose instances are otherwise restricted.
+ * The refused members stay refused.
  */
 final class ClassAllowlist {
   static final String CLASSES_PROPERTY = "gatun.allowlist.classes";
   static final String PREFIXES_PROPERTY = "gatun.allowlist.prefixes";
+  static final String ALL_PROPERTY = "gatun.allowlist.all";
 
   private static final Set<String> DEFAULT_CLASSES =
       Set.of(
@@ -96,8 +101,10 @@ final class ClassAllowlist {
   private final Set<String> classes;
   private final Set<String> dottedClasses; // the same names with '$' written as '.'
   private final List<String> prefixes;
+  private final boolean allowAll;
 
-  ClassAllowlist(List<String> extraClasses, List<String> extraPrefixes) {
+  ClassAllowlist(List<String> extraClasses, List<String> extraPrefixes, boolean allowAll) {
+    this.allowAll = allowAll;
     Set<String> allClasses = new HashSet<>(DEFAULT_CLASSES);
     for (String className : extraClasses) {
       requireQualifiedName(className, CLASSES_PROPERTY);
@@ -119,16 +126,38 @@ final class ClassAllowlist {
     this.prefixes = List.copyOf(allPrefixes);
   }
 
-  /** The built-in list plus whatever the two system properties add. */
+  /** The built-in list plus whatever the system properties add, or no list at all. */
   static ClassAllowlist fromSystemProperties() {
     return new ClassAllowlist(
         parseList(System.getProperty(CLASSES_PROPERTY)),
-        parseList(System.getProperty(PREFIXES_PROPERTY)));
+        parseList(System.getProperty(PREFIXES_PROPERTY)),
+        parseAll(System.getProperty(ALL_PROPERTY)));
+  }
+
+  // A value that is neither is a mistake, and guessing which way it was meant is how a server
+  // ends up open, or closed, without anybody having asked
+  private static boolean parseAll(String value) {
+    if (value == null || value.equalsIgnoreCase("false")) {
+      return false;
+    }
+    if (value.equalsIgnoreCase("true")) {
+      return true;
+    }
+    throw new IllegalArgumentException(
+        "Invalid value for " + ALL_PROPERTY + ": '" + value + "'. Expected true or false.");
+  }
+
+  /** Whether the list is lifted: every class is allowed. */
+  boolean allowsEverything() {
+    return allowAll;
   }
 
   boolean isAllowed(String className) {
     if (className == null) {
       return false;
+    }
+    if (allowAll) {
+      return true;
     }
     // A nested class may be named with a dot or with the '$' of its binary name
     if (classes.contains(className) || dottedClasses.contains(className.replace('$', '.'))) {

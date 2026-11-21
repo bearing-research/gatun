@@ -1008,6 +1008,19 @@ export GATUN_ALLOWED_PREFIXES=com.example,org.acme
 
 A nested class is named either way: `java.util.AbstractMap.SimpleEntry` or `java.util.AbstractMap$SimpleEntry`.
 
+To allow every class, as Py4J does, lift the list:
+
+```python
+from gatun import connect
+
+client = connect(allow_all=True)
+
+client.jvm.java.util.concurrent.atomic.AtomicLong(41).incrementAndGet()  # 42
+client.jvm.java.lang.Runtime.getRuntime().availableProcessors()
+```
+
+`allow_all=True` allows every class, and with it the objects the list otherwise keeps out of reach (see the next section): reflection objects, class loaders, `Runtime`, threads. `System.exit`, `System.load`, `System.loadLibrary` and `Class.newInstance` stay refused. It is off unless you turn it on: with the argument, with `allow_all = true` under `[tool.gatun]`, or with `GATUN_ALLOW_ALL=true`. An argument, `allow_all=False` included, wins over the environment, which wins over `pyproject.toml`. The server writes one line to its log at start when the list is off.
+
 ### What the Allowlist Is and Is Not
 
 The server trusts the operating-system user it runs as, and nobody else:
@@ -1015,11 +1028,13 @@ The server trusts the operating-system user it runs as, and nobody else:
 - Its socket and shared memory files are owner-only (`0600`), and it refuses connections from other users.
 - Each session reaches only the objects it created. Another session cannot call, read, free or pass an object by guessing its ID.
 
-Inside that boundary, the allowlist is a guardrail against accidents and against class names that come from somewhere you do not control. It is not a sandbox:
+Inside that boundary, the allowlist is a guardrail against accidents and against class names that come from somewhere you do not control. It is not a sandbox, and with `allow_all=True` it is not there at all: what stands then is the boundary above and the four refused members.
 
 - It decides which classes can be instantiated and which static members can be used. Instance methods are open on whatever an allowed call returns, with these exceptions: objects that would undo the list (`java.lang.reflect.Method` / `Constructor` / `Field`, method handles, class loaders, `Runtime`, `Process`, `ProcessBuilder`, `Thread`, `Module`) cannot be used from Python unless you put their type in `allowed_classes`, and `System.exit`, `System.load`, `System.loadLibrary` and `Class.newInstance` are always refused.
 - Naming a class does not run its static initializer, and neither does `Class.forName` called from Python. A class is initialized when something allowed first uses it.
 - Anything you allow can do what it does. The built-in `org.apache.spark.` and `scala.` prefixes, and any JAR you add, include classes that read files and start processes. Field access (`get_field`, `get_fields`) reaches non-public fields.
+
+With `allow_all=True` the first point does not apply: every class can be instantiated and every static member used, the listed types included, and only `System.exit`, `System.load`, `System.loadLibrary` and `Class.newInstance` are refused. Those four are no protection against code that means harm (`Runtime.getRuntime().halt(0)` ends the server as well); they catch the call made by mistake.
 
 Do not expose a Gatun socket to code or users you do not trust with the JVM.
 
