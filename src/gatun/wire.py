@@ -322,16 +322,16 @@ _BATCH_HEADERS = (_batch_header(False), _batch_header(True))
 
 
 def pack_batch(
-    commands: list[tuple[int, int, Any, tuple[Any, ...]]],
+    commands: list[tuple[int, int, Any, tuple[Any, ...], bool]],
     ref_types: tuple[type, ...],
     stop_on_error: bool,
 ) -> bytes | None:
     """The bytes of a Batch command, or None if the builder has to make it.
 
-    `commands` holds an action, an object ID, a name and the arguments for each
-    command of the batch. One command that `pack_command` would leave to the
-    builder leaves the whole batch to it, and so does a batch too long for the
-    command zone.
+    `commands` holds an action, an object ID, a name, the arguments and whether
+    the result is wanted as a reference, for each command of the batch. One
+    command that `pack_command` would leave to the builder leaves the whole
+    batch to it, and so does a batch too long for the command zone.
     """
     count = len(commands)
     entry = _BATCH_COMMANDS + 4
@@ -340,8 +340,8 @@ def pack_batch(
     base += skip
     distances = []
     parts = [_BATCH_HEADERS[bool(stop_on_error)], b"", _PADDING[skip]]
-    for action, target_id, name, args in commands:
-        block = _command_parts(base, action, name, target_id, args, ref_types, False)
+    for action, target_id, name, args, ref in commands:
+        block = _command_parts(base, action, name, target_id, args, ref_types, ref)
         if block is None or base > _PACKED_LIMIT:
             return None
         distances.append(base - entry)

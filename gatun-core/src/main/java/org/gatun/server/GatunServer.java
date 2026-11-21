@@ -55,7 +55,7 @@ public class GatunServer {
   // Protocol version - increment when making breaking changes to the protocol
   // Version 2: Per-client shared memory (handshake includes SHM path)
   // Version 4: Callback connection (Action.OpenCallbackChannel, call_id)
-  public static final int PROTOCOL_VERSION = 5;
+  public static final int PROTOCOL_VERSION = 6;
 
   private static final Set<PosixFilePermission> OWNER_ONLY =
       PosixFilePermissions.fromString("rw-------");
@@ -1076,7 +1076,8 @@ public class GatunServer {
             }
 
             // Wrap returned objects in registry
-            if (result != null && !MethodResolver.isAutoConvertible(result)) {
+            if (result != null
+                && (cmd.returnObjectRef() || !MethodResolver.isAutoConvertible(result))) {
               quota.allocateObject();
               long newId = objectIdCounter.getAndIncrement();
               putObject(newId, result);
@@ -1144,7 +1145,8 @@ public class GatunServer {
             }
 
             // Wrap returned objects in registry
-            if (result != null && !MethodResolver.isAutoConvertible(result)) {
+            if (result != null
+                && (cmd.returnObjectRef() || !MethodResolver.isAutoConvertible(result))) {
               quota.allocateObject();
               long newId = objectIdCounter.getAndIncrement();
               putObject(newId, result);
@@ -1332,7 +1334,8 @@ public class GatunServer {
             }
 
             // Wrap returned objects in registry
-            if (result != null && !MethodResolver.isAutoConvertible(result)) {
+            if (result != null
+                && (cmd.returnObjectRef() || !MethodResolver.isAutoConvertible(result))) {
               quota.allocateObject();
               long newId = objectIdCounter.getAndIncrement();
               putObject(newId, result);
@@ -1899,7 +1902,7 @@ public class GatunServer {
       }
 
       // Wrap returned objects in registry
-      if (result != null && !MethodResolver.isAutoConvertible(result)) {
+      if (result != null && (cmd.returnObjectRef() || !MethodResolver.isAutoConvertible(result))) {
         quota.allocateObject();
         long newId = objectIdCounter.getAndIncrement();
         putObject(newId, result);
@@ -1961,7 +1964,7 @@ public class GatunServer {
         result = field.get(target);
       }
 
-      if (result != null && !MethodResolver.isAutoConvertible(result)) {
+      if (result != null && (cmd.returnObjectRef() || !MethodResolver.isAutoConvertible(result))) {
         quota.allocateObject();
         long newId = objectIdCounter.getAndIncrement();
         putObject(newId, result);
@@ -2027,7 +2030,7 @@ public class GatunServer {
         result = field.get(null);
       }
 
-      if (result != null && !MethodResolver.isAutoConvertible(result)) {
+      if (result != null && (cmd.returnObjectRef() || !MethodResolver.isAutoConvertible(result))) {
         quota.allocateObject();
         long newId = objectIdCounter.getAndIncrement();
         putObject(newId, result);
@@ -2175,6 +2178,24 @@ public class GatunServer {
       TemporalVal tv = (TemporalVal) arg.val(new TemporalVal());
       value = convertTemporalVal(tv.kind(), tv.v());
       type = value.getClass();
+    } else if (valType == Value.BigIntVal) {
+      // A Python int that does not fit in a long
+      BigIntVal bv = (BigIntVal) arg.val(new BigIntVal());
+      if (bv.vLength() == 0) {
+        throw new IllegalArgumentException("A BigIntVal with no bytes");
+      }
+      ResourceLimits.checkByteLength(bv.vLength());
+      byte[] twosComplement = new byte[bv.vLength()];
+      bv.vAsByteBuffer().get(twosComplement);
+      value = new java.math.BigInteger(twosComplement);
+      type = java.math.BigInteger.class;
+    } else if (valType == Value.DecimalVal) {
+      // A Python decimal.Decimal
+      DecimalVal dv = (DecimalVal) arg.val(new DecimalVal());
+      String text = dv.v();
+      ResourceLimits.checkStringLength(text);
+      value = new java.math.BigDecimal(text);
+      type = java.math.BigDecimal.class;
     } else {
       value = null;
       type = Object.class;
@@ -2544,6 +2565,16 @@ public class GatunServer {
       // Handle Java arrays
       type = Value.ArrayVal;
       valueOffset = packArray(builder, value, sessionObjectIds);
+    } else if (value.getClass() == java.math.BigInteger.class) {
+      // The exact class, here and below: a subclass may carry more than the number, and
+      // toString() of one need not be the number at all
+      type = Value.BigIntVal;
+      int bytes = BigIntVal.createVVector(builder, ((java.math.BigInteger) value).toByteArray());
+      valueOffset = BigIntVal.createBigIntVal(builder, bytes);
+    } else if (value.getClass() == java.math.BigDecimal.class) {
+      type = Value.DecimalVal;
+      int text = builder.createString(value.toString());
+      valueOffset = DecimalVal.createDecimalVal(builder, text);
     } else {
       // Unknown type - wrap as object reference
       long newId = objectIdCounter.getAndIncrement();

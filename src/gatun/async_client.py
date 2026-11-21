@@ -47,6 +47,7 @@ from gatun.client import (
     _CALL_ENDED,
     _FREE_CHUNK_SIZE,
     _OPEN_CALL_MEMORY,
+    _PLAIN_TYPES,
     DEFAULT_CALLBACK_TIMEOUT,
     DEFAULT_SOCKET_TIMEOUT,
     HANDSHAKE_TIMEOUT,
@@ -57,17 +58,20 @@ from gatun.client import (
     CancelledException,
     DeadConnectionError,
     JavaException,
+    JavaList,
     JavaObject,
     PayloadTooLargeError,
     ProtocolDesyncError,
     ReentrancyError,
     SocketTimeoutError,
+    TypeHint,
     _arrow_stream_size,
     _arrow_table_to_send,
     _build_free_command,
     _callback_target,
     _channel_call_of,
     _close_shared_memory,
+    _converting,
     _enter_callback,
     _exit_callback,
     _finish_arrow_from_object,
@@ -347,6 +351,7 @@ class AsyncGatunClient(_ValueEncoder):
 
         # What the server said each dotted path is (class, method, field)
         self._reflect_cache: _LRUCache[str] = _LRUCache(1024)
+        self._converters = {}
 
     @property
     def jvm(self) -> AsyncJVMView:
@@ -979,6 +984,41 @@ class AsyncGatunClient(_ValueEncoder):
         """Unpack a FlatBuffer Value union to a Python object."""
         return _unpack_value_impl(val_type, val_table, self, AsyncJavaObject)
 
+    # A converter here may be a coroutine function: one that calls Java has to
+    # await it
+    _awaits_converters = True
+
+    async def _converted(self, value: Any) -> Any:  # type: ignore[override]
+        """`value` as the converters leave it. Containers are looked into."""
+        kind = type(value)
+        if kind in _PLAIN_TYPES or isinstance(value, self._object_ref_types):
+            return value
+        registered, converter = self._converter_for(kind)
+        if registered is not None and converter is not None:
+            token = _converting.set(_converting.get() | {registered})
+            try:
+                result = converter(value)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+            finally:
+                _converting.reset(token)
+        if kind is list or kind is tuple or kind is JavaList:
+            return [await self._converted(item) for item in value]
+        if kind is dict:
+            return {
+                await self._converted(key): await self._converted(item)
+                for key, item in value.items()
+            }
+        if kind is TypeHint:
+            return TypeHint(await self._converted(value.value), value.java_type)
+        return value
+
+    async def _convert_arguments(  # type: ignore[override]
+        self, args: Any
+    ) -> tuple[Any, ...]:
+        return tuple([await self._converted(arg) for arg in args])
+
     async def create_object(self, class_name: str, *args) -> AsyncJavaObject:
         """Create a new Java object asynchronously."""
         data = wire.pack_command(
@@ -986,6 +1026,8 @@ class AsyncGatunClient(_ValueEncoder):
         )
         if data is not None:
             return cast(AsyncJavaObject, await self._send_raw(data, packed=True))
+        if self._converters:
+            args = await self._convert_arguments(args)
 
         builder = flatbuffers.Builder(1024)
         name_off = builder.CreateString(class_name)
@@ -1011,16 +1053,29 @@ class AsyncGatunClient(_ValueEncoder):
 
         return cast(AsyncJavaObject, await self._send_raw(builder.Output()))
 
-    async def invoke_method(self, obj_id, method_name: str, *args):
-        """Invoke a method on a Java object asynchronously."""
+    async def invoke_method(
+        self, obj_id, method_name: str, *args, return_object_ref: bool = False
+    ):
+        """Invoke a method on a Java object asynchronously.
+
+        With `return_object_ref` the result is an AsyncJavaObject instead of a
+        converted value (a String, a List, a BigDecimal).
+        """
         if isinstance(obj_id, (JavaObject, AsyncJavaObject)):
             obj_id = obj_id.object_id
 
         data = wire.pack_command(
-            Act.Action.InvokeMethod, method_name, obj_id, args, self._object_ref_types
+            Act.Action.InvokeMethod,
+            method_name,
+            obj_id,
+            args,
+            self._object_ref_types,
+            return_object_ref,
         )
         if data is not None:
             return await self._send_raw(data, packed=True)
+        if self._converters:
+            args = await self._convert_arguments(args)
 
         builder = flatbuffers.Builder(1024)
         name_off = builder.CreateString(method_name)
@@ -1042,19 +1097,38 @@ class AsyncGatunClient(_ValueEncoder):
         Cmd.CommandAddTargetName(builder, name_off)
         if args_vec:
             Cmd.CommandAddArgs(builder, args_vec)
+        if return_object_ref:
+            Cmd.CommandAddReturnObjectRef(builder, True)
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
         return await self._send_raw(builder.Output())
 
-    async def invoke_static_method(self, class_name: str, method_name: str, *args):
-        """Invoke a static method on a class asynchronously."""
+    async def invoke_static_method(
+        self,
+        class_name: str,
+        method_name: str,
+        *args,
+        return_object_ref: bool = False,
+    ):
+        """Invoke a static method on a class asynchronously.
+
+        With `return_object_ref` the result is an AsyncJavaObject instead of a
+        converted value.
+        """
         full_name = f"{class_name}.{method_name}"
         data = wire.pack_command(
-            Act.Action.InvokeStaticMethod, full_name, 0, args, self._object_ref_types
+            Act.Action.InvokeStaticMethod,
+            full_name,
+            0,
+            args,
+            self._object_ref_types,
+            return_object_ref,
         )
         if data is not None:
             return await self._send_raw(data, packed=True)
+        if self._converters:
+            args = await self._convert_arguments(args)
 
         builder = flatbuffers.Builder(1024)
         name_off = builder.CreateString(full_name)
@@ -1075,17 +1149,27 @@ class AsyncGatunClient(_ValueEncoder):
         Cmd.CommandAddTargetName(builder, name_off)
         if args_vec:
             Cmd.CommandAddArgs(builder, args_vec)
+        if return_object_ref:
+            Cmd.CommandAddReturnObjectRef(builder, True)
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
         return await self._send_raw(builder.Output())
 
-    async def get_field(self, obj_id, field_name: str):
-        """Get a field value from a Java object asynchronously."""
+    async def get_field(
+        self, obj_id, field_name: str, *, return_object_ref: bool = False
+    ):
+        """Get a field value from a Java object asynchronously.
+
+        With `return_object_ref` the value is an AsyncJavaObject instead of a
+        converted value.
+        """
         if isinstance(obj_id, (JavaObject, AsyncJavaObject)):
             obj_id = obj_id.object_id
 
-        data = wire.pack_command(Act.Action.GetField, field_name, obj_id, (), ())
+        data = wire.pack_command(
+            Act.Action.GetField, field_name, obj_id, (), (), return_object_ref
+        )
         if data is not None:
             return await self._send_raw(data, packed=True)
 
@@ -1096,6 +1180,8 @@ class AsyncGatunClient(_ValueEncoder):
         Cmd.CommandAddAction(builder, Act.Action.GetField)
         Cmd.CommandAddTargetId(builder, obj_id)
         Cmd.CommandAddTargetName(builder, name_off)
+        if return_object_ref:
+            Cmd.CommandAddReturnObjectRef(builder, True)
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
@@ -1111,6 +1197,8 @@ class AsyncGatunClient(_ValueEncoder):
         )
         if data is not None:
             return await self._send_raw(data, packed=True)
+        if self._converters:
+            value = await self._converted(value)
 
         builder = flatbuffers.Builder(256)
         name_off = builder.CreateString(field_name)
@@ -1303,6 +1391,10 @@ class AsyncGatunClient(_ValueEncoder):
         # Normalize return_object_refs to a list
         if isinstance(return_object_refs, bool):
             return_object_refs = [return_object_refs] * len(calls)
+        if self._converters:
+            calls = [
+                (name, await self._convert_arguments(args)) for name, args in calls
+            ]
 
         builder = flatbuffers.Builder(4096)
 
@@ -1377,6 +1469,10 @@ class AsyncGatunClient(_ValueEncoder):
                 ("java.util.HashMap", ()),
             ])
         """
+        if self._converters:
+            specs = [
+                (name, await self._convert_arguments(args)) for name, args in specs
+            ]
         builder = flatbuffers.Builder(4096)
 
         # Build each ObjectSpec
@@ -1504,10 +1600,18 @@ class AsyncGatunClient(_ValueEncoder):
             _remember_reflection(self._reflect_cache, full_name, cached)
         return cached
 
-    async def get_static_field(self, class_name: str, field_name: str):
-        """Get a static field value from a Java class."""
+    async def get_static_field(
+        self, class_name: str, field_name: str, *, return_object_ref: bool = False
+    ):
+        """Get a static field value from a Java class.
+
+        With `return_object_ref` the value is an AsyncJavaObject instead of a
+        converted value.
+        """
         full_name = f"{class_name}.{field_name}"
-        data = wire.pack_command(Act.Action.GetStaticField, full_name, 0, (), ())
+        data = wire.pack_command(
+            Act.Action.GetStaticField, full_name, 0, (), (), return_object_ref
+        )
         if data is not None:
             return await self._send_raw(data, packed=True)
 
@@ -1516,6 +1620,8 @@ class AsyncGatunClient(_ValueEncoder):
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.GetStaticField)
         Cmd.CommandAddTargetName(builder, name_off)
+        if return_object_ref:
+            Cmd.CommandAddReturnObjectRef(builder, True)
         builder.Finish(Cmd.CommandEnd(builder))
         return await self._send_raw(builder.Output())
 

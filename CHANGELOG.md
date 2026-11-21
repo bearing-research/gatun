@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `benchmarks/benchmark_comparison.py --py4j-nodelay` runs Py4J's server with `TCP_NODELAY` set on the connections it accepts
+- A Python `int` that does not fit in 64 bits is sent as a `java.math.BigInteger`, and a `decimal.Decimal` as a `java.math.BigDecimal` with the same digits and scale. Both were refused (`TypeError`). An `int` that fits travels as before, and is converted where the parameter is a `BigInteger` or `BigDecimal`, so that `big.add(5)` works like `big.add(2**70)`; a `float` is never taken for a `BigDecimal`. `Decimal("NaN")` and the infinities raise `ValueError`
+- Numbers of other libraries are accepted as arguments: any `numbers.Integral` value is sent as an `int` and any `numbers.Real` value as a `float`, which covers numpy's scalars. numpy is not imported
+- `client.register_converter(python_type, fn)` and `unregister_converter`, in both clients: `fn` turns every argument of that type (or a subclass) into a value that can be sent, in single calls, batches and the vectorized calls, also inside a list, tuple or dict. It runs before the command is built, so it may call Java. In the async client it may be a coroutine function
+- `return_object_ref=True` on `invoke_method`, `get_field` and `get_static_field` (both clients; `invoke_static_method` had it in the sync client and now has it in the async one), and on a batch's `call`, `call_static` and `get_field`: the result is the Java object, not a converted value
+
+### Changed
+- **A `java.math.BigDecimal` is returned as a `decimal.Decimal` and a `java.math.BigInteger` as an `int`**, as return values, field values, callback arguments and elements of lists and maps. They were `JavaObject`s. Code that called methods on such a result (`value.add(...)`, `value.toString()`) now gets the Python number instead; to keep the Java object, construct it (`client.jvm.java.math.BigDecimal("1.50")` is still a `JavaObject`) or pass `return_object_ref=True`. Subclasses of the two, and other `Number` classes such as `AtomicLong`, are objects as before
+- A bridge method is called only when no other method matches. `dec.compareTo(5)` on a `BigDecimal` went to the compiler-made `compareTo(Object)`, whose `Object` parameter scored above the conversion of the int, and failed in its cast
+- Protocol version is now 6: two new values, `BigIntVal` and `DecimalVal`. Client and server must be upgraded together
 
 ### Fixed
 - README and `docs/benchmarks.md` said a plain instance call is 1.3 times faster through Gatun than through Py4J. Plain instance calls and object creation cost about the same: a second machine had Py4J level or ahead on them. The claims for static calls, `is_instance_of`, collections as arguments and bulk data stand

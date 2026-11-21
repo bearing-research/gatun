@@ -1027,9 +1027,10 @@ Do not expose a Gatun socket to code or users you do not trust with the JVM.
 
 | Python | Java |
 |--------|------|
-| `int` | `int`, `long` |
+| `int` | `int`, `long`; `java.math.BigInteger` when it does not fit in 64 bits |
 | `float` | `double` |
 | `bool` | `boolean` |
+| `decimal.Decimal` | `java.math.BigDecimal`, with the same digits and scale |
 | `str` | `String` |
 | `list` | `List` (ArrayList) |
 | `dict` | `Map` (HashMap) |
@@ -1040,6 +1041,54 @@ Do not expose a Gatun socket to code or users you do not trust with the JVM.
 | `datetime.datetime`, `date`, `time` | `java.sql.Timestamp`, `Date`, `Time` (as arguments; a naive datetime is local time) |
 | `None` | `null` |
 | `JavaObject` | Object reference (including Object arrays) |
+| numpy scalars and other `numbers.Integral` / `numbers.Real` values | as `int` / `float` |
+
+### Big Numbers
+
+A Python `int` that does not fit in 64 bits arrives as a `BigInteger`, and a `decimal.Decimal` as a `BigDecimal` with the same digits and the same scale. They come back the same way: a `BigInteger` is a Python `int` and a `BigDecimal` a `Decimal`, as return values, as fields and inside lists and maps.
+
+```python
+from decimal import Decimal
+
+BigInteger = client.jvm.java.math.BigInteger    # needs allowed_classes, or allow_all=True
+BigDecimal = client.jvm.java.math.BigDecimal
+
+BigInteger("1").shiftLeft(70)              # 1180591620717411303424, an int
+BigInteger("1").add(2**70)                 # 1180591620717411303425
+BigDecimal("1.50").add(Decimal("0.25"))    # Decimal('1.75')
+```
+
+- An `int` that fits in 64 bits travels as an `int` or `long`, as before. Where the parameter is a `BigInteger` or `BigDecimal` it is converted, so `big.add(5)` works like `big.add(2**70)`. A `float` is never taken for a `BigDecimal`: pass a `Decimal`.
+- `Decimal("NaN")` and the infinities raise `ValueError`: `BigDecimal` has neither. `Decimal("-0")` arrives as `0`.
+- To get the Java object instead of the value, construct it (`BigDecimal("1.50")` is a `JavaObject`) or ask for it: `client.invoke_method(dec.object_id, "add", x, return_object_ref=True)`. `invoke_static_method`, `get_field`, `get_static_field` and a batch's `call`, `call_static` and `get_field` take the same argument. It works for every value that is otherwise converted, a `String` or a `List` included.
+- numpy is not needed and not imported. Its scalars are sent as what they say they are: `numpy.int64(5)` as `5`, `numpy.float32(1.5)` as `1.5`. `numpy.bool_` says nothing of the kind; pass `bool(x)`.
+
+### Converters for Your Own Types
+
+A converter turns every argument of one of your types into something Gatun can send. It runs before the call is built, so it may call Java:
+
+```python
+from decimal import Decimal
+
+class Money:
+    def __init__(self, amount, currency):
+        self.amount, self.currency = amount, currency
+
+def to_java(money):
+    return client.jvm.java.util.AbstractMap.SimpleEntry(money.currency, Decimal(money.amount))
+
+client.register_converter(Money, to_java)
+
+prices = client.jvm.java.util.ArrayList()
+prices.add(Money("9.99", "EUR"))            # arrives as the SimpleEntry
+prices.add([Money("1.50", "USD")])          # also inside a list, a tuple or a dict
+prices.get(0).getValue()                    # Decimal('9.99')
+```
+
+- A converter is used for its type and for subclasses; the nearest registered class wins. It applies to the arguments of single calls, batches and the vectorized calls, in both clients. With the async client it may be a coroutine function.
+- What it returns is sent as it is, without another round of conversion, and the calls a converter makes while it converts a value do not convert that type again: a converter for `dict` can pass the dict itself to `LinkedHashMap(d)`.
+- `int`, `float`, `bool`, `str`, `None` and Java objects take no converter. Any other type does, including one Gatun already knows (`dict`, `datetime`).
+- Return values, and the values a callback returns, are not converted. `client.unregister_converter(Money)` removes one.
 
 ## Exception Handling
 

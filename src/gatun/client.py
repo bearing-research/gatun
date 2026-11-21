@@ -4,11 +4,13 @@ import array
 import calendar
 import contextvars
 import datetime
+import decimal
 import functools
 import inspect
 import logging
 import math
 import mmap
+import numbers
 import os
 import socket
 import struct
@@ -40,10 +42,12 @@ from gatun.generated.org.gatun.protocol import (
     ArrowForm,
     BatchCommand,
     BatchResponse,
+    BigIntVal,
     BoolVal,
     BufferDescriptor,
     CharVal,
     CreateObjectsRequest,
+    DecimalVal,
     DoubleVal,
     ElementType,
     FieldNode,
@@ -157,7 +161,7 @@ def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int)
 
 # Protocol version - must match the server version
 # Version 2: Per-client shared memory (handshake includes SHM path)
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 
 # Memory zone sizes - must match GatunServer.java constants
 COMMAND_ZONE_SIZE = wire.COMMAND_ZONE_SIZE  # 64KB for commands
@@ -1464,6 +1468,25 @@ def _unpack_list(list_obj: Any, client: Any, ref_class: Any) -> list[Any]:
     return []
 
 
+# The vtable slot of BigIntVal's bytes, its only field
+_BIGINT_BYTES = 4
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+# The types that travel as themselves on the path that is packed by hand. No
+# converter is asked about them: a call that carries nothing else must not pay
+# for the question.
+_PLAIN_TYPES = frozenset((int, float, bool, str, type(None)))
+
+# The registered types whose converters are running in this context. A
+# converter that passes its own argument on to Java (`LinkedHashMap(d)` in one
+# for dict) would otherwise be called for it again, without end.
+_converting: contextvars.ContextVar[frozenset[type]] = contextvars.ContextVar(
+    "gatun_converting", default=frozenset()
+)
+
+
 def _unpack_value_impl(
     val_type: int, val_table: Any, client: Any, ref_class: Any
 ) -> Any:
@@ -1524,6 +1547,20 @@ def _unpack_value_impl(
         arr_obj = ArrayVal.ArrayVal()
         arr_obj.Init(val_table.Bytes, val_table.Pos)
         return _unpack_array_impl(arr_obj, client, ref_class)
+    elif val_type == Value.Value.DecimalVal:
+        decimal_obj = DecimalVal.DecimalVal()
+        decimal_obj.Init(val_table.Bytes, val_table.Pos)
+        # The constructor is exact whatever the context's precision is
+        return decimal.Decimal(decimal_obj.V().decode("utf-8"))
+    elif val_type == Value.Value.BigIntVal:
+        tab = flatbuffers.table.Table(val_table.Bytes, val_table.Pos)
+        o = tab.Offset(_BIGINT_BYTES)
+        if o == 0:
+            return 0
+        start = tab.Vector(o)
+        return int.from_bytes(
+            tab.Bytes[start : start + tab.VectorLen(o)], "big", signed=True
+        )
 
     return None
 
@@ -2071,6 +2108,109 @@ class _ValueEncoder:
     # Wrapper classes that are sent as object references
     _object_ref_types: tuple[type, ...] = (JavaObject,)
 
+    # Converters for a program's own types, by type (register_converter). Each
+    # client has its own dict.
+    _converters: dict[type, Callable[[Any], Any]]
+    # Whether a converter may be a coroutine function: only where it is awaited
+    _awaits_converters = False
+
+    def register_converter(
+        self, python_type: type, converter: Callable[[Any], Any]
+    ) -> None:
+        """Have `converter` turn every argument of `python_type` into something
+        that can be sent, before the call is built.
+
+        A converter gets the value and returns what goes to Java in its place:
+        a Java object it made, or any value that is supported as it is. It runs
+        before the command is built, so it may call Java. It is used for
+        arguments of that type and of its subclasses (the nearest registered
+        class wins), also inside a list, a tuple or a dict, in single calls,
+        batches and the vectorized calls. What it returns is sent as it is, and
+        the calls it makes while converting a value do not convert that type.
+
+            def to_money(value):
+                return client.jvm.com.example.Money(str(value.amount), value.currency)
+
+            client.register_converter(Money, to_money)
+            client.jvm.com.example.Ledger.post(Money("9.99", "EUR"))
+
+        `int`, `float`, `bool`, `str` and `None` travel as themselves and take
+        no converter; neither do Java objects. Return values and the values a
+        callback returns are not converted.
+
+        Raises:
+            TypeError: `python_type` is not a class, or `converter` cannot be
+                called, or is a coroutine function on the sync client.
+            ValueError: the type takes no converter.
+        """
+        if not isinstance(python_type, type):
+            raise TypeError(
+                f"register_converter takes a class, got {type(python_type).__name__}: "
+                f"{python_type!r}"
+            )
+        if not callable(converter):
+            raise TypeError(f"The converter must be callable, got {converter!r}")
+        refused = None
+        if python_type in _PLAIN_TYPES or python_type is object:
+            refused = (
+                "int, float, bool, str and None travel as themselves, and a "
+                "converter for object would be one for every value"
+            )
+        elif issubclass(python_type, self._object_ref_types):
+            refused = "a Java object is sent as it is"
+        if refused:
+            raise ValueError(f"{python_type.__name__} takes no converter: {refused}")
+        if inspect.iscoroutinefunction(converter) and not self._awaits_converters:
+            raise TypeError(
+                "The sync client cannot await a converter; pass a plain function"
+            )
+        self._converters[python_type] = converter
+
+    def unregister_converter(self, python_type: type) -> None:
+        """Stop converting arguments of `python_type`. Unknown types are ignored."""
+        self._converters.pop(python_type, None)
+
+    def _converter_for(
+        self, kind: type
+    ) -> tuple[type, Callable[[Any], Any]] | tuple[None, None]:
+        """The converter for values of exactly `kind`: its own, or that of the
+        nearest base class, unless that one is running in this context."""
+        converters = self._converters
+        running = _converting.get()
+        for base in kind.__mro__:
+            converter = converters.get(base)
+            if converter is not None and base not in running:
+                return base, converter
+        return None, None
+
+    def _converted(self, value: Any) -> Any:
+        """`value` as the converters leave it. Containers are looked into."""
+        kind = type(value)
+        if kind in _PLAIN_TYPES or isinstance(value, self._object_ref_types):
+            return value
+        registered, converter = self._converter_for(kind)
+        if registered is not None and converter is not None:
+            token = _converting.set(_converting.get() | {registered})
+            try:
+                return converter(value)
+            finally:
+                _converting.reset(token)
+        # The exact types: a subclass (a JavaArray, which is a list) may mean
+        # something else on the wire, and stays as it is
+        if kind is list or kind is tuple or kind is JavaList:
+            return [self._converted(item) for item in value]
+        if kind is dict:
+            return {
+                self._converted(key): self._converted(item)
+                for key, item in value.items()
+            }
+        if kind is TypeHint:
+            return TypeHint(self._converted(value.value), value.java_type)
+        return value
+
+    def _convert_arguments(self, args: Any) -> tuple[Any, ...]:
+        return tuple([self._converted(arg) for arg in args])
+
     def _create_string(self, builder: flatbuffers.Builder, s: str) -> int:
         return cast(int, builder.CreateString(s))
 
@@ -2127,6 +2267,8 @@ class _ValueEncoder:
             BoolVal.AddV(builder, value)
             return Value.Value.BoolVal, BoolVal.End(builder)
         elif isinstance(value, int):
+            if not _INT64_MIN <= value <= _INT64_MAX:
+                return self._build_big_int(builder, value)
             IntVal.Start(builder)
             IntVal.AddV(builder, value)
             return Value.Value.IntVal, IntVal.End(builder)
@@ -2166,6 +2308,16 @@ class _ValueEncoder:
 
             NullVal.Start(builder)
             return Value.Value.NullVal, NullVal.End(builder)
+        elif isinstance(value, decimal.Decimal):
+            if not value.is_finite():
+                raise ValueError(
+                    f"Cannot send {value!r} to Java: java.math.BigDecimal has no "
+                    "NaN and no infinity"
+                )
+            text_off = self._create_string(builder, str(value))
+            DecimalVal.Start(builder)
+            DecimalVal.AddV(builder, text_off)
+            return Value.Value.DecimalVal, DecimalVal.End(builder)
         else:
             temporal = _encode_temporal(value)
             if temporal is not None:
@@ -2174,8 +2326,22 @@ class _ValueEncoder:
                 TemporalVal.AddKind(builder, kind)
                 TemporalVal.AddV(builder, temporal_value)
                 return Value.Value.TemporalVal, TemporalVal.End(builder)
-            else:
-                raise TypeError(f"Unsupported argument type: {type(value)}")
+            # The numbers of other libraries (numpy's scalars among them) say what
+            # they are by registering with these classes, so none has to be imported
+            if isinstance(value, numbers.Integral):
+                return self._build_value(builder, int(value))
+            if isinstance(value, numbers.Real):
+                return self._build_value(builder, float(value))
+            raise TypeError(f"Unsupported argument type: {type(value)}")
+
+    def _build_big_int(self, builder, value: int):
+        """Build a BigIntVal: an int that does not fit in 64 bits, as bytes."""
+        # One bit more than the magnitude needs, for the sign
+        data = value.to_bytes(value.bit_length() // 8 + 1, "big", signed=True)
+        vec_off = builder.CreateByteVector(data)
+        BigIntVal.Start(builder)
+        BigIntVal.AddV(builder, vec_off)
+        return Value.Value.BigIntVal, BigIntVal.End(builder)
 
     def _build_list(self, builder, items) -> int:
         """Build a ListVal from a list, tuple or range and return its offset.
@@ -2613,6 +2779,7 @@ class GatunClient(_ValueEncoder):
         # A callback that outlives its timeout keeps its entry until it returns, so
         # it can never send on a channel it no longer owns.
         self._callback_threads: set[int] = set()
+        self._converters = {}
 
         # Why the last connect() failed, for callers that report it
         self.connect_error: BaseException | None = None
@@ -3674,6 +3841,8 @@ class GatunClient(_ValueEncoder):
         )
         if data is not None:
             return self._send_raw(data, packed=True)
+        if self._converters:
+            args = self._convert_arguments(args)
 
         builder = self._get_builder(large=True)
         cls_off = self._create_string(builder, class_name)
@@ -3703,12 +3872,30 @@ class GatunClient(_ValueEncoder):
         # Pass bytes!
         return self._send_raw(builder.Output())
 
-    def invoke_method(self, obj_id, method_name, *args):
+    def invoke_method(
+        self, obj_id, method_name, *args, return_object_ref: bool = False
+    ):
+        """Invoke a method on a Java object.
+
+        Args:
+            obj_id: Object ID
+            method_name: Name of the method
+            *args: Arguments to pass to the method
+            return_object_ref: If True, return the result as a JavaObject
+                instead of converting it (a String, a List, a BigDecimal)
+        """
         data = wire.pack_command(
-            Act.Action.InvokeMethod, method_name, obj_id, args, self._object_ref_types
+            Act.Action.InvokeMethod,
+            method_name,
+            obj_id,
+            args,
+            self._object_ref_types,
+            return_object_ref,
         )
         if data is not None:
             return self._send_raw(data, packed=True)
+        if self._converters:
+            args = self._convert_arguments(args)
 
         builder = self._get_builder(large=True)
         meth_off = self._create_string(builder, method_name)
@@ -3734,6 +3921,8 @@ class GatunClient(_ValueEncoder):
         Cmd.CommandAddTargetName(builder, meth_off)
         if args_vec:
             Cmd.CommandAddArgs(builder, args_vec)
+        if return_object_ref:
+            Cmd.CommandAddReturnObjectRef(builder, True)
 
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
@@ -3763,6 +3952,8 @@ class GatunClient(_ValueEncoder):
         )
         if data is not None:
             return self._send_raw(data, packed=True)
+        if self._converters:
+            args = self._convert_arguments(args)
 
         builder = self._get_builder(large=True)
         name_off = self._create_string(builder, full_name)
@@ -3795,17 +3986,21 @@ class GatunClient(_ValueEncoder):
 
         return self._send_raw(builder.Output())
 
-    def get_field(self, obj_id, field_name):
+    def get_field(self, obj_id, field_name, *, return_object_ref: bool = False):
         """Get a field value from a Java object.
 
         Args:
             obj_id: Object ID (or JavaObject instance)
             field_name: Name of the field to get
+            return_object_ref: If True, return the value as a JavaObject
+                instead of converting it
         """
         if isinstance(obj_id, JavaObject):
             obj_id = obj_id.object_id
 
-        data = wire.pack_command(Act.Action.GetField, field_name, obj_id, (), ())
+        data = wire.pack_command(
+            Act.Action.GetField, field_name, obj_id, (), (), return_object_ref
+        )
         if data is not None:
             return self._send_raw(data, packed=True)
 
@@ -3816,6 +4011,8 @@ class GatunClient(_ValueEncoder):
         Cmd.CommandAddAction(builder, Act.Action.GetField)
         Cmd.CommandAddTargetId(builder, obj_id)
         Cmd.CommandAddTargetName(builder, name_off)
+        if return_object_ref:
+            Cmd.CommandAddReturnObjectRef(builder, True)
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
@@ -3837,6 +4034,8 @@ class GatunClient(_ValueEncoder):
         )
         if data is not None:
             return self._send_raw(data, packed=True)
+        if self._converters:
+            value = self._converted(value)
 
         builder = self._get_builder()
         name_off = self._create_string(builder, field_name)
@@ -3857,12 +4056,16 @@ class GatunClient(_ValueEncoder):
 
         return self._send_raw(builder.Output())
 
-    def get_static_field(self, class_name: str, field_name: str):
+    def get_static_field(
+        self, class_name: str, field_name: str, *, return_object_ref: bool = False
+    ):
         """Get a static field value from a Java class.
 
         Args:
             class_name: Fully qualified class name (e.g., "java.lang.Integer")
             field_name: Name of the static field (e.g., "MAX_VALUE")
+            return_object_ref: If True, return the value as a JavaObject
+                instead of converting it
 
         Returns:
             The field value
@@ -3872,7 +4075,9 @@ class GatunClient(_ValueEncoder):
             2147483647
         """
         full_name = f"{class_name}.{field_name}"
-        data = wire.pack_command(Act.Action.GetStaticField, full_name, 0, (), ())
+        data = wire.pack_command(
+            Act.Action.GetStaticField, full_name, 0, (), (), return_object_ref
+        )
         if data is not None:
             return self._send_raw(data, packed=True)
 
@@ -3882,6 +4087,8 @@ class GatunClient(_ValueEncoder):
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.GetStaticField)
         Cmd.CommandAddTargetName(builder, name_off)
+        if return_object_ref:
+            Cmd.CommandAddReturnObjectRef(builder, True)
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
@@ -3895,6 +4102,8 @@ class GatunClient(_ValueEncoder):
             field_name: Name of the static field
             value: Value to set
         """
+        if self._converters:
+            value = self._converted(value)
         builder = self._get_builder()
         full_name = f"{class_name}.{field_name}"
         name_off = self._create_string(builder, full_name)
@@ -4140,6 +4349,8 @@ class GatunClient(_ValueEncoder):
         # Normalize return_object_refs to a list
         if isinstance(return_object_refs, bool):
             return_object_refs = [return_object_refs] * len(calls)
+        if self._converters:
+            calls = [(name, self._convert_arguments(args)) for name, args in calls]
 
         builder = self._get_builder(large=True)
 
@@ -4213,6 +4424,8 @@ class GatunClient(_ValueEncoder):
                 ("java.util.HashMap", ()),
             ])
         """
+        if self._converters:
+            specs = [(name, self._convert_arguments(args)) for name, args in specs]
         builder = self._get_builder(large=True)
 
         # Build each ObjectSpec
@@ -5272,7 +5485,9 @@ class BatchContext:
     def __init__(self, client: GatunClient, stop_on_error: bool = False):
         self._client = client
         self._stop_on_error = stop_on_error
-        self._command_data: list[tuple[int, int, str | None, tuple]] = []
+        # action, object ID, name, arguments, whether the result is wanted as a
+        # reference
+        self._command_data: list[tuple[int, int, str | None, tuple, bool]] = []
         # Targets of queued commands. Only their IDs go into _command_data, so
         # without this a target whose last reference is dropped inside the batch
         # would be freed before the batch runs.
@@ -5301,16 +5516,24 @@ class BatchContext:
             BatchResult that will contain the JavaObject after execute().
         """
         idx = len(self._command_data)
-        self._command_data.append((Act.Action.CreateObject, 0, class_name, args))
+        self._command_data.append((Act.Action.CreateObject, 0, class_name, args, False))
         return BatchResult(self, idx)
 
-    def call(self, obj: JavaObject, method_name: str, *args) -> BatchResult:
+    def call(
+        self,
+        obj: JavaObject,
+        method_name: str,
+        *args,
+        return_object_ref: bool = False,
+    ) -> BatchResult:
         """Queue an instance method call.
 
         Args:
             obj: JavaObject to call method on.
             method_name: Name of the method to call.
             *args: Method arguments.
+            return_object_ref: If True, the result is a JavaObject instead of
+                a converted value.
 
         Returns:
             BatchResult that will contain the return value after execute().
@@ -5318,39 +5541,61 @@ class BatchContext:
         idx = len(self._command_data)
         self._targets.append(obj)
         self._command_data.append(
-            (Act.Action.InvokeMethod, obj.object_id, method_name, args)
+            (
+                Act.Action.InvokeMethod,
+                obj.object_id,
+                method_name,
+                args,
+                return_object_ref,
+            )
         )
         return BatchResult(self, idx)
 
-    def call_static(self, class_name: str, method_name: str, *args) -> BatchResult:
+    def call_static(
+        self,
+        class_name: str,
+        method_name: str,
+        *args,
+        return_object_ref: bool = False,
+    ) -> BatchResult:
         """Queue a static method call.
 
         Args:
             class_name: Fully qualified Java class name.
             method_name: Name of the static method to call.
             *args: Method arguments.
+            return_object_ref: If True, the result is a JavaObject instead of
+                a converted value.
 
         Returns:
             BatchResult that will contain the return value after execute().
         """
         idx = len(self._command_data)
         full_name = f"{class_name}.{method_name}"
-        self._command_data.append((Act.Action.InvokeStaticMethod, 0, full_name, args))
+        self._command_data.append(
+            (Act.Action.InvokeStaticMethod, 0, full_name, args, return_object_ref)
+        )
         return BatchResult(self, idx)
 
-    def get_field(self, obj: JavaObject, field_name: str) -> BatchResult:
+    def get_field(
+        self, obj: JavaObject, field_name: str, *, return_object_ref: bool = False
+    ) -> BatchResult:
         """Queue a field get operation.
 
         Args:
             obj: JavaObject to get field from.
             field_name: Name of the field.
+            return_object_ref: If True, the result is a JavaObject instead of
+                a converted value.
 
         Returns:
             BatchResult that will contain the field value after execute().
         """
         idx = len(self._command_data)
         self._targets.append(obj)
-        self._command_data.append((Act.Action.GetField, obj.object_id, field_name, ()))
+        self._command_data.append(
+            (Act.Action.GetField, obj.object_id, field_name, (), return_object_ref)
+        )
         return BatchResult(self, idx)
 
     def set_field(self, obj: JavaObject, field_name: str, value) -> BatchResult:
@@ -5367,7 +5612,7 @@ class BatchContext:
         idx = len(self._command_data)
         self._targets.append(obj)
         self._command_data.append(
-            (Act.Action.SetField, obj.object_id, field_name, (value,))
+            (Act.Action.SetField, obj.object_id, field_name, (value,), False)
         )
         return BatchResult(self, idx)
 
@@ -5402,6 +5647,13 @@ class BatchContext:
         )
         packed = data is not None
         if data is None:
+            if self._client._converters:
+                # Before the builder is taken: a converter may call Java
+                convert = self._client._convert_arguments
+                self._command_data = [
+                    (action, target_id, name, convert(args), ref)
+                    for action, target_id, name, args, ref in self._command_data
+                ]
             data = self._build()
         if len(data) > self._client.payload_offset:
             raise PayloadTooLargeError(
@@ -5470,7 +5722,7 @@ class BatchContext:
 
         # Build all sub-commands first (must be done before BatchCommand)
         sub_cmd_offsets = []
-        for action, target_id, target_name, args in self._command_data:
+        for action, target_id, target_name, args, ref in self._command_data:
             # Build argument tables
             arg_offsets = []
             for arg in args:
@@ -5498,6 +5750,8 @@ class BatchContext:
                 Cmd.CommandAddTargetName(builder, name_off)
             if args_vec:
                 Cmd.CommandAddArgs(builder, args_vec)
+            if ref:
+                Cmd.CommandAddReturnObjectRef(builder, True)
             sub_cmd_offsets.append(Cmd.CommandEnd(builder))
 
         # Build commands vector for BatchCommand

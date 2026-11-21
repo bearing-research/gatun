@@ -230,14 +230,14 @@ class TestWithFrees:
 
 
 BATCH_COMMANDS = [
-    (Action.Action.CreateObject, 0, "java.util.ArrayList", ()),
-    (INVOKE, 7, "add", ("héllo",)),
-    (INVOKE, 2**40, "set", (0, 1.5)),
-    (Action.Action.InvokeStaticMethod, 0, "java.lang.Math.max", (10, 20)),
-    (Action.Action.GetField, 7, "size", ()),
-    (Action.Action.SetField, 7, "flag", (True,)),
-    (INVOKE, 7, "add", (None,)),
-    (INVOKE, 7, "add", (Handle(99),)),
+    (Action.Action.CreateObject, 0, "java.util.ArrayList", (), False),
+    (INVOKE, 7, "add", ("héllo",), False),
+    (INVOKE, 2**40, "set", (0, 1.5), True),
+    (Action.Action.InvokeStaticMethod, 0, "java.lang.Math.max", (10, 20), True),
+    (Action.Action.GetField, 7, "size", (), False),
+    (Action.Action.SetField, 7, "flag", (True,), False),
+    (INVOKE, 7, "add", (None,), False),
+    (INVOKE, 7, "add", (Handle(99),), False),
 ]
 
 
@@ -253,9 +253,10 @@ class TestPackBatch:
         batch = outer.Batch()
         assert batch.StopOnError() is stop_on_error
         assert batch.CommandsLength() == len(BATCH_COMMANDS)
-        for index, (action, target_id, name, args) in enumerate(BATCH_COMMANDS):
+        for index, (action, target_id, name, args, ref) in enumerate(BATCH_COMMANDS):
             command = batch.Commands(index)
             assert command.Action() == action
+            assert command.ReturnObjectRef() is ref
             assert command.TargetId() == target_id
             assert command.TargetName() == name.encode()
             assert command.ArgsLength() == len(args)
@@ -267,7 +268,7 @@ class TestPackBatch:
     def test_any_number_of_commands(self):
         # The vector of commands is padded to a multiple of 8 for odd counts
         for count in range(1, 12):
-            commands = [(INVOKE, n, "n" * n, (n,)) for n in range(count)]
+            commands = [(INVOKE, n, "n" * n, (n,), False) for n in range(count)]
             batch = read_command(wire.pack_batch(commands, (), False)).Batch()
             assert batch.CommandsLength() == count
             for n in range(count):
@@ -290,10 +291,10 @@ class TestPackBatch:
     @pytest.mark.parametrize(
         "command",
         [
-            (INVOKE, 7, "add", ([1, 2],)),
-            (INVOKE, 7, "add", (2**70,)),
-            (INVOKE, 7, None, ()),
-            (INVOKE, 7, "add", (Handle(1),)),  # not given as an object type
+            (INVOKE, 7, "add", ([1, 2],), False),
+            (INVOKE, 7, "add", (2**70,), False),
+            (INVOKE, 7, None, (), False),
+            (INVOKE, 7, "add", (Handle(1),), False),  # not given as an object type
         ],
     )
     def test_one_command_for_the_builder_leaves_it_the_batch(self, command):
@@ -597,9 +598,9 @@ class TestPackedCalls:
         assert items.size() == 5
         assert items.get(3) == {"a": 1}
         assert items.get(4) == 5
-        # The builder's own refusal of an integer past 64 bits
-        with pytest.raises(TypeError, match="bad number"):
-            items.add(2**70)
+        # An integer past 64 bits is the builder's too: a BigInteger
+        items.add(2**70)
+        assert items.get(5) == 2**70
 
     def test_a_command_that_does_not_fit_is_refused(self, client):
         items = client.create_object("java.util.ArrayList")
@@ -707,7 +708,7 @@ class TestPackedCalls:
 
     def test_a_batch_that_only_the_builder_fits_in(self, client):
         items = client.create_object("java.util.ArrayList")
-        commands = [(INVOKE, items.object_id, "add", (n,)) for n in range(800)]
+        commands = [(INVOKE, items.object_id, "add", (n,), False) for n in range(800)]
         assert wire.pack_batch(commands, (JavaObject,), False) is None
 
         with client.batch() as batch:

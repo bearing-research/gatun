@@ -174,6 +174,20 @@ public final class ResourceLimits {
     }
   }
 
+  /**
+   * Check the size of an integer that arrived as bytes. It is one value, like a string, so the
+   * string limit is the one that applies.
+   */
+  public static void checkByteLength(int length) {
+    if (length > MAX_STRING_LENGTH) {
+      throw new ResourceLimitExceededException(
+          String.format(
+              "Integer too large: %d bytes (max: %d). "
+                  + "Increase gatun.limits.max_string_length if needed.",
+              length, MAX_STRING_LENGTH));
+    }
+  }
+
   /** Check collection size limit. */
   public static void checkCollectionSize(int size) {
     if (size > MAX_LIST_ENTRIES) {
