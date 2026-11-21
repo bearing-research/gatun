@@ -136,39 +136,55 @@ class TestMalformedCommandHandling:
     so they use make_client to get a fresh connection per test/example.
     """
 
-    def test_zero_length_command(self, make_client):
-        """Zero-length command should be rejected."""
+    @pytest.mark.parametrize("length", [0, 0xFFFFFFFF, 0x80000000])
+    def test_a_length_that_is_none_ends_the_session(self, make_client, length):
+        """Zero, or negative as Java reads it: the session is told and closed.
+        Whatever follows is not a length, and taking it for one would run the
+        command that is still in the command zone a second time."""
         client = make_client()
-        # Send zero length
-        client.sock.sendall(struct.pack("<I", 0))
+        items = client.create_object("java.util.ArrayList")
+        client.invoke_method(items.object_id, "add", "once")
 
-        # Server should either:
-        # 1. Send an error response
-        # 2. Close the connection
-        # Either way, the session is now broken
+        # The bad length, then four bytes that would pass for the length of
+        # the add() still lying in the command zone
+        client.sock.sendall(struct.pack("<II", length, 64))
 
-    def test_negative_length_command(self, make_client):
-        """Negative command length (as unsigned) should be handled."""
-        client = make_client()
-        # -1 as unsigned int is 0xFFFFFFFF = 4294967295
-        # This would be way larger than any zone
+        size = struct.unpack("<I", client.sock.recv(4))[0]
+        client.shm.seek(client.response_offset)
+        assert b"Invalid command size" in client.shm.read(size)
+        # The end of the stream. Linux reports it as a reset, because the
+        # server closed with the four bytes unread.
         try:
-            client.sock.sendall(struct.pack("<I", 0xFFFFFFFF))
-            # Either we get an error or connection closes
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # Expected - server rejected
+            assert client.sock.recv(4) == b""
+        except ConnectionResetError:
+            pass
+        items.detach()
 
-    def test_oversized_command(self, make_client):
-        """Command larger than command zone should be rejected."""
+        other = make_client()
+        assert other.ping() is True
+
+    def test_large_command_that_never_arrives(self, make_client):
+        """A length past the command zone announces bytes on the socket. A
+        client that sends none and goes away ends its own session only."""
         client = make_client()
-        # Command zone is 64KB (65536 bytes)
-        oversized = 100000  # 100KB
+        client.sock.sendall(struct.pack("<I", 100000))
+        client.sock.close()
 
-        try:
-            client.sock.sendall(struct.pack("<I", oversized))
-            # Server should reject this
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # Expected
+        other = make_client()
+        assert other.ping() is True
+
+    def test_command_larger_than_the_memory(self, make_client):
+        """No command is that large: the session is told and closed, since
+        whatever follows such a length is not a length."""
+        client = make_client()
+        client.sock.sendall(struct.pack("<I", client.memory_size + 1))
+        size = struct.unpack("<I", client.sock.recv(4))[0]
+        client.shm.seek(client.response_offset)
+        assert b"Invalid command size" in client.shm.read(size)
+        assert client.sock.recv(4) == b""
+
+        other = make_client()
+        assert other.ping() is True
 
     def test_truncated_flatbuffer(self, make_client):
         """Truncated FlatBuffer should be handled gracefully."""

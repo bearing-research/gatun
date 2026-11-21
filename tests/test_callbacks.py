@@ -624,18 +624,17 @@ class TestCallbackResults:
         assert items.stream().mapToLong(to_long).sum() == 14
         assert items.stream().mapToDouble(to_double).sum() == 4.0
 
-    def test_result_too_large_for_the_channel(self, client):
+    def test_result_larger_than_the_command_zone(self, client):
+        """What does not fit at all is in test_large_values.py."""
         grow = client.register_callback(
             lambda value: "z" * 70_000, "java.util.function.Function"
         )
         items = client.jvm.java.util.ArrayList()
         items.add("a")
 
-        with pytest.raises(JavaException, match="too large to return"):
-            items.stream().map(grow).toList()
-        assert client.ping() is True
+        assert items.stream().map(grow).toList() == ["z" * 70_000]
 
-    def test_arguments_too_large_for_the_channel(self, client):
+    def test_arguments_larger_than_the_response_zone(self, client):
         seen = []
         consumer = client.register_callback(seen.append, "java.util.function.Consumer")
         inner = client.jvm.java.util.ArrayList()
@@ -644,10 +643,9 @@ class TestCallbackResults:
         outer = client.jvm.java.util.ArrayList()
         outer.add(inner)
 
-        with pytest.raises(JavaException, match="more than the 65536"):
-            outer.forEach(consumer)
-        assert seen == []
-        assert client.ping() is True
+        outer.forEach(consumer)
+
+        assert seen == [["y" * 30_000] * 3]
 
 
 class TestCallbacksDuringMultiCommandRequests:
@@ -1489,7 +1487,7 @@ class TestLongExceptionChains:
             "public class Deep {\n"
             "  public static void fail(int depth) {\n"
             "    if (depth > 0) { fail(depth - 1); return; }\n"
-            "    try { inner(400); } catch (RuntimeException e) {\n"
+            "    try { inner(1500); } catch (RuntimeException e) {\n"
             '      throw new IllegalStateException("wrapper", e);\n'
             "    }\n"
             "  }\n"
@@ -1499,11 +1497,14 @@ class TestLongExceptionChains:
             "  }\n"
             "}\n",
         )
-        client = connect(memory="16MB", classpath=[classes], allowed_classes=["Deep"])
+        # The whole trace is some 150,000 characters, and a quarter of the
+        # memory is the most an error's text may take
+        client = connect(memory="192KB", classpath=[classes], allowed_classes=["Deep"])
         try:
             with pytest.raises(JavaException) as exc_info:
-                client.jvm.Deep.fail(400)
+                client.jvm.Deep.fail(1500)
             text = str(exc_info.value)
+            assert "trace shortened" in text
             assert "java.lang.IllegalStateException: wrapper" in text
             assert (
                 "Caused by: java.lang.UnsupportedOperationException: the root cause"
@@ -1524,6 +1525,18 @@ class TestJavaCallsInsideChannelCallbacks:
     def client(self, other_thread_classes):
         client = connect(
             memory="16MB",
+            classpath=[other_thread_classes],
+            allowed_classes=["OtherThread"],
+            socket_timeout=10,
+        )
+        yield client
+        client.close()
+
+    @pytest.fixture
+    def small_client(self, other_thread_classes):
+        """With the smallest memory there is, so that 200 KB is too large."""
+        client = connect(
+            memory="192KB",
             classpath=[other_thread_classes],
             allowed_classes=["OtherThread"],
             socket_timeout=10,
@@ -1704,7 +1717,9 @@ class TestJavaCallsInsideChannelCallbacks:
 
         assert client.jvm.OtherThread.call(supplier) == [3, True, "kept"]
 
-    def test_batch_whose_response_is_too_large_keeps_nothing(self, client):
+    def test_batch_whose_response_is_too_large_keeps_nothing(self, small_client):
+        client = small_client
+
         def live_objects():
             report = client.get_metrics()
             return int(report.split("current_objects:")[1].split()[0])
@@ -1716,7 +1731,7 @@ class TestJavaCallsInsideChannelCallbacks:
                 with client.batch() as b:
                     for _ in range(5):
                         b.create("java.util.ArrayList")
-                    b.call(text, "repeat", 40_000)
+                    b.call(text, "repeat", 120_000)
             except PayloadTooLargeError as e:
                 return type(e).__name__
             return "delivered"
@@ -1792,12 +1807,14 @@ class TestJavaCallsInsideChannelCallbacks:
         # And it stays registered
         assert client.jvm.OtherThread.call(made[0]) == "from the inner one"
 
-    def test_command_and_response_too_large_for_the_connection(self, client):
+    def test_command_and_response_too_large_for_the_connection(self, small_client):
+        client = small_client
+
         def too_large():
             caught = []
             for attempt in (
-                lambda: client.jvm.java.lang.String.valueOf("x" * 70_000),
-                lambda: client.jvm.java.lang.String("ab").repeat(40_000),
+                lambda: client.jvm.java.lang.String.valueOf("x" * 250_000),
+                lambda: client.jvm.java.lang.String("ab").repeat(120_000),
             ):
                 try:
                     attempt()
@@ -2094,9 +2111,12 @@ class TestJavaCallsInsideChannelCallbacks:
         ]
         assert numbers.size() == 0
 
-    def test_batch_too_large_for_the_callback_connection_was_not_executed(self, client):
-        """A command travels there wrapped, in a frame with a limit of its
-        own. Refused for that, the batch can still be executed."""
+    def test_batch_too_large_for_the_callback_connection_was_not_executed(
+        self, small_client
+    ):
+        """A command travels there wrapped, in a frame that may be as large as
+        the command itself. Refused for that, the batch can still be executed."""
+        client = small_client
         numbers = client.jvm.java.util.ArrayList()
         kept = []
 
@@ -2107,11 +2127,11 @@ class TestJavaCallsInsideChannelCallbacks:
 
         def run():
             try:
-                batch_with(70_000).execute()
+                batch_with(250_000).execute()
             except PayloadTooLargeError as e:
-                around_the_text = e.payload_size - 70_000
-            # Fits the client's command zone, and not the frame once wrapped
-            batch = batch_with(65_536 - around_the_text - 8)
+                around_the_text = e.payload_size - 250_000
+            # As large as a command may be, and too large once wrapped
+            batch = batch_with(client.max_message_size - around_the_text - 8)
             kept.append(batch)
             try:
                 batch.execute()
@@ -2121,7 +2141,7 @@ class TestJavaCallsInsideChannelCallbacks:
 
         supplier = client.register_callback(run, "java.util.function.Supplier")
 
-        assert client.jvm.OtherThread.call(supplier) == "65536 0"
+        assert client.jvm.OtherThread.call(supplier) == "196608 0"
         assert kept[0].execute() == [True]
         assert numbers.size() == 1
 

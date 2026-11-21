@@ -346,7 +346,7 @@ Java can call a callback from any thread and at any time, including when the cli
 
   They can also move Arrow tables with `arrow_to_java` and `arrow_from_java` (a `foreachBatch` function that fetches its batch, for example). The client's shared memory belongs to its own channel, so each such call gets shared memory of its own, as large as the client's, when it first moves a table; the limit on one table is the same `memory` setting. A table read in place there (`copy=False`) is good until the callback's next transfer.
 
-  `batch()`, the vectorized calls (`invoke_methods`, `create_objects`, `get_fields`), `register_callback` and `get_metrics` work there too. What such a callback cannot do is whatever goes through the client's own shared memory: the other Arrow transfers (`send_arrow_table`, `send_arrow_buffers`, `get_arrow_data`, `arrow_context`) raise `ReentrancyError`. A command or a result is limited to 64KB, a batch's results taken together; a table is not, since it does not travel in them. In the sync client a plain thread the callback starts does not inherit the route; its calls take their turn on the client's channel, as do those of a callback Java has stopped waiting for because it timed out.
+  `batch()`, the vectorized calls (`invoke_methods`, `create_objects`, `get_fields`), `register_callback` and `get_metrics` work there too. What such a callback cannot do is whatever goes through the client's own shared memory: the other Arrow transfers (`send_arrow_table`, `send_arrow_buffers`, `get_arrow_data`, `arrow_context`) raise `ReentrancyError`. A command or a result may be as large there as anywhere else (see [Large Values](#large-values)). In the sync client a plain thread the callback starts does not inherit the route; its calls take their turn on the client's channel, as do those of a callback Java has stopped waiting for because it timed out.
 
 A callback stays registered, and its function alive, for as long as it can still be called: until `unregister_callback`, the end of the session, or the moment nothing holds the proxy any more. That last one means the object `register_callback` returned has been garbage collected in Python and Java code has let go of the proxy too; the JVM's garbage collector then reports it and the client drops the function, some time later. So keep the returned object for as long as the callback should work when the Java code you give it to holds it only weakly (a registry of weak listeners). A proxy called after that throws `IllegalStateException` in the calling Java thread.
 
@@ -1118,6 +1118,26 @@ prices.get(0).getValue()                    # Decimal('9.99')
 - `int`, `float`, `bool`, `str`, `None` and Java objects take no converter. Any other type does, including one Gatun already knows (`dict`, `datetime`).
 - Return values, and the values a callback returns, are not converted. `client.unregister_converter(Money)` removes one.
 
+### Large Values
+
+A string, a `bytes`, a list or a dict of any size is an ordinary argument and an ordinary return value, up to the size of the shared memory the client connected with (`memory=`, 16 MB by default):
+
+```python
+client = connect(memory="64MB")
+
+text = "x" * 5_000_000
+builder = client.jvm.java.lang.StringBuilder(text)   # 5 MB as an argument
+builder.toString() == text                           # and as a return value
+
+client.max_message_size                              # 67108864: the memory size
+```
+
+- A command or a response of up to 64 KB is written to shared memory, as before. A larger one follows its length on the socket. Nothing else changes for the caller, and it holds for single calls, a batch (its commands taken together, and its results), the vectorized calls, callback arguments and results, both clients, and calls made inside a callback.
+- Beyond `max_message_size` a command raises `PayloadTooLargeError` before it is sent, and a response arrives as that error; the client stays usable. Connect with more memory, split the call, or move the data as Arrow.
+- The server's limits on what Python sends apply as they did: 10 MB per string (`gatun.limits.max_string_length`) and 100,000 entries per list or map (`gatun.limits.max_list_entries`) by default, raised with `extra_jvm_flags=["-Dgatun.limits.max_string_length=67108864"]`. What Java returns is bounded by the memory size alone.
+- A large value takes no room in the payload zone, so it cannot disturb an Arrow table that is lent or read in place. For bulk data Arrow remains several times faster: a value travels through the socket and is decoded element by element.
+- A Java stack trace arrives whole. It is shortened only past a megabyte, or a quarter of the memory if that is less.
+
 ## Exception Handling
 
 Java exceptions are mapped to Python exceptions:
@@ -1204,6 +1224,8 @@ Gatun uses a client-server architecture with shared memory for high-performance 
 3. Java reads command from shared memory, executes, writes response
 4. Response length sent back over socket
 5. Python reads response from shared memory
+
+A command or a response larger than its 64 KB zone is not written to shared memory: its bytes follow the length on the socket ([Large Values](#large-values)).
 
 ### Memory Layout
 

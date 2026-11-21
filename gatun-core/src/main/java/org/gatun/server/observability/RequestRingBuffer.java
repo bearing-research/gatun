@@ -84,7 +84,9 @@ public class RequestRingBuffer {
             ctx.elapsedMicros(),
             success,
             errorType,
-            errorMessage,
+            // All that a log line shows of it. The whole text can be a megabyte of stack
+            // trace, and the buffer keeps its records for the life of the session.
+            errorMessage == null ? null : RequestRecord.truncate(errorMessage, 100),
             System.nanoTime());
 
     buffer[writeIndex] = record;

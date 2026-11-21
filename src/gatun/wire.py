@@ -39,9 +39,8 @@ from gatun.generated.org.gatun.protocol import Action, Value
 COMMAND_ZONE_SIZE = 65536
 
 # The longest command packed here. Short of the zone by more than a packed
-# command's extra bytes and the wrapper a command gets inside a callback, where
-# it travels in a frame with the zone's limit (`_nested_command` in client.py):
-# what the builder could fit in a frame must not be refused for being packed.
+# command's extra bytes: what the builder fits into the command zone must not
+# be sent on the socket, as a command past the zone is, for being packed.
 _PACKED_LIMIT = COMMAND_ZONE_SIZE - 512
 
 _INT = Value.Value.IntVal
@@ -415,7 +414,7 @@ _NESTED_VTABLE_SIZE = 30
 _NO_SLOTS = bytes(14)
 
 
-def read_plain(buf: bytes, client: Any, ref_class: Any) -> Any:
+def read_plain(buf: bytes | bytearray, client: Any, ref_class: Any) -> Any:
     """The value a response holds, or NOT_PLAIN if it is anything but one value.
 
     The values read here are an integer, a string, a boolean, a double, null and
@@ -426,7 +425,9 @@ def read_plain(buf: bytes, client: Any, ref_class: Any) -> Any:
     return _plain_at(buf, _u32_at(buf, 0)[0], client, ref_class)
 
 
-def batch_values(buf: bytes, batch: int, client: Any, ref_class: Any) -> list[Any]:
+def batch_values(
+    buf: bytes | bytearray, batch: int, client: Any, ref_class: Any
+) -> list[Any]:
     """What `read_plain` makes of each response of the BatchResponse table that
     starts `batch` bytes into `buf`: its value, or NOT_PLAIN.
     """
@@ -443,7 +444,7 @@ def batch_values(buf: bytes, batch: int, client: Any, ref_class: Any) -> list[An
     return values
 
 
-def _plain_at(buf: bytes, table: int, client: Any, ref_class: Any) -> Any:
+def _plain_at(buf: bytes | bytearray, table: int, client: Any, ref_class: Any) -> Any:
     """`read_plain` for the Response table that starts `table` bytes into `buf`."""
     vtable = table - _i32(buf, table)[0]
     size = _u16(buf, vtable)[0]

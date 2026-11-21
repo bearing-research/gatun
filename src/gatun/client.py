@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
 from gatun import wire
 from gatun.callback_channel import (
-    MAX_FRAME_SIZE,
     CallbackChannel,
     CallMemory,
     ChannelCall,
@@ -161,11 +160,18 @@ def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int)
 
 # Protocol version - must match the server version
 # Version 2: Per-client shared memory (handshake includes SHM path)
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 
 # Memory zone sizes - must match GatunServer.java constants
 COMMAND_ZONE_SIZE = wire.COMMAND_ZONE_SIZE  # 64KB for commands
 RESPONSE_ZONE_SIZE = 65536  # 64KB for responses
+
+# A FlatBuffer's offsets are 32 bits, signed on the Java side. Must match
+# GatunServer.MAX_FLATBUFFER_SIZE.
+_MAX_FLATBUFFER_SIZE = 2**31 - 1 - 1024
+
+# A builder that grew past this is not kept for the next command
+_KEPT_BUILDER_SIZE = 1024 * 1024
 
 # Maximum size for callback error messages to prevent exceeding command zone.
 # Leave headroom for FlatBuffers overhead and other command fields.
@@ -228,12 +234,14 @@ class PayloadTooLargeError(Exception):
         self.payload_size = payload_size
         self.max_size = max_size
         self.zone = zone
-        # Only the payload zone grows with the memory setting; commands and
-        # responses have 64KB each whatever it is
+        # A command or a response can be as large as the shared memory, of
+        # which only the payload zone holds Arrow data
         if zone in ("Command", "Response"):
             advice = (
-                f"{zone}s are limited to this size whatever the memory setting. "
-                "Split the call, or move bulk data as Arrow."
+                f"A {zone.lower()} can be as large as the shared memory the client "
+                "connected with: connect with more "
+                "(e.g., gatun.connect(memory='256MB')), split the call, or move "
+                "bulk data as Arrow."
             )
         else:
             advice = (
@@ -510,6 +518,8 @@ def _recv_exactly(sock, n, timeout: float | None = None):
         SocketTimeoutError: If the timeout expires before receiving all bytes
         RuntimeError: If the socket closes unexpectedly
     """
+    if n > RESPONSE_ZONE_SIZE:
+        return _recv_large(sock, n, timeout)
     timeout = _usable_timeout(timeout)
 
     # Fast path: no timeout specified, use socket's existing timeout
@@ -556,6 +566,40 @@ def _recv_exactly(sock, n, timeout: float | None = None):
     finally:
         # Restore original timeout
         sock.settimeout(original_timeout)
+
+
+def _recv_large(sock, n: int, timeout: float | None = None) -> bytearray:
+    """`_recv_exactly` for a message that follows its length on the socket.
+
+    It is read into one buffer that is allocated once: `recv(n)` makes room for
+    all `n` bytes on every call, however few arrive. The timeout is for the
+    whole message, as it is there.
+    """
+    timeout = _usable_timeout(timeout)
+    data = bytearray(n)
+    view = memoryview(data)
+    got = 0
+    deadline = None if timeout is None else time.monotonic() + timeout
+    original_timeout = sock.gettimeout() if timeout is not None else None
+    try:
+        while got < n:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SocketTimeoutError(f"Timeout after receiving {got}/{n} bytes")
+                sock.settimeout(remaining)
+            try:
+                count = sock.recv_into(view[got:])
+            except TimeoutError:
+                raise SocketTimeoutError(f"Timeout after receiving {got}/{n} bytes")
+            if not count:
+                raise RuntimeError("Socket closed unexpectedly")
+            got += count
+    finally:
+        view.release()
+        if deadline is not None:
+            sock.settimeout(original_timeout)
+    return data
 
 
 class StaleArenaError(RuntimeError):
@@ -2006,7 +2050,7 @@ def _not_inside_channel_callback(what: str) -> ReentrancyError:
     )
 
 
-def _nested_command(call_id: int, data: bytes | bytearray) -> bytearray:
+def _nested_command(call_id: int, data: bytes | bytearray, limit: int) -> bytearray:
     """Wrap a command for the callback connection, or refuse it."""
     action = Cmd.Command.GetRootAsCommand(data, 0).Action()
     if action not in _NESTABLE_ACTIONS:
@@ -2021,8 +2065,8 @@ def _nested_command(call_id: int, data: bytes | bytearray) -> bytearray:
     Cmd.CommandAddNestedCommand(builder, nested)
     builder.Finish(Cmd.CommandEnd(builder))
     frame = cast(bytearray, builder.Output())
-    if len(frame) > MAX_FRAME_SIZE:
-        raise PayloadTooLargeError(len(frame), MAX_FRAME_SIZE, "Command")
+    if len(frame) > limit:
+        raise PayloadTooLargeError(len(frame), limit, "Command")
     return frame
 
 
@@ -2734,6 +2778,8 @@ class GatunClient(_ValueEncoder):
 
         # These are set during connect()
         self.memory_size = 0
+        # The largest command, response or callback frame: see max_message_size
+        self._max_message = 0
         self.command_offset = 0
         self.payload_offset = 65536  # 64KB - must match GatunServer.PAYLOAD_OFFSET
         self.response_offset = 0
@@ -2851,8 +2897,42 @@ class GatunClient(_ValueEncoder):
             pool.small = flatbuffers.Builder(256)
             pool.large = flatbuffers.Builder(1024)
             builder = pool.large if large else pool.small
+        if len(builder.Bytes) > _KEPT_BUILDER_SIZE:
+            # It keeps the buffer it grew to: one large command would cost that
+            # much memory for as long as the thread lives
+            builder = flatbuffers.Builder(1024)
+            if large:
+                pool.large = builder
+            else:
+                pool.small = builder
         builder.Clear()
         return builder
+
+    def _drop_grown_builders(self) -> None:
+        """Let go of this thread's pooled builders that a large command grew.
+
+        Called when a large command is sent: the builder that made it would
+        keep the buffer until this thread next asks for a builder of the same
+        kind, and a thread whose later calls are all packed by hand never does.
+        """
+        pool = self._builders
+        for kind, size in (("small", 256), ("large", 1024)):
+            builder = getattr(pool, kind, None)
+            if builder is not None and len(builder.Bytes) > _KEPT_BUILDER_SIZE:
+                setattr(pool, kind, flatbuffers.Builder(size))
+
+    @property
+    def max_message_size(self) -> int:
+        """The largest command or response, in bytes: the size of the shared
+        memory the client connected with (`memory=`).
+
+        One that fits its 64 KB zone of the shared memory is written there. A
+        larger one follows its length on the socket, so it touches no shared
+        memory and cannot land on an Arrow table that is lent or read in place.
+        Beyond this size a command raises PayloadTooLargeError before it is
+        sent, and a response arrives as that error.
+        """
+        return self._max_message
 
     @property
     def jvm(self):
@@ -2902,6 +2982,7 @@ class GatunClient(_ValueEncoder):
             # 2. Configure Offsets
             # Response zone size must match GatunServer.RESPONSE_ZONE_SIZE (64KB)
             self.response_offset = self.memory_size - 65536
+            self._max_message = min(self.memory_size, _MAX_FLATBUFFER_SIZE)
 
             # 3. Map Memory (session-specific SHM file created by server)
             assert self.memory_path is not None, "Memory path not set"
@@ -2999,10 +3080,11 @@ class GatunClient(_ValueEncoder):
         # 0a. Fail fast on a connection that cannot be used
         self._require_usable()
 
-        # 1. Validate command size
-        max_command_size = self.payload_offset  # Command zone ends where payload starts
-        if len(data) > max_command_size:
-            raise PayloadTooLargeError(len(data), max_command_size, "Command")
+        # 1. Validate command size. Before connect() there is no size to
+        # validate against, and _write_command says what is wrong.
+        limit = self._max_message
+        if limit and len(data) > limit:
+            raise PayloadTooLargeError(len(data), limit, "Command")
 
         if not expects_response:
             # A CallbackResponse: part of an exchange that is already under way
@@ -3086,7 +3168,9 @@ class GatunClient(_ValueEncoder):
         in which case nothing was sent and the command belongs on the client's
         own channel.
         """
-        frame = _nested_command(call.call_id, data)
+        frame = _nested_command(call.call_id, data, self._max_message)
+        if len(data) > COMMAND_ZONE_SIZE:
+            self._drop_grown_builders()
         # A callback that runs for hours would otherwise hold on to every
         # object it dropped until it returns
         if self._pending_frees:
@@ -3127,12 +3211,18 @@ class GatunClient(_ValueEncoder):
         """Write one command to shared memory and signal Java."""
         if self.shm is None:
             raise DeadConnectionError("Client is not connected")
-        # No flush: both processes map the same pages, so the bytes are visible to
-        # Java as soon as they are written, and the length sent on the socket
-        # afterwards is what orders the two. flush() is an msync of the whole
-        # mapping, a system call per command that buys nothing here.
-        self.shm.seek(self.command_offset)
-        self.shm.write(data)
+        # A command that fits the command zone goes there. A larger one follows
+        # its length on the socket, and the length is what tells Java which.
+        in_zone = len(data) <= COMMAND_ZONE_SIZE
+        if not in_zone:
+            self._drop_grown_builders()
+        if in_zone:
+            # No flush: both processes map the same pages, so the bytes are visible
+            # to Java as soon as they are written, and the length sent on the socket
+            # afterwards is what orders the two. flush() is an msync of the whole
+            # mapping, a system call per command that buys nothing here.
+            self.shm.seek(self.command_offset)
+            self.shm.write(data)
 
         # Signal Java (Send Length)
         # Verify socket is open (check None first to avoid AttributeError)
@@ -3142,6 +3232,8 @@ class GatunClient(_ValueEncoder):
 
         try:
             self.sock.sendall(struct.pack("<I", len(data)))
+            if not in_zone:
+                self.sock.sendall(data)
         except (OSError, BrokenPipeError, ConnectionResetError) as e:
             self._mark_dead()
             raise ProtocolDesyncError(f"Socket error sending command: {e}")
@@ -3370,36 +3462,35 @@ class GatunClient(_ValueEncoder):
             # 2. Validate response size before reading from SHM
             # This catches protocol desync (garbage data) early
             # On invalid size, close the connection to prevent cascading failures
-            max_response_size = self.memory_size - self.response_offset
             if sz == 0:
                 self._mark_dead()
                 raise ProtocolDesyncError(
                     "Invalid response size: 0 bytes (empty response)", response_size=sz
                 )
+            if sz > self._max_message:
+                self._mark_dead()
+                raise ProtocolDesyncError(
+                    f"Response size {sz} exceeds the largest a response can be "
+                    f"({self._max_message})",
+                    response_size=sz,
+                )
+
+            resp_buf: bytes | bytearray
             if sz > RESPONSE_ZONE_SIZE:
-                self._mark_dead()
-                raise ProtocolDesyncError(
-                    f"Response size {sz} exceeds RESPONSE_ZONE_SIZE ({RESPONSE_ZONE_SIZE})",
-                    response_size=sz,
-                )
-            if sz > max_response_size:
-                self._mark_dead()
-                raise ProtocolDesyncError(
-                    f"Response size {sz} exceeds available SHM space ({max_response_size})",
-                    response_size=sz,
-                )
+                # 3a. Too large for the response zone: it follows on the socket
+                resp_buf = self._recv_message(sz, timeout)
+            else:
+                # 3b. Read Data from SHM
+                self.shm.seek(self.response_offset)
+                resp_buf = self.shm.read(sz)
 
-            # 3. Read Data from SHM
-            self.shm.seek(self.response_offset)
-            resp_buf = self.shm.read(sz)
-
-            # Validate we got all the bytes (mmap.read can return fewer)
-            if len(resp_buf) != sz:
-                self._mark_dead()
-                raise ProtocolDesyncError(
-                    f"SHM read returned {len(resp_buf)} bytes, expected {sz}",
-                    response_size=sz,
-                )
+                # Validate we got all the bytes (mmap.read can return fewer)
+                if len(resp_buf) != sz:
+                    self._mark_dead()
+                    raise ProtocolDesyncError(
+                        f"SHM read returned {len(resp_buf)} bytes, expected {sz}",
+                        response_size=sz,
+                    )
 
             # 4. A response that is one plain value, which most are, is read
             # without the generated classes
@@ -3427,6 +3518,21 @@ class GatunClient(_ValueEncoder):
                 continue
 
             return self._parse_response(resp)
+
+    def _recv_message(self, size: int, timeout: float | None) -> bytearray:
+        """Read a response that follows its length on the socket. Anything that
+        stops the read leaves the rest of it on the way, so the client is dead."""
+        try:
+            return _recv_large(self.sock, size, timeout)
+        except SocketTimeoutError:
+            self._mark_dead()
+            raise
+        except (RuntimeError, OSError) as e:
+            self._mark_dead()
+            raise ProtocolDesyncError(f"Socket error reading response: {e}")
+        except BaseException:
+            self._mark_dead()
+            raise
 
     def _parse_response(self, resp) -> Any:
         """What a response means to the caller: its value, or its exception."""
@@ -3855,17 +3961,16 @@ class GatunClient(_ValueEncoder):
         cmd_offset = Cmd.CommandEnd(builder)
         builder.Finish(cmd_offset)
 
-        # The command zone in band, a frame on the callback connection: the
-        # same size
+        # In band or as a frame on the callback connection: the same limit
         data = bytes(builder.Output())
-        if len(data) > self.payload_offset and not is_error:
+        if len(data) > self._max_message and not is_error:
             # Java is waiting; it has to hear something that fits
             return self._build_callback_response(
                 callback_id,
                 None,
                 True,
                 f"Callback result is too large to return: {len(data):,} bytes "
-                f"exceeds the {self.payload_offset:,} bytes an answer can take",
+                f"exceeds the {self._max_message:,} bytes an answer can take",
                 call_id,
             )
         return data
@@ -5690,15 +5795,14 @@ class BatchContext:
                     for action, target_id, name, args, ref in self._command_data
                 ]
             data = self._build()
-        if len(data) > self._client.payload_offset:
-            raise PayloadTooLargeError(
-                len(data), self._client.payload_offset, "Command"
-            )
+        limit = self._client._max_message
+        if limit and len(data) > limit:
+            raise PayloadTooLargeError(len(data), limit, "Command")
         call = _channel_call_of(self._client)
         if call is not None:
-            # On the callback connection the command travels wrapped, in a
-            # frame with a limit of its own: refused here, it was not sent
-            _nested_command(call.call_id, data)
+            # On the callback connection the command travels wrapped, which
+            # adds to its size: refused here, it was not sent
+            _nested_command(call.call_id, data, limit)
 
         self._executed = True
         try:

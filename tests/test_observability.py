@@ -368,17 +368,18 @@ class TestMetricsAreRecorded:
         its response into an error, so it counted as a success."""
         from gatun import PayloadTooLargeError
 
-        client = connect()
+        # A response may be as large as the memory: the smallest there is
+        client = connect(memory="192KB")
         try:
             sb = client.create_object("java.lang.StringBuilder", "x")
             items = client.create_object("java.util.ArrayList")
             before = _metric(client.get_metrics(), "total_errors")
 
             with pytest.raises(PayloadTooLargeError):
-                client.jvm.java.util.Collections.nCopies(5000, sb)
+                client.jvm.java.util.Collections.nCopies(20_000, sb)
             with pytest.raises(PayloadTooLargeError), client.batch() as b:
                 for _ in range(40):
-                    b.call_static("java.util.Collections", "nCopies", 200, sb)
+                    b.call_static("java.util.Collections", "nCopies", 1000, sb)
                 b.call(items, "size")
 
             assert _metric(client.get_metrics(), "total_errors") == before + 2

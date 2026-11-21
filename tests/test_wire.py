@@ -16,13 +16,11 @@ import pytest
 from gatun import (
     CancelledException,
     JavaNumberFormatException,
-    PayloadTooLargeError,
     aconnect,
     connect,
     wire,
 )
-from gatun.callback_channel import MAX_FRAME_SIZE
-from gatun.client import JavaObject, TypeHint, _nested_command
+from gatun.client import JavaObject, TypeHint
 from gatun.generated.org.gatun.protocol import (
     Action,
     BatchResponse,
@@ -602,13 +600,18 @@ class TestPackedCalls:
         items.add(2**70)
         assert items.get(5) == 2**70
 
-    def test_a_command_that_does_not_fit_is_refused(self, client):
+    def test_a_command_past_the_zone_is_the_builders(self, client):
         items = client.create_object("java.util.ArrayList")
+        text = "x" * 70_000
+        assert (
+            wire.pack_command(INVOKE, "add", items.object_id, (text,), (JavaObject,))
+            is None
+        )
 
-        with pytest.raises(PayloadTooLargeError):
-            items.add("x" * 70_000)
+        items.add(text)
 
-        assert items.size() == 0
+        assert items.size() == 1
+        assert items.get(0) == text
 
     def test_mixed_with_builder_commands_on_one_client(self, client):
         items = client.create_object("java.util.ArrayList")
@@ -699,12 +702,11 @@ class TestPackedCalls:
 
         assert items.get(0) == text
 
-    def test_a_packed_command_fits_the_frame_it_gets_inside_a_callback(self):
-        """There it travels wrapped, in a frame with the command zone's limit."""
+    def test_a_packed_command_fits_the_command_zone(self):
         for length in range(64_800, 65_536, 7):
             data = wire.pack_command(INVOKE, "add", 5, ("x" * length,), (JavaObject,))
             if data is not None:
-                assert len(_nested_command(1, data)) <= MAX_FRAME_SIZE
+                assert len(data) <= wire.COMMAND_ZONE_SIZE - 512
 
     def test_a_batch_that_only_the_builder_fits_in(self, client):
         items = client.create_object("java.util.ArrayList")
@@ -717,16 +719,14 @@ class TestPackedCalls:
 
         assert items.size() == 800
 
-    def test_batch_too_large_for_a_command_is_refused(self, client):
+    def test_batch_larger_than_the_command_zone(self, client):
         items = client.create_object("java.util.ArrayList")
         batch = client.batch()
         for _ in range(100):
             batch.call(items, "add", "x" * 1000)
 
-        with pytest.raises(PayloadTooLargeError):
-            batch.execute()
-
-        assert items.size() == 0
+        assert batch.execute() == [True] * 100
+        assert items.size() == 100
 
     async def test_async_client(self):
         client = await aconnect()

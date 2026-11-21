@@ -110,7 +110,7 @@ class TestWrapperRelease:
         """The client never learns the IDs of what the batch made."""
         # The count is the whole server's, so on a server of its own: on the
         # shared one, sessions of earlier tests are still being cleaned up
-        client = connect(memory="16MB")
+        client = connect(memory="192KB")
 
         def live_objects():
             report = client.get_metrics()
@@ -123,7 +123,7 @@ class TestWrapperRelease:
             with pytest.raises(PayloadTooLargeError), client.batch() as b:
                 for _ in range(5):
                     b.create("java.util.ArrayList")
-                b.call(text, "repeat", 40_000)
+                b.call(text, "repeat", 120_000)
 
             assert live_objects() == before
         finally:
@@ -156,11 +156,13 @@ class TestWrapperRelease:
     def test_objects_in_a_response_that_is_too_large_are_released(self):
         """The client never sees the IDs in a response that did not fit, so the
         server must not keep the objects, or count them against the session."""
-        client = connect(extra_jvm_flags=["-Dgatun.limits.max_objects=50"])
+        client = connect(
+            memory="192KB", extra_jvm_flags=["-Dgatun.limits.max_objects=50"]
+        )
         try:
             sb = client.create_object("java.lang.StringBuilder", "x")
             with pytest.raises(PayloadTooLargeError):
-                client.jvm.java.util.Collections.nCopies(5000, sb)
+                client.jvm.java.util.Collections.nCopies(20_000, sb)
 
             held = [client.create_object("java.util.ArrayList") for _ in range(40)]
             assert len(held) == 40
