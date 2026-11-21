@@ -1076,12 +1076,34 @@ The server trusts the operating-system user it runs as, and nobody else:
 Inside that boundary, the allowlist is a guardrail against accidents and against class names that come from somewhere you do not control. It is not a sandbox, and with `allow_all=True` it is not there at all: what stands then is the boundary above and the four refused members.
 
 - It decides which classes can be instantiated and which static members can be used. Instance methods are open on whatever an allowed call returns, with these exceptions: objects that would undo the list (`java.lang.reflect.Method` / `Constructor` / `Field`, method handles, class loaders, `Runtime`, `Process`, `ProcessBuilder`, `Thread`, `Module`) cannot be used from Python unless you put their type in `allowed_classes`, and `System.exit`, `System.load`, `System.loadLibrary` and `Class.newInstance` are always refused.
-- Naming a class does not run its static initializer, and neither does `Class.forName` called from Python. A class is initialized when something allowed first uses it.
+- Naming a class does not run its static initializer, and neither does `Class.forName` called from Python, in either form: `Class.forName(name, true, loader)` loads the class without initializing it too. A class is initialized when something allowed first uses it: an instance is created, a static method called or a static field read or set, from Python or by Java code. A class that registers itself in its initializer is therefore not registered by `Class.forName` (a JDBC driver without a `META-INF/services/java.sql.Driver` entry, from before JDBC 4); with the class allowed, create an instance of it (`client.jvm.com.example.Driver()`), which runs the initializer.
 - Anything you allow can do what it does. The built-in `org.apache.spark.` and `scala.` prefixes, and any JAR you add, include classes that read files and start processes. Field access (`get_field`, `get_fields`) reaches non-public fields.
 
 With `allow_all=True` the first point does not apply: every class can be instantiated and every static member used, the listed types included, and only `System.exit`, `System.load`, `System.loadLibrary` and `Class.newInstance` are refused. Those four are no protection against code that means harm (`Runtime.getRuntime().halt(0)` ends the server as well); they catch the call made by mistake.
 
 Do not expose a Gatun socket to code or users you do not trust with the JVM.
+
+### Resource Limits
+
+Each session is limited in what it may hold and send. The limits are system properties of the server, read once when it starts, so they are set per server:
+
+```python
+client = connect(extra_jvm_flags=["-Dgatun.limits.max_objects=500000"])
+```
+
+| Property (`gatun.limits.`) | Default | Limits |
+|---|---|---|
+| `max_objects` | 100,000 | Java objects a session holds at once (handles not yet freed). Making one past it is refused; objects that arrive inside a returned collection or as a callback's arguments are counted without being refused, so they can take a session past it, and calls that make an object then fail until handles are freed |
+| `max_string_length` | 10,485,760 | Characters (UTF-16 units) of one string or decimal sent from Python; bytes of one big integer |
+| `max_list_entries` | 100,000 | Entries of one list or map sent from Python |
+| `max_nesting_depth` | 100 | Lists and maps inside each other, sent from Python |
+| `max_batch_size` | 10,000 | Commands in one `batch()` |
+| `max_method_calls` / `max_create_objects` | 10,000 | Entries of one `invoke_methods` / `create_objects` |
+| `max_arrow_bytes` | 1 GB | Arrow memory charged to a session: tables made by `arrow_to_java` until their handles are freed, and the payload arena since its last reset. The data of a lent table (`copy=False`) is not charged |
+| `max_sessions` | 0 (no limit) | Sessions the server serves at once |
+| `session_idle_timeout_ms` | 0 (none) | Time without activity after which a session is closed. Activity is a request ending on any of the client's channels, and an object or Arrow memory taken or released |
+
+The string, list and nesting limits apply to what Python sends: arguments, values set into fields, and what a callback answers with. The length of `bytes` and of an array is not checked against them, though each element of a `String` or `Object` array is checked like any other argument. Values Java returns are not checked against them either; they are bounded by the memory size and the largest message a session may receive. A list of a million numbers that a Java method builds comes back whole, and the same list passed back to Java is refused unless `max_list_entries` is raised.
 
 ## Supported Types
 
