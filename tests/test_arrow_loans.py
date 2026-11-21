@@ -402,6 +402,19 @@ class TestEndOfALoan:
         assert client.ping() is True
         loan.close()
 
+    def test_an_ended_loan_is_named_under_another_id(self, client):
+        """Java code can hand the lent table back under an ID of its own."""
+        loan = client.arrow_to_java(pa.table({"x": [1, 2, 3]}), copy=False)
+        holder = client.jvm.java.util.ArrayList()
+        holder.add(loan.root)
+        again = holder.get(0)
+        assert again.object_id != loan.root.object_id
+        client.reset_payload_arena()
+
+        with pytest.raises(JavaException, match="loan has ended"):
+            client.arrow_from_java(again)
+        loan.close()
+
     def test_a_closed_table_cannot_be_read_back(self, client):
         """The same for a table Java code closed: a closed table is no table."""
         root = client.arrow_to_java(pa.table({"x": [1, 2, 3]}))

@@ -4337,21 +4337,73 @@ public class GatunServer {
               + target.getClass().getName()
               + ", not an org.apache.arrow.vector.VectorSchemaRoot");
     }
-    requireReadable(targetId, table);
-    long length = arrow.writeIpcTable(table, free);
+    ArrowLoans.Loan loan = lentLoanOf(targetId, table);
+    requireReadable(targetId, table, loan);
+    long length;
+    try {
+      length = arrow.writeIpcTable(table, free);
+    } catch (RuntimeException e) {
+      // Another thread of the session may have ended the loan while it was written: its
+      // buffers then refuse to be read
+      requireNotEnded(targetId, loan);
+      throw e;
+    }
+    // Ended during the write, the stream may hold some of the table and not the rest. The loan
+    // is marked ended before anything of it is taken away, so this sees every such end.
+    requireNotEnded(targetId, loan);
     SessionObserver.recordArrowTransfer(
         sessionId, "java_to_python", table.getRowCount(), length, false);
     return length;
   }
 
   /**
-   * Refuse a table that has been closed, before it is written out. A closed table keeps its row
-   * count over vectors that hold nothing, and the stream written from it is one pyarrow refuses
-   * ("Array length did not match record batch length") without saying why. A loan that has ended
-   * closed its table, so that case is named.
+   * The loan that lent {@code table}, if Python lent it: under the ID it was lent with, or under
+   * another one (Java code that handed the table back, from a list or a method).
    */
-  private void requireReadable(long targetId, VectorSchemaRoot table) {
+  private ArrowLoans.Loan lentLoanOf(long targetId, VectorSchemaRoot table) {
     ArrowLoans.Loan loan = lentTables.get(targetId);
+    if (loan != null) {
+      return loan;
+    }
+    for (ArrowLoans.Loan other : lentTables.values()) {
+      if (other.table() == table) {
+        return other;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Refuse a table that cannot be written out as it is. A closed table keeps its row count over
+   * vectors that hold nothing, and the stream written from it is one pyarrow refuses ("Array length
+   * did not match record batch length") without saying why; so is one whose columns disagree with
+   * its row count in any other way. A table whose loan has ended was closed with it, which is
+   * named.
+   */
+  private static void requireReadable(long targetId, VectorSchemaRoot table, ArrowLoans.Loan loan) {
+    requireNotEnded(targetId, loan);
+    int rows = table.getRowCount();
+    for (FieldVector vector : table.getFieldVectors()) {
+      if (vector.getValueCount() != rows) {
+        throw new IllegalStateException(
+            "Object "
+                + targetId
+                + " is a table whose column "
+                + vector.getName()
+                + " holds "
+                + vector.getValueCount()
+                + " values for its "
+                + rows
+                + " rows: "
+                + (vector.getValueCount() < rows
+                    ? "it has been closed, or its row count set past its data"
+                    : "its row count was not set to its data")
+                + ". A stream written from it would not be read");
+      }
+    }
+  }
+
+  private static void requireNotEnded(long targetId, ArrowLoans.Loan loan) {
     if (loan != null && loan.ended()) {
       throw new IllegalStateException(
           "Object "
@@ -4359,21 +4411,6 @@ public class GatunServer {
               + " is a table Python lent to Java, and its loan has ended (the block or"
               + " reset_payload_arena() ended it, or the thread that lent it): it can no longer"
               + " be read. Read it while the loan lasts, or send a copy (copy=True)");
-    }
-    int rows = table.getRowCount();
-    for (FieldVector vector : table.getFieldVectors()) {
-      if (vector.getValueCount() < rows) {
-        throw new IllegalStateException(
-            "Object "
-                + targetId
-                + " is a table that has been closed: its "
-                + rows
-                + " rows are gone (column "
-                + vector.getName()
-                + " holds "
-                + vector.getValueCount()
-                + ")");
-      }
     }
   }
 
