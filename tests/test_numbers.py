@@ -545,12 +545,34 @@ class TestNumbersOfOtherLibraries:
         assert numbers.describe(np.bool_(True)) == "java.lang.Boolean true"
         assert numbers.echo(np.bool_(False)) is False
         assert numbers.echo([np.bool_(True), np.bool_(False)]) == [True, False]
-        assert numbers.echo(np.array(True)) is True
 
-    def test_an_array_of_bools_is_still_refused(self, numbers):
-        """`bool()` of an array with several elements is an error, not a value."""
+    @pytest.mark.parametrize(
+        "value",
+        [
+            np.array([True, False]),
+            np.array(True),
+            np.ma.array(True, mask=True),
+        ],
+        ids=["array", "0-d array", "masked"],
+    )
+    def test_an_array_of_bools_is_still_refused(self, numbers, value):
+        """Only the scalar: a masked value must not arrive as its data, and an
+        array of several has no one value."""
         with pytest.raises(TypeError, match="Unsupported argument type"):
-            numbers.describe(np.array([True, False]))
+            numbers.describe(value)
+
+    def test_a_class_handle_asks_java_nothing(self, client):
+        """A handle's attribute lookup asks Java; encoding an argument must not."""
+        ArrayList = client.jvm.java.util.ArrayList
+        asked = []
+        reflect = client._reflect_cached
+        client._reflect_cached = lambda *a, **k: asked.append(a) or reflect(*a, **k)
+        try:
+            with pytest.raises(TypeError, match="Unsupported argument type"):
+                client.jvm.java.lang.String.valueOf(ArrayList)
+        finally:
+            del client._reflect_cached
+        assert not [a for a in asked if "dtype" in str(a)]
 
     def test_a_fraction_is_a_real_number(self, numbers):
         assert numbers.which(fractions.Fraction(1, 2)) == "double"

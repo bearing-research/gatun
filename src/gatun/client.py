@@ -498,6 +498,27 @@ def _java_exception(
     return exc_class(error_type, message, error_msg, java_exception)
 
 
+def _is_bool_scalar(value) -> bool:
+    """numpy's bool, which registers with neither `numbers.Integral` nor
+    `numbers.Real`, recognized without importing numpy: a type with a `dtype`
+    of kind "b" that is not an array (arrays, masked ones among them, define
+    `__array_finalize__`; a masked value must not arrive as its data).
+
+    The attributes are looked up on the type first. On a class handle
+    (`client.jvm.java.util.ArrayList`) an instance lookup goes to its
+    `__getattr__`, which asks Java, and `_build_value` must make no Java call.
+    """
+    kind_of = type(value)
+    if getattr(kind_of, "dtype", None) is None or hasattr(
+        kind_of, "__array_finalize__"
+    ):
+        return False
+    try:
+        return bool(value.dtype.kind == "b")
+    except Exception:  # noqa: BLE001 - not a value this can send, whatever it raised
+        return False
+
+
 class SocketTimeoutError(Exception):
     """Raised when a socket read times out."""
 
@@ -2448,10 +2469,7 @@ class _ValueEncoder:
                 return self._build_value(builder, int(value))
             if isinstance(value, numbers.Real):
                 return self._build_value(builder, float(value))
-            # numpy's bool registers with neither, so it is known by its dtype
-            # (a 0-d array of bools too); an array of several has no one value
-            dtype = getattr(value, "dtype", None)
-            if getattr(dtype, "kind", None) == "b" and getattr(value, "ndim", 1) == 0:
+            if _is_bool_scalar(value):
                 return self._build_value(builder, bool(value))
             raise TypeError(f"Unsupported argument type: {type(value)}")
 
