@@ -1,24 +1,44 @@
 """Integration tests for Spark with Gatun.
 
-These tests verify that Gatun can load and use Apache Spark classes.
-Tests are skipped if Spark is not installed.
+These tests verify that Gatun can load and use Apache Spark classes, on
+whatever Spark 4 they find. Tests are skipped if there is none.
 """
 
 import glob
+import importlib.util
+import os
 from pathlib import Path
 
 import pytest
 
-from gatun import connect
+from gatun import JavaNoSuchMethodException, connect
 
-# Find Spark installation
 PROJECT_ROOT = Path(__file__).parent.parent
-SPARK_HOME = PROJECT_ROOT / "spark-4.1.1-bin-hadoop3"
+
+
+def find_spark_jars() -> Path | None:
+    """Spark's `jars` directory: of $SPARK_HOME, of a distribution extracted
+    in the repository root, or of an installed pyspark, in that order."""
+    candidates = []
+    if os.environ.get("SPARK_HOME"):
+        candidates.append(Path(os.environ["SPARK_HOME"]) / "jars")
+    candidates += sorted(PROJECT_ROOT.glob("spark-*-bin-*/jars"), reverse=True)
+    pyspark = importlib.util.find_spec("pyspark")
+    if pyspark is not None and pyspark.origin:
+        candidates.append(Path(pyspark.origin).parent / "jars")
+    for jars in candidates:
+        if any(jars.glob("spark-core_*.jar")):
+            return jars
+    return None
+
+
+SPARK_JARS = find_spark_jars()
 
 # Skip all tests in this module if Spark is not found
 pytestmark = pytest.mark.skipif(
-    not SPARK_HOME.exists(),
-    reason=f"Spark not found at {SPARK_HOME}. Extract spark-4.1.1-bin-hadoop3.tgz to run these tests.",
+    SPARK_JARS is None,
+    reason="Spark not found. Set SPARK_HOME, extract a Spark 4 distribution "
+    "(spark-4.1.1-bin-hadoop3.tgz) in the repository root, or install pyspark.",
 )
 
 
@@ -79,7 +99,14 @@ def arrow_from_dataframe(client, df):
 
     jvm = client.jvm
     arrow_utils = jvm.org.apache.spark.sql.util.ArrowUtils
-    arrow_schema = arrow_utils.toArrowSchema(df.schema(), "UTC", True, False)
+    # (schema, timeZoneId, errorOnDuplicatedFieldNames, largeVarTypes), and from
+    # Spark 4.3 a fifth, losslessInternalTypes, whose default is false. These
+    # are Spark's internals, and Scala's default arguments do not exist for a
+    # caller that is not Scala.
+    try:
+        arrow_schema = arrow_utils.toArrowSchema(df.schema(), "UTC", True, False)
+    except JavaNoSuchMethodException:
+        arrow_schema = arrow_utils.toArrowSchema(df.schema(), "UTC", True, False, False)
     allocator = arrow_utils.rootAllocator()
     root = jvm.org.apache.arrow.vector.VectorSchemaRoot.create(arrow_schema, allocator)
     loader = jvm.org.apache.arrow.vector.VectorLoader(root)
@@ -109,8 +136,7 @@ def arrow_from_dataframe(client, df):
 
 def get_spark_jars() -> list[str]:
     """Get all JAR files from Spark's jars directory."""
-    jars_dir = SPARK_HOME / "jars"
-    return glob.glob(str(jars_dir / "*.jar"))
+    return glob.glob(str(SPARK_JARS / "*.jar"))
 
 
 @pytest.fixture(scope="module")

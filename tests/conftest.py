@@ -33,7 +33,17 @@ def java_gateway():
 
     # 2. Launch (Configuration Phase)
     # We pass the path as a string because the Popen/Java args expect strings
-    session = launch_gateway(memory="64MB", socket_path=str(socket_path))
+    # GATUN_TEST_CLASSPATH runs the suite's server on a classpath of the caller's
+    # choosing, e.g. Spark's `jars/*`: with an Arrow there the server is the thin
+    # JAR and every Arrow test exercises that Arrow instead of the bundled one
+    classpath = [
+        entry
+        for entry in os.environ.get("GATUN_TEST_CLASSPATH", "").split(os.pathsep)
+        if entry
+    ]
+    session = launch_gateway(
+        memory="64MB", socket_path=str(socket_path), classpath=classpath or None
+    )
 
     yield session
 

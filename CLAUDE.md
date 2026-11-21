@@ -74,7 +74,8 @@ Prerequisites: `flatc` on `PATH` (`brew install flatbuffers`) and a JDK 22+. `JA
 - There are no Java unit tests. All Java behavior is exercised through pytest against the packaged JAR in `src/gatun/jars/`, so after editing Java or the schema you must run `uv sync --reinstall-package gatun` before tests will see the change. A plain `uv sync` does not rebuild.
 - `tests/conftest.py` starts one server per pytest session on a fixed socket (`<tmpdir>/gatun_test.sock`, 64MB), so two pytest runs cannot overlap on one machine. The `client` fixture gives each test a fresh connection to it; `make_client` is a factory for tests that need several connections in sequence.
 - Tests that need non-default server settings (`test_resource_limits.py`, `test_observability.py`, `test_connect.py`) launch their own server via `connect(...)` instead of using the fixtures.
-- `tests/test_spark_integration.py` is skipped unless a Spark distribution is extracted at `spark-4.1.1-bin-hadoop3/` in the repo root (gitignored).
+- `tests/test_spark_integration.py` runs on the Spark it finds and is skipped when there is none (`find_spark_jars`): `$SPARK_HOME`, a distribution extracted in the repo root (`spark-*-bin-*/`, gitignored), or an installed `pyspark`, in that order. CI's `spark` job installs `pyspark` 4.1.1 and 4.3.0.
+- `GATUN_TEST_CLASSPATH` (entries joined with `:`; `dir/*` is every JAR in a directory) puts the test session's server on a classpath. With Spark's `jars/*` the server is the thin JAR on Spark's Arrow, and the whole suite runs on it; CI's `spark` job does that.
 - `tests/test_readme_examples.py` mirrors the README examples; keep the two in step.
 - `asyncio_mode = "auto"`: async tests need no marker.
 
@@ -87,6 +88,7 @@ Coverage reports are generated automatically:
 ```bash
 ./gradlew :gatun-core:build          # Build the Java server
 ./gradlew :gatun-core:shadowJar      # Build fat JAR (gatun-server-all.jar)
+./gradlew :gatun-core:thinJar        # Build thin JAR (gatun-server-thin.jar), for a classpath with its own Arrow
 ./gradlew :gatun-core:run            # Run the server directly
 ./gradlew spotlessApply              # Format Java (google-java-format); spotlessCheck to verify
 ```
@@ -101,11 +103,19 @@ Both directories are gitignored, as is the built JAR in `src/gatun/jars/` — ne
 
 `gatun_build_backend.py` is a PEP 517 backend wrapping setuptools. On every wheel/sdist/editable build it:
 1. Runs `flatc` if the schema is newer than the generated files (mtime comparison), then patches the output: Python imports are rewritten from `org.gatun.protocol.*` to `gatun.generated.org.gatun.protocol.*`, and the Java `ValidateVersion()` call is rewritten to `FLATBUFFERS_RUNTIME_VERSION`.
-2. Runs `./gradlew :gatun-core:shadowJar` if any file under `gatun-core/src` or `gatun-core/build.gradle.kts` is newer than the packaged JAR, and copies the result to `src/gatun/jars/gatun-server-all.jar`.
+2. Runs `./gradlew :gatun-core:shadowJar :gatun-core:thinJar` if any file under `gatun-core/src` or `gatun-core/build.gradle.kts` is newer than the packaged JARs, and copies the results to `src/gatun/jars/` (`gatun-server-all.jar`, `gatun-server-thin.jar`).
 
 `FLATBUFFERS_RUNTIME_VERSION` in the backend must match the `flatbuffers-java` version in `gatun-core/build.gradle.kts`; bump them together.
 
-The shadow JAR relocates Netty (`gatun.shaded.io.netty`) so it can coexist with Spark's Netty, and pins Jackson to Spark 4.x's version unshaded so the two share classes. Keep that in mind when changing Java dependencies. The relocation renames Netty's system properties too: the server's Netty reads `gatun.shaded.io.netty.*` (`DEFAULT_JVM_FLAGS` in `launcher.py` passes `tryReflectionSetAccessible` under both names, the plain one for a Netty on the classpath). With it the server's Arrow memory is counted by Netty (`gatun.shaded.io.netty.maxDirectMemory`), not by the JVM's direct memory limit.
+There are two server JARs, and the launcher picks one per server (`_server_jar` in `launcher.py`):
+- **The fat JAR** (`gatun-server-all.jar`) has everything: the server, Arrow, and Arrow's Netty and Jackson, both relocated (`gatun.shaded.io.netty`, `gatun.shaded.com.fasterxml.jackson`), so neither is in front of a Netty or Jackson on the classpath. It is used when the classpath has no Arrow, which includes no classpath at all.
+- **The thin JAR** (`gatun-server-thin.jar`) is the server's own classes and nothing else. It is used when the classpath brings Arrow (Spark's does), and the server then runs on that Arrow, with that Arrow's Netty, Jackson and FlatBuffers. In front of such a classpath the fat JAR's Arrow would shadow the classpath's class by class, and Spark 4.3 (Arrow 19, Jackson 2.21) fails on it.
+- Arrow itself cannot be relocated: Java code on the classpath has to receive the `VectorSchemaRoot` that `arrow_to_java()` makes, as its own class. FlatBuffers cannot be relocated in the thin JAR either: `ArrowMemoryHandler` and `ArrowLoans` read Arrow's own messages (`org.apache.arrow.flatbuf`), which extend that library's `Table`.
+- "Brings Arrow" means the classpath has one class of each library the server's code needs (`_HOST_ARROW_CLASSES`: arrow-vector, arrow-memory-core, arrow-memory-netty, Netty's buffers, FlatBuffers). The launcher reads each JAR's central directory as bytes and looks for the entry (`_central_directory`, `_jar_has`); `zipfile` would build an object for each of a quarter of a million entries. A classpath with Arrow but not all of that gets the fat JAR and a warning.
+- The server is compiled against the Arrow in `build.gradle.kts` (18.3.0) and runs on the classpath's, so it must keep to Arrow API that the supported Spark versions share. CI runs the Spark tests and the Arrow tests on Spark 4.1.1 (Arrow 18.3) and 4.3.0 (Arrow 19): `GATUN_TEST_CLASSPATH` puts the test session's server on a classpath.
+- The server's generated protocol classes never call `ValidateVersion()`, so on the thin JAR they run on whatever FlatBuffers the classpath's Arrow needs.
+
+Keep all of that in mind when changing Java dependencies. The relocation renames Netty's system properties too: the fat JAR's Netty reads `gatun.shaded.io.netty.*` (`DEFAULT_JVM_FLAGS` in `launcher.py` passes `tryReflectionSetAccessible` under both names, the plain one for a Netty on the classpath, which is also the thin JAR's). With it the server's Arrow memory is counted by Netty (`gatun.shaded.io.netty.maxDirectMemory`, or `io.netty.maxDirectMemory` on the thin JAR), not by the JVM's direct memory limit.
 
 ## Key Implementation Details
 
@@ -821,7 +831,7 @@ memory = "64MB"                  # KB/MB/GB, a fraction ("1.5GB") or bytes; mini
 socket_path = "/tmp/gatun.sock"  # Optional: fixed path instead of random
 jvm_flags = ["-Xmx512m"]         # Appended to the launcher's default flags
 connect_timeout = 5.0            # seconds
-startup_timeout = 5.0            # seconds to wait for the server socket
+startup_timeout = 30.0           # seconds to wait for the server socket (the default)
 allowed_prefixes = ["com.example"]  # added to the built-in class allowlist
 allow_all = false                # true lifts the class allowlist
 ```
@@ -879,7 +889,7 @@ bridge.unregister_callback(comparator)
 `gatun.bridge.JavaException` and its subclasses are the client's classes (imported, not defined again), so the adapter converts nothing: the objects it returns are the client's `JavaObject`s, and a method called on one raises the client's exception whatever the bridge defines.
 
 ### PySpark Usage
-Nothing in this repo or in stock PySpark switches PySpark over to Gatun; there is no `PYSPARK_USE_GATUN` switch. Running PySpark on Gatun needs a PySpark build ported to the `BridgeAdapter` interface (`docs/bridge_adapter_spec.md`). What this repo tests is driving Spark's JVM classes directly via `connect(classpath=<spark jars>)` (`tests/test_spark_integration.py`), which needs a JDK Spark supports: it passes on 22 and fails on 27. That file's `dataframe_from_arrow` / `arrow_from_dataframe` helpers show a pyarrow table becoming a Spark DataFrame and a query result coming back as Arrow, through `arrow_to_java_batches` / `arrow_from_java` and Spark-internal converters (`ArrowConverters.toDataFrame`, `Dataset.toArrowBatchRdd`).
+Nothing in this repo or in stock PySpark switches PySpark over to Gatun; there is no `PYSPARK_USE_GATUN` switch. Running PySpark on Gatun needs a PySpark build ported to the `BridgeAdapter` interface (`docs/bridge_adapter_spec.md`). What this repo tests is driving Spark's JVM classes directly via `connect(classpath=<spark jars>)` (`tests/test_spark_integration.py`, on Spark 4.1.1 and 4.3.0 in CI), which needs a JDK Spark supports: it passes on 22 and fails on 27. The server runs on Spark's own Arrow there (see Generated Code for the two JARs). That file's `dataframe_from_arrow` / `arrow_from_dataframe` helpers show a pyarrow table becoming a Spark DataFrame and a query result coming back as Arrow, through `arrow_to_java_batches` / `arrow_from_java` and Spark-internal converters (`ArrowConverters.toDataFrame`, `Dataset.toArrowBatchRdd`).
 
 ## Logging
 

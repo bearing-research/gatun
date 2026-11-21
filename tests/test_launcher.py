@@ -226,6 +226,197 @@ class TestMemorySize:
             assert items.get(0) == "x" * 1000
 
 
+ARROW_AND_FRIENDS = [name.decode() for name in launcher._HOST_ARROW_CLASSES]
+
+
+def make_jar(path, names, **zip_options):
+    """A JAR with empty entries of these names."""
+    import zipfile
+
+    with zipfile.ZipFile(path, "w", **zip_options) as jar:
+        jar.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+        for name in names:
+            jar.writestr(name, b"")
+    return str(path)
+
+
+class TestServerJar:
+    """Which JAR the server starts from: the fat one, or on a classpath that
+    brings Arrow, the thin one that uses that Arrow."""
+
+    def test_no_classpath(self):
+        assert launcher._server_jar(None) == launcher.JAR_PATH
+        assert launcher._server_jar([]) == launcher.JAR_PATH
+
+    def test_both_jars_are_packaged(self):
+        assert launcher.JAR_PATH.exists()
+        assert launcher.THIN_JAR_PATH.exists()
+
+    def test_the_thin_jar_is_the_servers_classes_alone(self):
+        import zipfile
+
+        with zipfile.ZipFile(launcher.THIN_JAR_PATH) as jar:
+            names = [n for n in jar.namelist() if n.endswith(".class")]
+        assert "org/gatun/server/GatunServer.class" in names
+        assert all(name.startswith("org/gatun/") for name in names)
+
+    def test_the_fat_jar_has_no_jackson_or_netty_under_their_own_names(self):
+        import zipfile
+
+        with zipfile.ZipFile(launcher.JAR_PATH) as jar:
+            names = jar.namelist()
+        assert "org/apache/arrow/vector/VectorSchemaRoot.class" in names
+        assert not [n for n in names if n.startswith(("com/fasterxml/", "io/netty/"))]
+        assert not [
+            n
+            for n in names
+            if n.startswith("META-INF/versions/")
+            and n.endswith(".class")
+            and "/gatun/shaded/" not in n
+        ]
+
+    def test_classpath_with_arrow_in_several_jars(self, tmp_path):
+        jars = [
+            make_jar(tmp_path / f"lib{n}.jar", [name, f"other/Thing{n}.class"])
+            for n, name in enumerate(ARROW_AND_FRIENDS)
+        ]
+        other = make_jar(tmp_path / "app.jar", ["com/example/App.class"])
+
+        assert launcher._server_jar([other, *jars]) == launcher.THIN_JAR_PATH
+
+    def test_classpath_with_arrow_in_one_jar_of_any_name(self, tmp_path):
+        uber = make_jar(tmp_path / "application.jar", ARROW_AND_FRIENDS)
+
+        assert launcher._server_jar([uber]) == launcher.THIN_JAR_PATH
+
+    def test_classpath_without_arrow(self, tmp_path):
+        jar = make_jar(tmp_path / "app.jar", ["com/example/App.class"])
+
+        assert launcher._server_jar([jar]) == launcher.JAR_PATH
+
+    @pytest.mark.parametrize("left_out", ARROW_AND_FRIENDS[1:])
+    def test_arrow_without_something_it_needs(self, tmp_path, caplog, left_out):
+        """The thin JAR could not run there, so the fat one does, and says so."""
+        names = [name for name in ARROW_AND_FRIENDS if name != left_out]
+        jar = make_jar(tmp_path / "arrow-vector.jar", names)
+
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            assert launcher._server_jar([jar]) == launcher.JAR_PATH
+        assert left_out in caplog.text
+
+    def test_no_warning_without_arrow(self, tmp_path, caplog):
+        """Netty and FlatBuffers alone are nobody's Arrow."""
+        jar = make_jar(tmp_path / "netty-buffer.jar", ARROW_AND_FRIENDS[3:])
+
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            assert launcher._server_jar([jar]) == launcher.JAR_PATH
+        assert caplog.text == ""
+
+    def test_a_relocated_arrow_is_not_arrow(self, tmp_path):
+        relocated = make_jar(
+            tmp_path / "shaded.jar",
+            [f"shaded/{name}" for name in ARROW_AND_FRIENDS]
+            + [f"META-INF/versions/17/{name}" for name in ARROW_AND_FRIENDS],
+        )
+
+        assert launcher._server_jar([relocated]) == launcher.JAR_PATH
+
+    def test_wildcard_entry(self, tmp_path):
+        """`dir/*` is every JAR in the directory, as it is for the JVM."""
+        make_jar(tmp_path / "all.jar", ARROW_AND_FRIENDS)
+        (tmp_path / "notes.txt").write_text("not a jar")
+
+        assert launcher._server_jar([f"{tmp_path}/*"]) == launcher.THIN_JAR_PATH
+        assert launcher._server_jar([str(tmp_path)]) == launcher.JAR_PATH
+
+    def test_directory_of_classes(self, tmp_path):
+        for name in ARROW_AND_FRIENDS:
+            target = tmp_path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"")
+
+        assert launcher._server_jar([str(tmp_path)]) == launcher.THIN_JAR_PATH
+
+    def test_entries_joined_with_the_path_separator(self, tmp_path):
+        first = make_jar(tmp_path / "a.jar", ARROW_AND_FRIENDS[:2])
+        second = make_jar(tmp_path / "b.jar", ARROW_AND_FRIENDS[2:])
+
+        assert (
+            launcher._server_jar([first + os.pathsep + second])
+            == launcher.THIN_JAR_PATH
+        )
+
+    def test_entries_that_are_missing_or_no_jar(self, tmp_path):
+        text = tmp_path / "readme.jar"
+        text.write_text("PK is not enough to make a zip file " * 10)
+        empty = tmp_path / "empty.jar"
+        empty.write_bytes(b"")
+        real = make_jar(tmp_path / "real.jar", ARROW_AND_FRIENDS)
+
+        classpath = [str(tmp_path / "missing.jar"), str(text), str(empty)]
+        assert launcher._server_jar(classpath) == launcher.JAR_PATH
+        assert launcher._server_jar([*classpath, real]) == launcher.THIN_JAR_PATH
+
+    def test_jar_with_a_comment_and_many_entries(self, tmp_path):
+        import zipfile
+
+        path = tmp_path / "big.jar"
+        with zipfile.ZipFile(path, "w") as jar:
+            for n in range(3000):
+                jar.writestr(f"com/example/pkg{n % 50}/Class{n}.class", b"")
+            for name in ARROW_AND_FRIENDS:
+                jar.writestr(name, b"")
+            jar.comment = b"c" * 5000
+
+        assert launcher._server_jar([str(path)]) == launcher.THIN_JAR_PATH
+
+    def test_zip64_jar(self, tmp_path):
+        """More than 65,535 entries: the directory's place is in a second record."""
+        import zipfile
+
+        path = tmp_path / "huge.jar"
+        with zipfile.ZipFile(path, "w") as jar:
+            for n in range(66_000):
+                jar.writestr(f"p/C{n}.class", b"")
+            for name in ARROW_AND_FRIENDS:
+                jar.writestr(name, b"")
+
+        directory = launcher._central_directory(str(path))
+        assert launcher._jar_has(directory, b"p/C65999.class")
+        assert not launcher._jar_has(directory, b"p/C66000.class")
+        assert launcher._server_jar([str(path)]) == launcher.THIN_JAR_PATH
+
+    def test_the_directory_search_agrees_with_zipfile(self):
+        """On a real JAR, with thousands of entries: every name is found, and
+        no part of a name is taken for one."""
+        import zipfile
+
+        directory = launcher._central_directory(str(launcher.JAR_PATH))
+        with zipfile.ZipFile(launcher.JAR_PATH) as jar:
+            names = jar.namelist()
+
+        assert len(names) > 1000
+        assert all(launcher._jar_has(directory, name.encode()) for name in names)
+        assert not launcher._jar_has(
+            directory, b"apache/arrow/vector/VectorSchemaRoot.class"
+        )
+        assert not launcher._jar_has(
+            directory, b"org/apache/arrow/vector/VectorSchemaRoot"
+        )
+
+    def test_the_thin_jar_is_what_starts(self, tmp_path, started_processes):
+        uber = make_jar(tmp_path / "application.jar", ARROW_AND_FRIENDS)
+
+        # Empty classes: the server cannot start on this classpath
+        with pytest.raises(RuntimeError, match="failed to start"):
+            launch_gateway(classpath=[uber])
+
+        (process,) = started_processes
+        command = process.args
+        classpath = command[command.index("-cp") + 1].split(os.pathsep)
+        assert classpath == [str(launcher.THIN_JAR_PATH), uber]
+
+
 class TestSignalHandlers:
     @pytest.fixture(autouse=True)
     def _restore_handlers(self, monkeypatch):

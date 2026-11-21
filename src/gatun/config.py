@@ -48,7 +48,11 @@ class GatunConfig:
 
     # Timeouts
     connect_timeout: float = 5.0  # seconds
-    startup_timeout: float = 5.0  # seconds
+    # Seconds to wait for the server's socket. It only bounds a server that
+    # neither listens nor exits: one that exits is reported at once. A JVM with
+    # a few hundred JARs on its classpath (Spark's) needs more than five seconds
+    # to get there on a small machine.
+    startup_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         # Expand ~ in socket_path

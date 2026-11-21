@@ -7,6 +7,7 @@ import secrets
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -22,6 +23,19 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 MODULE_DIR = Path(__file__).parent.resolve()
 JAR_PATH = MODULE_DIR / "jars" / "gatun-server-all.jar"
+# The server without Arrow, Netty and Jackson: see _server_jar
+THIN_JAR_PATH = MODULE_DIR / "jars" / "gatun-server-thin.jar"
+
+# One class from each library the server's own code uses and the thin JAR
+# leaves out: Arrow's vectors, its memory, its Netty allocator, Netty, and
+# FlatBuffers
+_HOST_ARROW_CLASSES = (
+    b"org/apache/arrow/vector/VectorSchemaRoot.class",
+    b"org/apache/arrow/memory/BufferAllocator.class",
+    b"org/apache/arrow/memory/netty/NettyAllocationManager.class",
+    b"io/netty/buffer/PooledByteBufAllocator.class",
+    b"com/google/flatbuffers/Table.class",
+)
 
 # The shared memory holds the command zone, the payload zone and the response
 # zone. A size that leaves no payload zone makes the response zone overlap the
@@ -100,6 +114,125 @@ DEFAULT_JVM_FLAGS = [
     "-Dio.netty.tryReflectionSetAccessible=true",
     "-Dgatun.shaded.io.netty.tryReflectionSetAccessible=true",
 ]
+
+
+_LIKELY_JAR = re.compile("arrow|netty|flatbuffers", re.IGNORECASE)
+
+
+def _central_directory(path: str) -> bytes:
+    """The central directory of a JAR: the part that lists its entries.
+
+    Read whole and searched as bytes (`_jar_has`). Going through `zipfile`
+    builds an object per entry, and a Spark classpath has some 280 JARs with
+    a quarter of a million entries between them.
+    """
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        # The record that ends the file, behind a comment of at most 64 KB
+        tail_size = min(size, 22 + 65535)
+        f.seek(size - tail_size)
+        tail = f.read(tail_size)
+        end = tail.rfind(b"PK\x05\x06")
+        if end < 0 or end + 22 > len(tail):
+            return b""
+        cd_size, cd_offset = struct.unpack_from("<II", tail, end + 12)
+        if cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+            # Zip64: the real numbers are in a record that a locator, right
+            # before this one, points to
+            locator = end - 20
+            if locator < 0 or tail[locator : locator + 4] != b"PK\x06\x07":
+                return b""
+            (record_offset,) = struct.unpack_from("<Q", tail, locator + 8)
+            f.seek(record_offset)
+            record = f.read(56)
+            if len(record) < 56 or record[:4] != b"PK\x06\x06":
+                return b""
+            cd_size, cd_offset = struct.unpack_from("<QQ", record, 40)
+        f.seek(cd_offset)
+        return f.read(cd_size)
+
+
+def _jar_has(directory: bytes, name: bytes) -> bool:
+    """Whether a central directory lists exactly this entry."""
+    at = directory.find(name)
+    while at >= 0:
+        # An entry's name follows its 46-byte header, which gives its length;
+        # without this a relocated copy (shaded/org/apache/arrow/...) would do
+        header = at - 46
+        if (
+            header >= 0
+            and directory[header : header + 4] == b"PK\x01\x02"
+            and struct.unpack_from("<H", directory, header + 28)[0] == len(name)
+        ):
+            return True
+        at = directory.find(name, at + 1)
+    return False
+
+
+def _classpath_entries(classpath: list[str]) -> list[str]:
+    """The files and directories a classpath names, the way the JVM reads it:
+    `dir/*` is every JAR in `dir`."""
+    entries: list[str] = []
+    for item in classpath:
+        for entry in item.split(os.pathsep):
+            if entry.endswith(os.sep + "*") or entry == "*":
+                folder = entry[:-1] or "."
+                entries += sorted(
+                    path
+                    for path in glob.glob(os.path.join(glob.escape(folder), "*"))
+                    if path.lower().endswith(".jar")
+                )
+            elif entry:
+                entries.append(entry)
+    return entries
+
+
+def _classpath_provides_arrow(classpath: list[str]) -> bool:
+    """Whether the classpath has the Arrow the server can run on, and what
+    that Arrow needs (see _HOST_ARROW_CLASSES)."""
+    missing = set(_HOST_ARROW_CLASSES)
+    entries = _classpath_entries(classpath)
+    # The likely ones first, so that a long classpath is not read to its end
+    entries.sort(key=lambda entry: not _LIKELY_JAR.search(os.path.basename(entry)))
+    for entry in entries:
+        if os.path.isdir(entry):
+            missing -= {
+                name
+                for name in missing
+                if os.path.exists(os.path.join(entry, os.fsdecode(name)))
+            }
+        else:
+            try:
+                directory = _central_directory(entry)
+            except OSError:
+                continue  # the JVM skips an entry it cannot read, too
+            missing -= {name for name in missing if _jar_has(directory, name)}
+        if not missing:
+            return True
+    if _HOST_ARROW_CLASSES[0] not in missing:
+        logger.warning(
+            "The classpath has Arrow but not all of it the server needs "
+            "(missing: %s), so the server's own Arrow goes in front of it",
+            ", ".join(sorted(os.fsdecode(name) for name in missing)),
+        )
+    return False
+
+
+def _server_jar(classpath: list[str] | None) -> Path:
+    """The JAR to start the server from.
+
+    The fat JAR has Arrow in it (and Arrow's Netty and Jackson, both relocated).
+    In front of a classpath with an Arrow of its own it would shadow that Arrow
+    class by class, and code on the classpath built for another version breaks:
+    Spark 4.3 ships Arrow 19. Relocating the server's Arrow is no way out,
+    because that code has to receive the VectorSchemaRoot `arrow_to_java()`
+    makes, as its own class. So where the classpath brings Arrow, the server
+    is started from the thin JAR, which has the server's classes and nothing
+    else, and uses that Arrow like everything else there.
+    """
+    if classpath and _classpath_provides_arrow(classpath):
+        return THIN_JAR_PATH
+    return JAR_PATH
 
 
 # A dotted Java name: identifiers separated by single dots ('$' for nested classes)
@@ -462,8 +595,11 @@ def launch_gateway(
     """
     config = get_config()
 
-    if not JAR_PATH.exists():
-        raise RuntimeError(f"Gatun JAR not found at {JAR_PATH}. Did you run 'uv sync'?")
+    server_jar = _server_jar(classpath)
+    if not server_jar.exists():
+        raise RuntimeError(
+            f"Gatun JAR not found at {server_jar}. Did you run 'uv sync'?"
+        )
 
     # 1. Apply config defaults, then parse memory
     if memory is None:
@@ -553,7 +689,7 @@ def launch_gateway(
     if classpath:
         # Use -cp with main class to allow additional classpath entries
         # java [FLAGS] -cp [CLASSPATH] org.gatun.server.GatunServer [MEM_SIZE] [SOCKET_PATH]
-        all_jars = [str(JAR_PATH)] + classpath
+        all_jars = [str(server_jar)] + classpath
         cp = os.pathsep.join(all_jars)
         cmd = (
             [java_cmd]
@@ -566,7 +702,7 @@ def launch_gateway(
         cmd = (
             [java_cmd]
             + jvm_flags
-            + ["-jar", str(JAR_PATH), str(mem_bytes), socket_path]
+            + ["-jar", str(server_jar), str(mem_bytes), socket_path]
         )
 
     logger.info("Launching Java server: %s @ %s", memory, socket_path)

@@ -27,7 +27,7 @@ class TestGatunConfig:
         assert config.socket_path is None
         assert config.jvm_flags == []
         assert config.connect_timeout == 5.0
-        assert config.startup_timeout == 5.0
+        assert config.startup_timeout == 30.0
 
     def test_custom_values(self):
         """Test GatunConfig accepts custom values."""
