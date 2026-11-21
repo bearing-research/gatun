@@ -574,6 +574,25 @@ class TestAsyncHandlesAreFreed:
         await items.add("a")
         assert await (await items.stream()).count() == 1
 
+    async def test_temporary_passed_to_the_client(self, async_client):
+        """The client's methods keep a temporary alive through the call too."""
+
+        async def builder():
+            return await async_client.jvm.java.lang.StringBuilder("abc")
+
+        assert await async_client.invoke_method(await builder(), "length") == 3
+        assert await async_client.get_field(await builder(), "count") == 3
+        assert await async_client.set_field(await builder(), "count", 2) is None
+        assert (
+            await async_client.is_instance_of(await builder(), "java.lang.CharSequence")
+            is True
+        )
+        assert await async_client.get_fields(await builder(), ["count"]) == [3]
+        assert await async_client.invoke_methods(await builder(), [("length", ())]) == [
+            3
+        ]
+        assert await async_client.ping() is True
+
     async def test_detached_object_is_kept(self, async_client):
         import gc
 

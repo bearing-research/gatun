@@ -497,7 +497,7 @@ For direct control:
 ```python
 client.create_object("java.util.ArrayList")           # No-arg constructor
 client.create_object("java.util.ArrayList", 100)      # With initial capacity
-client.invoke_method(object_id, "methodName", arg1)   # Direct method call
+client.invoke_method(obj, "methodName", arg1)         # Direct method call (object or ID)
 client.invoke_static_method("java.lang.Math", "max", 10, 20)
 client.get_field(obj, "fieldName")                    # Get field value
 client.set_field(obj, "fieldName", value)             # Set field value
