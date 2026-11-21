@@ -1064,30 +1064,29 @@ class TestArrowLimit:
 
 
 class TestCancel:
-    def sleepers(self, client, count, millis=30_000):
+    def sleepers(self, client, *millis):
+        """One thread per duration, each in a sleep of that many milliseconds
+        in Java once this returns. A sleep that a test cancels must be long:
+        the others may end while the last thread is still getting there."""
         outcomes = {}
 
         def work(n):
             try:
-                outcomes[n] = client.jvm.Channels.sleep(millis)
+                outcomes[n] = client.jvm.Channels.sleep(millis[n])
             except BaseException as e:  # noqa: BLE001
                 outcomes[n] = e
 
         before = client.jvm.Channels.sleepsStarted()
-        threads = [threading.Thread(target=work, args=(n,)) for n in range(count)]
+        threads = [threading.Thread(target=work, args=(n,)) for n in range(len(millis))]
         for thread in threads:
             thread.start()
         # Each thread's first call opens a channel of its own, which can take
-        # longer than any fixed pause on a loaded machine: wait until every
-        # call is asleep in Java, so that a cancel finds it running
-        deadline = time.monotonic() + 30
-        while client.jvm.Channels.sleepsStarted() < before + count:
-            assert time.monotonic() < deadline, outcomes
-            time.sleep(0.01)
+        # longer than any fixed pause on a loaded machine
+        wait_for_sleeps(client, before + len(millis), outcomes)
         return threads, outcomes
 
     def test_cancel_interrupts_every_request_in_flight(self, client):
-        threads, outcomes = self.sleepers(client, 2)
+        threads, outcomes = self.sleepers(client, 30_000, 30_000)
 
         assert client.cancel() is True
         for thread in threads:
@@ -1098,7 +1097,7 @@ class TestCancel:
         assert client.cancel() is False
 
     def test_cancel_one_thread(self, client):
-        threads, outcomes = self.sleepers(client, 2, millis=2500)
+        threads, outcomes = self.sleepers(client, 30_000, 2500)
 
         assert client.cancel(threads[0]) is True
         for thread in threads:
@@ -1111,19 +1110,26 @@ class TestCancel:
         idle = threading.Thread(target=lambda: None)
         idle.start()
         idle.join()
-        threads, outcomes = self.sleepers(client, 1, millis=1500)
+        threads, outcomes = self.sleepers(client, 30_000)
 
         assert client.cancel(idle) is False
         assert client.cancel(threading.current_thread()) is False
-        threads[0].join()
-        assert outcomes[0] == "slept"
+        assert client.cancel(threads[0]) is True
+        threads[0].join(timeout=10)
+        assert isinstance(outcomes[0], CancelledException)
 
     def test_a_cancelled_thread_keeps_its_jvm_thread(self, client):
         Channels = client.jvm.Channels
 
         def work():
             before = Channels.threadId()
-            canceller = threading.Timer(0.4, client.cancel)
+            started = Channels.sleepsStarted()
+
+            def cancel_once_asleep():
+                wait_for_sleeps(client, started + 1, {})
+                client.cancel()
+
+            canceller = threading.Thread(target=cancel_once_asleep)
             canceller.start()
             with pytest.raises(CancelledException):
                 Channels.sleep(30_000)
@@ -1132,6 +1138,18 @@ class TestCancel:
 
         before, after = on_thread(work)
         assert before == after
+
+
+def wait_for_sleeps(client, count, outcomes):
+    """Wait until `count` calls of Channels.sleep have begun. Well inside the
+    30 s that a sleep to be cancelled lasts, so that it is still running; a
+    thread that failed on the way ends the wait with its error."""
+    deadline = time.monotonic() + 20
+    while client.jvm.Channels.sleepsStarted() < count:
+        failed = [o for o in outcomes.values() if isinstance(o, BaseException)]
+        assert not failed, failed
+        assert time.monotonic() < deadline, outcomes
+        time.sleep(0.01)
 
 
 class TestIdleTimeout:
