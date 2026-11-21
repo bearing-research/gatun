@@ -454,6 +454,61 @@ class TestAllowingYourOwnClasses:
             client.close()
 
 
+class TestBigNumbersAndConverters:
+    """The 'Big Numbers' and 'Converters for Your Own Types' examples."""
+
+    def test_big_numbers(self):
+        from decimal import Decimal
+
+        client = connect(
+            allowed_classes=["java.math.BigInteger", "java.math.BigDecimal"]
+        )
+        try:
+            BigInteger = client.jvm.java.math.BigInteger
+            BigDecimal = client.jvm.java.math.BigDecimal
+
+            assert BigInteger("1").shiftLeft(70) == 1180591620717411303424
+            assert BigInteger("1").add(2**70) == 1180591620717411303425
+            assert BigDecimal("1.50").add(Decimal("0.25")) == Decimal("1.75")
+
+            big = BigInteger("10")
+            assert big.add(5) == 15
+            dec = BigDecimal("1.50")
+            total = client.invoke_method(dec, "add", Decimal(1), return_object_ref=True)
+            assert total.scale() == 2
+        finally:
+            client.close()
+
+    def test_converter(self):
+        from decimal import Decimal
+
+        client = connect(allowed_classes=["java.util.AbstractMap.SimpleEntry"])
+        try:
+
+            class Money:
+                def __init__(self, amount, currency):
+                    self.amount, self.currency = amount, currency
+
+            def to_java(money):
+                return client.jvm.java.util.AbstractMap.SimpleEntry(
+                    money.currency, Decimal(money.amount)
+                )
+
+            client.register_converter(Money, to_java)
+
+            prices = client.jvm.java.util.ArrayList()
+            prices.add(Money("9.99", "EUR"))
+            prices.add([Money("1.50", "USD")])
+            assert prices.get(0).getValue() == Decimal("9.99")
+            assert prices.get(1)[0].getKey() == "USD"
+
+            client.unregister_converter(Money)
+            with pytest.raises(TypeError):
+                prices.add(Money("1", "EUR"))
+        finally:
+            client.close()
+
+
 class TestCancellingARequest:
     """The 'Cancelling a Request' and 'Configuration' examples."""
 

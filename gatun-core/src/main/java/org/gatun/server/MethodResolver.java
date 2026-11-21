@@ -322,7 +322,8 @@ public final class MethodResolver {
   /**
    * Convert a number to the type a parameter or type hint declares, where Java's own conversions
    * would not: an {@code Integer} for a {@code Long}, {@code short} or {@code float} parameter, a
-   * {@code Double} for a {@code float}. Anything else is returned unchanged.
+   * {@code Double} for a {@code float}, an integer for a {@code BigInteger} or {@code BigDecimal}.
+   * Anything else is returned unchanged.
    *
    * @throws IllegalArgumentException if an integer does not fit the narrower type
    */
@@ -336,6 +337,9 @@ public final class MethodResolver {
     }
     if (value instanceof Character c) {
       value = (int) c.charValue(); // char widens like a number
+    }
+    if (value instanceof java.math.BigInteger big) {
+      return boxed == java.math.BigDecimal.class ? new java.math.BigDecimal(big) : value;
     }
     if (!(value instanceof Number number)) {
       return value;
@@ -355,6 +359,12 @@ public final class MethodResolver {
       return value; // a fractional value is never silently truncated
     }
     long asLong = number.longValue();
+    if (boxed == java.math.BigInteger.class) {
+      return java.math.BigInteger.valueOf(asLong);
+    }
+    if (boxed == java.math.BigDecimal.class) {
+      return java.math.BigDecimal.valueOf(asLong);
+    }
     if (boxed == Long.class) {
       return asLong;
     }
@@ -612,6 +622,7 @@ public final class MethodResolver {
     if (paramType == Object.class) return true;
 
     if (isPythonNarrowing(paramType, argType)) return true;
+    if (isPythonBigNumber(paramType, argType)) return true;
 
     // argType=Object (from null or untyped) matches any reference type
     // Note: null to primitive is handled by caller (convertArgument)
@@ -635,6 +646,22 @@ public final class MethodResolver {
       return argType == int.class;
     }
     return false;
+  }
+
+  /**
+   * A Python int for a {@code BigInteger} or {@code BigDecimal} parameter. Python has one int type,
+   * and which Java type one arrives as depends on its size: without this, {@code big.add(2**70)}
+   * would work and {@code big.add(5)} would match nothing. Exact, so allowed; a Python float is
+   * not, since a double has no one decimal it stands for. The value is converted by {@link
+   * #coerce}.
+   */
+  private static boolean isPythonBigNumber(Class<?> paramType, Class<?> argType) {
+    if (paramType != java.math.BigInteger.class && paramType != java.math.BigDecimal.class) {
+      return false;
+    }
+    return argType == int.class
+        || argType == long.class
+        || (paramType == java.math.BigDecimal.class && argType == java.math.BigInteger.class);
   }
 
   /**
@@ -754,6 +781,10 @@ public final class MethodResolver {
     // Last resort, below every other match
     if (isPythonNarrowing(paramType, argType)) {
       return 5;
+    }
+    // And below that: a primitive parameter that takes the int is the better home for it
+    if (isPythonBigNumber(paramType, argType)) {
+      return paramType == java.math.BigInteger.class ? 4 : 3;
     }
 
     return 0; // No match

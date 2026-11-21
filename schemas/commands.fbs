@@ -78,7 +78,9 @@ union Value {
   ArrayVal,
   CallbackRef,  // Reference to a Python callback function
   CharVal,      // Java char (single UTF-16 code unit)
-  TemporalVal   // Date/time value, Python -> Java only
+  TemporalVal,  // Date/time value, Python -> Java only
+  BigIntVal,    // java.math.BigInteger <-> a Python int
+  DecimalVal    // java.math.BigDecimal <-> decimal.Decimal
 }
 
 table StringVal { v:string; }
@@ -97,6 +99,16 @@ enum TemporalKind : byte {
   Time = 2        // v = seconds since midnight             -> java.sql.Time
 }
 table TemporalVal { kind:TemporalKind; v:long; }
+
+// Numbers that fit no primitive, in either direction. A Python int travels as a BigIntVal
+// only when it does not fit in 64 bits; Java sends every BigInteger as one.
+// The integer in two's complement, most significant byte first: BigInteger.toByteArray()
+// and int.to_bytes(..., "big", signed=True). Not text: converting an integer of many
+// thousand digits to decimal is slow, and Python refuses it past 4300 digits.
+table BigIntVal { v:[ubyte]; }
+// The decimal as text: BigDecimal.toString() and str(Decimal), each of which the other
+// side reads back to the same digits and the same scale.
+table DecimalVal { v:string; }
 
 // Reference to a Python callback function
 // When Java invokes this, it triggers a callback request to Python
