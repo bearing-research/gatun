@@ -55,7 +55,7 @@ public class GatunServer {
   // Protocol version - increment when making breaking changes to the protocol
   // Version 2: Per-client shared memory (handshake includes SHM path)
   // Version 4: Callback connection (Action.OpenCallbackChannel, call_id)
-  public static final int PROTOCOL_VERSION = 7;
+  public static final int PROTOCOL_VERSION = 8;
 
   private static final Set<PosixFilePermission> OWNER_ONLY =
       PosixFilePermissions.fromString("rw-------");
@@ -63,6 +63,21 @@ public class GatunServer {
   private final Path socketPath;
   private volatile UserPrincipal serverUser; // owner of the socket file, set once it is bound
   private final long memorySize;
+
+  // A FlatBuffer's offsets are 32 bits, signed in Java
+  private static final int MAX_FLATBUFFER_SIZE = Integer.MAX_VALUE - 1024;
+
+  /**
+   * The largest command, response or callback frame, in bytes: the size of a session's shared
+   * memory. One that fits its 64KB zone is written there. A larger one follows its length on the
+   * socket and touches no shared memory at all, so it cannot land on an Arrow table that is lent or
+   * read in place. The client applies the same limit, and its side of the rule is in client.py.
+   */
+  private final int maxMessageSize;
+
+  // How long an error's text may be, in characters, each up to three bytes: it has to fit a
+  // response with room to spare
+  private final int maxErrorText;
   private final long responseOffset;
   private final ExecutorService threadPool;
 
@@ -335,6 +350,8 @@ public class GatunServer {
     this.socketPath = Path.of(socketPathStr);
     this.memorySize = memorySize;
     this.responseOffset = memorySize - RESPONSE_ZONE_SIZE;
+    this.maxMessageSize = (int) Math.min(memorySize, MAX_FLATBUFFER_SIZE);
+    this.maxErrorText = Math.min(MAX_ERROR_TEXT, this.maxMessageSize / 4);
     // A session's thread spends its life blocked on its socket, and a platform thread wakes
     // from that in one step: the kernel makes it runnable. A virtual thread needs the poller
     // thread to notice the socket and then a carrier to be woken for it, which made every
@@ -661,6 +678,7 @@ public class GatunServer {
           new CallbackChannel(
               peer,
               name,
+              maxMessageSize,
               notice -> handleChannelNotice(ctx, notice),
               answer -> decodeChannelAnswer(ctx, answer),
               this::callEndedReply);
@@ -905,26 +923,36 @@ public class GatunServer {
         lengthBuf.clear();
 
         // Validate command size to prevent OOB access or DoS
-        // Command zone is from COMMAND_OFFSET to PAYLOAD_OFFSET
-        if (commandSize <= 0 || commandSize > PAYLOAD_OFFSET) {
-          LOG.warning("Invalid command size: " + commandSize + " (max: " + PAYLOAD_OFFSET + ")");
+        if (commandSize <= 0 || commandSize > maxMessageSize) {
+          LOG.warning("Invalid command size: " + commandSize + " (max: " + maxMessageSize + ")");
           writeErrorResponse(
               client,
               sharedMem,
-              "Invalid command size: " + commandSize + " bytes (max: " + PAYLOAD_OFFSET + ")",
+              "Invalid command size: " + commandSize + " bytes (max: " + maxMessageSize + ")",
               "java.lang.IllegalArgumentException");
+          if (commandSize > PAYLOAD_OFFSET) {
+            // Its bytes are on the socket, or it is no length at all: either way what comes
+            // next is not a length. The client refuses such a command before it sends one.
+            break;
+          }
           continue;
         }
 
-        // The command is read from a private copy, not from shared memory. A callback
-        // made while it runs puts Python's answer in the command zone, and a command that
-        // is still being read then (the rest of a batch, the remaining calls of
-        // InvokeMethods) would be read out of that answer. A copy also cannot be changed
-        // by the client after it has been checked.
-        MemorySegment.copy(
-            sharedMem, ValueLayout.JAVA_BYTE, COMMAND_OFFSET, commandCopy, 0, commandSize);
-        ByteBuffer cmdBuf = ByteBuffer.wrap(commandCopy, 0, commandSize);
-        cmdBuf.order(ByteOrder.LITTLE_ENDIAN); // Essential for FlatBuffers
+        ByteBuffer cmdBuf;
+        if (commandSize > PAYLOAD_OFFSET) {
+          // Too large for the command zone: the bytes follow the length on the socket
+          cmdBuf = readMessage(client, commandSize);
+        } else {
+          // The command is read from a private copy, not from shared memory. A callback
+          // made while it runs puts Python's answer in the command zone, and a command that
+          // is still being read then (the rest of a batch, the remaining calls of
+          // InvokeMethods) would be read out of that answer. A copy also cannot be changed
+          // by the client after it has been checked.
+          MemorySegment.copy(
+              sharedMem, ValueLayout.JAVA_BYTE, COMMAND_OFFSET, commandCopy, 0, commandSize);
+          cmdBuf = ByteBuffer.wrap(commandCopy, 0, commandSize);
+          cmdBuf.order(ByteOrder.LITTLE_ENDIAN); // Essential for FlatBuffers
+        }
 
         // Define 'cmd' here so it is visible to the rest of the loop. Bytes that are not a
         // command fail here, before the request proper; the client still gets an answer.
@@ -1456,17 +1484,17 @@ public class GatunServer {
         ByteBuffer resBuf = builder.dataBuffer();
         int resSize = resBuf.remaining();
 
-        // Validate response size fits in zone
-        if (resSize > RESPONSE_ZONE_SIZE) {
-          // Response too large - send error instead. The client never sees the IDs in the
-          // response it was meant to get, so it cannot free them.
+        // More than a session may send: the client gets an error in its place
+        if (resSize > maxMessageSize) {
+          // The client never sees the IDs in the response it was meant to get, so it cannot
+          // free them.
           discardObjects(packedIds, sessionObjectIds, quota);
           if (requestSuccess) {
             discardResultRefs(vectorResults, sessionObjectIds, quota);
           }
           builder = new FlatBufferBuilder(256);
           errorMessage =
-              new PayloadTooLargeException("Response", resSize, RESPONSE_ZONE_SIZE).getMessage();
+              new PayloadTooLargeException("Response", resSize, maxMessageSize).getMessage();
           errorType = PayloadTooLargeException.class.getName();
           requestSuccess = false;
           responseOffset = packError(builder, errorMessage, errorType);
@@ -1478,14 +1506,20 @@ public class GatunServer {
         // Record request completion in observer
         observer.onRequestEnd(requestSuccess, errorType, errorMessage);
 
-        MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
-        responseSlice.copyFrom(MemorySegment.ofBuffer(resBuf));
-
         // 5. Signal Python
-        lengthBuf.putInt(resSize);
-        lengthBuf.flip();
-        client.write(lengthBuf);
-        lengthBuf.clear();
+        if (resSize <= RESPONSE_ZONE_SIZE) {
+          MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
+          responseSlice.copyFrom(MemorySegment.ofBuffer(resBuf));
+          lengthBuf.putInt(resSize);
+          lengthBuf.flip();
+          client.write(lengthBuf);
+          lengthBuf.clear();
+        } else {
+          writeMessage(client, sharedMem, resBuf);
+          // The builder keeps the buffer it grew to; one large response must not cost the
+          // session that much memory for the rest of its life
+          responseBuilder = new FlatBufferBuilder(1024);
+        }
 
         currentRequestId.remove();
       }
@@ -1579,26 +1613,52 @@ public class GatunServer {
       throws IOException {
     FlatBufferBuilder builder = new FlatBufferBuilder(256);
     builder.finish(packError(builder, message, errorType));
-    ByteBuffer response = builder.dataBuffer();
-    int size = response.remaining();
-    sharedMem.asSlice(this.responseOffset, size).copyFrom(MemorySegment.ofBuffer(response));
+    writeMessage(client, sharedMem, builder.dataBuffer());
+  }
+
+  /**
+   * Send a response, or a callback's request, to the client: into the response zone when it fits
+   * there, and after its length on the socket when it does not. The length says which, to the
+   * client as to the server ({@link #readMessage}).
+   */
+  private void writeMessage(SocketChannel client, MemorySegment sharedMem, ByteBuffer message)
+      throws IOException {
+    int size = message.remaining();
     ByteBuffer length = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
     length.putInt(size).flip();
-    while (length.hasRemaining()) {
-      client.write(length);
+    if (size <= RESPONSE_ZONE_SIZE) {
+      sharedMem.asSlice(this.responseOffset, size).copyFrom(MemorySegment.ofBuffer(message));
+      while (length.hasRemaining()) {
+        client.write(length);
+      }
+      return;
+    }
+    ByteBuffer[] parts = {length, message};
+    while (message.hasRemaining()) {
+      client.write(parts);
     }
   }
 
-  // A command is at most 64KB, so no vector in it has more elements than that. The counts are
-  // read from the command itself, and a forged one would otherwise size an allocation.
-  private static void checkArgumentCount(int count) {
-    if (count < 0 || count > PAYLOAD_OFFSET) {
+  /** Read a command that was too large for the command zone, and so follows its length. */
+  private static ByteBuffer readMessage(SocketChannel client, int size) throws IOException {
+    ByteBuffer message = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN);
+    if (!readFully(client, message)) {
+      throw new IOException("Connection closed in the middle of a command of " + size + " bytes");
+    }
+    message.flip();
+    return message;
+  }
+
+  // No vector in a command has more elements than the command has bytes. The counts are read
+  // from the command itself, and a forged one would otherwise size an allocation.
+  private void checkArgumentCount(int count) {
+    if (count < 0 || count > maxMessageSize) {
       throw new IllegalArgumentException("Argument count " + count + " is not possible");
     }
   }
 
-  private static int arrayLength(int length) {
-    if (length < 0 || length > PAYLOAD_OFFSET) {
+  private int arrayLength(int length) {
+    if (length < 0 || length > maxMessageSize) {
       throw new IllegalArgumentException("Array length " + length + " is not possible");
     }
     return length;
@@ -2460,24 +2520,26 @@ public class GatunServer {
   }
 
   // --- HELPER: Format exception with full stack trace ---
-  // Longest error text sent to the client. A deep stack trace (Spark's run to hundreds of
-  // frames) must not push the response past the 64KB response zone: the client would then get
-  // a size error in place of the exception's type and message.
-  private static final int MAX_ERROR_TEXT = 12_000;
+  // Longest error text sent to the client, in characters; a session's own limit is maxErrorText,
+  // at most a quarter of what a response can be. Spark's traces run to hundreds of frames and
+  // several causes, tens of kilobytes that arrive whole. What this guards against is the trace
+  // that would push its response past the largest a response can be (the client would get a size
+  // error in place of the exception's type and message), and a batch of failures that does.
+  private static final int MAX_ERROR_TEXT = 1 << 20;
 
   // Frames shown per exception in the chain when the whole trace does not fit
   private static final int MAX_FRAMES_WHEN_CUT = 12;
 
-  private static String formatException(Throwable t) {
+  private String formatException(Throwable t) {
     String full = stackTrace(t, Integer.MAX_VALUE);
-    if (full.length() <= MAX_ERROR_TEXT) {
+    if (full.length() <= maxErrorText) {
       return full;
     }
     // Too long: shorten each exception's frames rather than cutting the end off, because the
     // end is where the root cause is ("Caused by: ..."), and that is the line that explains it
     String cut = stackTrace(t, MAX_FRAMES_WHEN_CUT);
-    if (cut.length() > MAX_ERROR_TEXT) {
-      cut = cut.substring(0, MAX_ERROR_TEXT) + "\n\t...";
+    if (cut.length() > maxErrorText) {
+      cut = cut.substring(0, maxErrorText) + "\n\t...";
     }
     return cut + "\n(trace shortened; the server log has all of it)";
   }
@@ -2988,15 +3050,15 @@ public class GatunServer {
       builder.finish(Response.endResponse(builder));
 
       ByteBuffer request = builder.dataBuffer();
-      // The response zone in band, a frame on the callback connection: the same size
-      if (request.remaining() > RESPONSE_ZONE_SIZE) {
+      // In band or as a frame on the callback connection: the same limit
+      if (request.remaining() > maxMessageSize) {
         throw new IllegalArgumentException(
             "Arguments for callback "
                 + methodName
                 + " take "
                 + request.remaining()
                 + " bytes, more than the "
-                + RESPONSE_ZONE_SIZE
+                + maxMessageSize
                 + " a callback request can carry");
       }
       built = true;
@@ -3049,24 +3111,14 @@ public class GatunServer {
     try {
       ByteBuffer resBuf =
           buildCallbackRequest(0, callbackId, methodName, args, ctx, new ArrayList<>());
-      int resSize = resBuf.remaining();
 
-      // Write to response zone
-      MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
-      responseSlice.copyFrom(MemorySegment.ofBuffer(resBuf));
-
-      // Signal Python with the response size
-      ByteBuffer lengthBuf = ByteBuffer.allocate(4);
-      lengthBuf.order(ByteOrder.LITTLE_ENDIAN);
-      lengthBuf.putInt(resSize);
-      lengthBuf.flip();
-      while (lengthBuf.hasRemaining()) {
-        channel.write(lengthBuf);
-      }
+      // The request goes where a response would, and says so the same way
+      writeMessage(channel, sharedMem, resBuf);
 
       // Now we need to read the callback response directly from Python
       // Python sends a CallbackResponse command back to us
-      lengthBuf.clear();
+      ByteBuffer lengthBuf = ByteBuffer.allocate(4);
+      lengthBuf.order(ByteOrder.LITTLE_ENDIAN);
       if (!readFully(channel, lengthBuf)) {
         throw new IOException("Connection closed while waiting for callback response");
       }
@@ -3074,14 +3126,19 @@ public class GatunServer {
       int commandSize = lengthBuf.getInt();
 
       // Validate command size
-      if (commandSize <= 0 || commandSize > PAYLOAD_OFFSET) {
+      if (commandSize <= 0 || commandSize > maxMessageSize) {
         throw new IOException("Invalid callback response size: " + commandSize);
       }
 
-      // Read the command from command zone
-      MemorySegment cmdSlice = sharedMem.asSlice(COMMAND_OFFSET, commandSize);
-      ByteBuffer cmdBuf = cmdSlice.asByteBuffer();
-      cmdBuf.order(ByteOrder.LITTLE_ENDIAN);
+      ByteBuffer cmdBuf;
+      if (commandSize > PAYLOAD_OFFSET) {
+        cmdBuf = readMessage(channel, commandSize);
+      } else {
+        // Read the command from command zone
+        MemorySegment cmdSlice = sharedMem.asSlice(COMMAND_OFFSET, commandSize);
+        cmdBuf = cmdSlice.asByteBuffer();
+        cmdBuf.order(ByteOrder.LITTLE_ENDIAN);
+      }
 
       return readCallbackResult(Command.getRootAsCommand(cmdBuf));
     } finally {
@@ -3251,12 +3308,11 @@ public class GatunServer {
     }
     builder.finish(response);
     ByteBuffer frame = builder.dataBuffer();
-    if (frame.remaining() > CallbackChannel.MAX_FRAME_SIZE) {
+    if (frame.remaining() > maxMessageSize) {
       // The client never sees the IDs in the response it was meant to get
       discardNested(result, vector, registered, ctx);
       PayloadTooLargeException tooLarge =
-          new PayloadTooLargeException(
-              "Response", frame.remaining(), CallbackChannel.MAX_FRAME_SIZE);
+          new PayloadTooLargeException("Response", frame.remaining(), maxMessageSize);
       errorType = tooLarge.getClass().getName();
       builder = new FlatBufferBuilder(256);
       builder.finish(packError(builder, tooLarge.getMessage(), errorType, callId));

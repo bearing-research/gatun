@@ -21,7 +21,7 @@ Gatun is a high-performance Python-to-Java bridge using shared memory (mmap) and
 3. Server creates per-client shared memory file and sends handshake with SHM path
 4. Commands are serialized to FlatBuffers, written to shared memory
 5. Length prefix sent over socket signals Java to process command
-6. Response written to shared memory, length sent back to Python
+6. Response written to shared memory, length sent back to Python. A command or a response larger than its zone follows its length on the socket instead (see Values Larger Than a Zone)
 7. On disconnect, server cleans up the client's shared memory file
 
 ### Memory Layout
@@ -30,6 +30,16 @@ Gatun is a high-performance Python-to-Java bridge using shared memory (mmap) and
 - Response zone: last 64KB of shared memory
 
 These sizes are hardcoded on both sides and must stay in sync: `PAYLOAD_OFFSET` / `RESPONSE_ZONE_SIZE` in `GatunServer.java`, `COMMAND_ZONE_SIZE` in `wire.py` (which `client.py` takes it from), `RESPONSE_ZONE_SIZE` in `client.py`, and the literal `65536` offsets in the `connect()` paths of both `client.py` and `async_client.py`.
+
+### Values Larger Than a Zone
+A command or a response of more than 64 KB follows its length on the socket; the length alone says which, on both sides (`> PAYLOAD_OFFSET` / `> RESPONSE_ZONE_SIZE`). Nothing is written to shared memory for it, least of all to the payload zone, which holds lent tables and views the message knows nothing about.
+- The limit is `maxMessageSize` in `GatunServer` and `_max_message` (`max_message_size`) in both clients: the session's memory size, capped by what a FlatBuffer can address (`MAX_FLATBUFFER_SIZE`, the same number on both sides). The resource limits apply to the values inside as before. A command beyond it is refused in Python before anything is sent (`PayloadTooLargeError`); a response beyond it becomes that error.
+- A message within its zone takes the path it always took, byte for byte. The hand-packed commands never grow past the zone (`_PACKED_LIMIT`), and the releases that ride on a command leave it inside (`_with_pending_frees`), so everything large is the builder's.
+- Server: `readMessage` / `writeMessage` in `GatunServer`. The in-band callback exchange uses them as well (`exchangeCallback`: the request Java sends and the answer it reads), and `writeErrorResponse`. After a large response the session's `responseBuilder` is replaced, or it would keep the buffer it grew to.
+- Client: `_write_command` and `_read_response` (`_recv_message`, `_recv_large`) in `client.py`; `_exchange` and `_read_response` in `async_client.py`. `_get_builder` drops a pooled builder that grew past `_KEPT_BUILDER_SIZE`.
+- The callback connection has no shared memory, so its frames only got a larger limit: the constructor argument of `CallbackChannel` in Java, `_checked_size(header, limit)` in `callback_channel.py`, `_nested_command(call_id, data, limit)`. A large frame takes the connection's one writer for as long as it is written.
+- A message that was announced must be read to its end: a timeout or an interrupt part way leaves the rest on the socket, so the sync client marks itself dead there as it does for the length.
+- An error's text is at most `maxErrorText` characters: `MAX_ERROR_TEXT` (1 MiB) or a quarter of the largest message. `formatException` then shortens each exception's frames, not the end, where the root cause is.
 
 ### Where Changes Must Be Mirrored
 The protocol is implemented several times over, so a wire-level change usually touches all of these:
@@ -49,7 +59,7 @@ On the Python side, `client.jvm.a.b.C` navigation goes through `_JVMNode`, which
 
 ### Protocol Handshake
 Format: `[4 bytes: version][4 bytes: arena_epoch][8 bytes: memory size][2 bytes: shm_path_len][N bytes: shm_path]`
-- Protocol version (currently 7) is verified on connect
+- Protocol version (currently 8) is verified on connect
 - Version mismatch raises RuntimeError with upgrade instructions
 - SHM path is the per-client shared memory file path (e.g., `/tmp/gatun.sock.1.shm`)
 
@@ -327,7 +337,7 @@ The policy above is for callbacks made by the thread that is running the request
 **Callbacks from other threads: the callback connection**
 
 Any other Java thread (a Spark listener, a timer, an executor's worker, a parallel stream), at any time, calls Python on the session's callback connection. `GatunServer.invokeCallback` chooses by `SessionControl.isSessionThread()`: `exchangeCallback` in band, `callOnChannel` otherwise.
-- It is a second Unix socket with no shared memory: each session maps its memory with `Arena.ofConfined()`, so no other thread can touch it. Frames are `[4 bytes length][FlatBuffer]`, at most 64KB: a `Response` with `is_callback` from Java, a `CallbackResponse` command from Python, paired by `call_id`. Calls from many threads are in flight at once.
+- It is a second Unix socket with no shared memory: each session maps its memory with `Arena.ofConfined()`, so no other thread can touch it. Frames are `[4 bytes length][FlatBuffer]`, as large as a command or response may be on the main channel (see Values Larger Than a Zone): a `Response` with `is_callback` from Java, a `CallbackResponse` command from Python, paired by `call_id`. Calls from many threads are in flight at once.
 - It is opened lazily, by the first `register_callback` (`_ensure_callback_channel`): `Action.OpenCallbackChannel` on the main channel makes the server listen on `<socket>.<session id>.cb`, a socket that accepts one connection and is then removed. The connection takes no session slot. If it cannot be opened, the client logs a warning and in-band callbacks still work.
 - Server: `CallbackChannel` has one reader and one writer thread; callers only use queues. Callers are threads the server does not own, and interrupting a thread that is blocked on a channel closes the channel. `callOnChannel` sets the `sessionContext` thread-local to the proxy's session while it packs and decodes, because `sessionObject` skips its ownership check on a thread with no session.
 - Python: `CallbackChannel` (a daemon reader thread, one thread per call) and `AsyncCallbackChannel` (a reader task, one task per call) hand each request to the client's `_serve_channel_callback`. They hold the client weakly, so a client dropped without `close()` is still collected. These callbacks are not recorded as running "inside a request" (`_callback_threads`; their `_CallbackScope` has a `call`), so they may call Java.
@@ -681,7 +691,7 @@ A `JavaException` carries the thrown exception as a Java object, `java_exception
 
 Python-side exceptions:
 - `ReentrancyError` - Raised when attempting nested Java calls from within a callback
-- `PayloadTooLargeError` - Raised when data exceeds shared memory capacity
+- `PayloadTooLargeError` - Raised when Arrow data exceeds the payload zone, or a command or response the size of the shared memory (`max_message_size`)
 - `StaleArenaError` - Raised when using an arena after client reconnected
 - `CallbackTimeoutError` - Raised when a callback runs longer than the callback timeout
 - `SocketTimeoutError` / `ProtocolDesyncError` / `DeadConnectionError` - Transport failures; after a desync the client is marked dead and further calls raise `DeadConnectionError`

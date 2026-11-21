@@ -46,6 +46,7 @@ from gatun.callback_channel import (
 from gatun.client import (
     _CALL_ENDED,
     _FREE_CHUNK_SIZE,
+    _MAX_FLATBUFFER_SIZE,
     _OPEN_CALL_MEMORY,
     _PLAIN_TYPES,
     DEFAULT_CALLBACK_TIMEOUT,
@@ -323,6 +324,9 @@ class AsyncGatunClient(_ValueEncoder):
         self.shm: mmap.mmap | None = None
 
         self.memory_size = 0
+        # The largest command, response or callback frame; see
+        # GatunClient.max_message_size
+        self._max_message = 0
         self.command_offset = 0
         self.payload_offset = 65536  # 64KB - must match GatunServer.PAYLOAD_OFFSET
         self.response_offset = 0
@@ -412,6 +416,7 @@ class AsyncGatunClient(_ValueEncoder):
             self.memory_path = shm_path_bytes.decode("utf-8")
 
             self.response_offset = self.memory_size - 65536  # 64KB response zone
+            self._max_message = min(self.memory_size, _MAX_FLATBUFFER_SIZE)
 
             # Map shared memory (still sync - mmap doesn't have async API). Opening a
             # local file is effectively instant, and the handle is held for the life
@@ -491,9 +496,11 @@ class AsyncGatunClient(_ValueEncoder):
         async with self._lock:
             if self._dead or self._writer is None:
                 raise DeadConnectionError("Connection is closed. Create a new client.")
+            if len(data) > self._max_message:
+                raise PayloadTooLargeError(len(data), self._max_message, "Command")
+            # What a command may grow to with the releases that ride on it: it
+            # stays in the command zone
             max_command_size = self.payload_offset
-            if len(data) > max_command_size:
-                raise PayloadTooLargeError(len(data), max_command_size, "Command")
 
             # Release objects whose wrappers were garbage collected. A packed
             # command carries them if they are one command's worth; a longer
@@ -597,7 +604,7 @@ class AsyncGatunClient(_ValueEncoder):
         in which case nothing was sent and the command belongs on the client's
         own channel.
         """
-        frame = _nested_command(call.call_id, data)
+        frame = _nested_command(call.call_id, data, self._max_message)
         # A callback that runs for hours would otherwise hold on to every
         # object it dropped until it returns
         if self._pending_frees:
@@ -625,16 +632,28 @@ class AsyncGatunClient(_ValueEncoder):
             return False, None
         return True, self._parse_response(resp)
 
+    @property
+    def max_message_size(self) -> int:
+        """The largest command or response, in bytes: the size of the shared
+        memory the client connected with. See GatunClient.max_message_size."""
+        return self._max_message
+
     async def _exchange(self, data: bytes, wait_for_response: bool = True):
         """One command and its response. The caller holds the lock."""
         assert self.shm is not None and self._writer is not None
-        # Write to shared memory (sync - mmap doesn't have async API)
-        self.shm.seek(self.command_offset)
-        self.shm.write(data)
+        # A command that fits the command zone goes there; a larger one follows
+        # its length on the socket (see GatunClient._write_command)
+        in_zone = len(data) <= self.payload_offset
+        if in_zone:
+            # Write to shared memory (sync - mmap doesn't have async API)
+            self.shm.seek(self.command_offset)
+            self.shm.write(data)
 
         try:
             # Signal Java
             self._writer.write(struct.pack("<I", len(data)))
+            if not in_zone:
+                self._writer.write(data)
             await self._writer.drain()
             if not wait_for_response:
                 return None
@@ -667,26 +686,27 @@ class AsyncGatunClient(_ValueEncoder):
 
             # Validate response size before reading from SHM
             # This catches protocol desync (garbage data) early
-            max_response_size = self.memory_size - self.response_offset
             if response_len == 0:
                 raise ProtocolDesyncError(
                     "Invalid response size: 0 bytes (empty response)",
                     response_size=response_len,
                 )
-            if response_len > RESPONSE_ZONE_SIZE:
+            if response_len > self._max_message:
                 raise ProtocolDesyncError(
-                    f"Response size {response_len} exceeds RESPONSE_ZONE_SIZE ({RESPONSE_ZONE_SIZE})",
-                    response_size=response_len,
-                )
-            if response_len > max_response_size:
-                raise ProtocolDesyncError(
-                    f"Response size {response_len} exceeds available SHM space ({max_response_size})",
+                    f"Response size {response_len} exceeds the largest a response "
+                    f"can be ({self._max_message})",
                     response_size=response_len,
                 )
 
-            # Read response from shared memory
-            self.shm.seek(self.response_offset)
-            response_data = self.shm.read(response_len)
+            if response_len > RESPONSE_ZONE_SIZE:
+                # Too large for the response zone: it follows on the socket
+                response_data = await self._read_with_timeout(
+                    response_len, self.socket_timeout
+                )
+            else:
+                # Read response from shared memory
+                self.shm.seek(self.response_offset)
+                response_data = self.shm.read(response_len)
 
             # A response that is one plain value, which most are, is read
             # without the generated classes
@@ -974,16 +994,15 @@ class AsyncGatunClient(_ValueEncoder):
         cmd = Cmd.CommandEnd(builder)
         builder.Finish(cmd)
 
-        # The command zone in band, a frame on the callback connection: the
-        # same size
+        # In band or as a frame on the callback connection: the same limit
         data = bytes(builder.Output())
-        if len(data) > self.payload_offset and not is_error:
+        if len(data) > self._max_message and not is_error:
             return self._build_callback_response(
                 callback_id,
                 None,
                 True,
                 f"Callback result is too large to return: {len(data):,} bytes "
-                f"exceeds the {self.payload_offset:,} bytes an answer can take",
+                f"exceeds the {self._max_message:,} bytes an answer can take",
                 call_id,
             )
         return data

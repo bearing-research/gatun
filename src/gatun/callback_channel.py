@@ -50,10 +50,6 @@ from gatun.generated.org.gatun.protocol import Response
 
 logger = logging.getLogger(__name__)
 
-# The size of the zones the in-band path uses, so both paths carry the same
-# calls. Must match CallbackChannel.MAX_FRAME_SIZE on the server.
-MAX_FRAME_SIZE = 64 * 1024
-
 # What the server sends once it serves the connection: its protocol version
 _READY = struct.Struct("<I")
 _LENGTH = struct.Struct("<I")
@@ -63,9 +59,12 @@ def _frame(data: bytes | bytearray) -> bytes:
     return _LENGTH.pack(len(data)) + bytes(data)
 
 
-def _checked_size(header: bytes) -> int:
+def _checked_size(header: bytes, limit: int) -> int:
+    """The size of the frame a header announces. `limit` is the largest a frame
+    may be: what a command or response may be on the client's own channel
+    (`max_message_size`), so both paths carry the same calls."""
     (size,) = _LENGTH.unpack(header)
-    if not 0 < size <= MAX_FRAME_SIZE:
+    if not 0 < size <= limit:
         raise OSError(f"Invalid callback frame size: {size}")
     return int(size)
 
@@ -228,6 +227,7 @@ class CallbackChannel:
     def __init__(self, client: Any, path: str, timeout: float | None):
         """Connect to the socket the server opened for this client's session."""
         self._client = weakref.ref(client)
+        self._max_frame = client.max_message_size
         self._send_lock = threading.Lock()
         self._closed = False
         self._calls: dict[int, ChannelCall] = {}
@@ -251,12 +251,19 @@ class CallbackChannel:
 
     def _read(self, n: int) -> bytes | None:
         """Read exactly n bytes; None if the connection ended first."""
-        data = bytearray()
-        while len(data) < n:
-            chunk = self._sock.recv(n - len(data))
-            if not chunk:
-                return None
-            data.extend(chunk)
+        # Into one buffer: recv(n) makes room for all n bytes on every call,
+        # and a frame may be megabytes that arrive a little at a time
+        data = bytearray(n)
+        view = memoryview(data)
+        got = 0
+        try:
+            while got < n:
+                count = self._sock.recv_into(view[got:])
+                if not count:
+                    return None
+                got += count
+        finally:
+            view.release()
         return bytes(data)
 
     def _serve(self) -> None:
@@ -265,7 +272,7 @@ class CallbackChannel:
                 header = self._read(_LENGTH.size)
                 if header is None:
                     return
-                data = self._read(_checked_size(header))
+                data = self._read(_checked_size(header, self._max_frame))
                 if data is None:
                     return
                 resp = Response.Response.GetRootAsResponse(data, 0)
@@ -492,6 +499,7 @@ class AsyncCallbackChannel:
         writer: asyncio.StreamWriter,
     ):
         self._client = weakref.ref(client)
+        self._max_frame = client.max_message_size
         self._reader = reader
         self._writer = writer
         self._send_lock = asyncio.Lock()
@@ -527,7 +535,9 @@ class AsyncCallbackChannel:
         try:
             while True:
                 header = await self._reader.readexactly(_LENGTH.size)
-                data = await self._reader.readexactly(_checked_size(header))
+                data = await self._reader.readexactly(
+                    _checked_size(header, self._max_frame)
+                )
                 resp = Response.Response.GetRootAsResponse(data, 0)
                 if resp.CallbackReleased():
                     self._callback_released(resp.CallbackId())

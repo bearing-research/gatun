@@ -45,8 +45,9 @@ import org.gatun.protocol.Command;
 final class CallbackChannel {
   private static final Logger LOG = Logger.getLogger(CallbackChannel.class.getName());
 
-  /** The size of the zones the in-band path uses, so both paths carry the same calls. */
-  static final int MAX_FRAME_SIZE = 64 * 1024;
+  // The largest frame, in either direction: what a command or a response may be on the session's
+  // own channel, so both paths carry the same calls
+  private final int maxFrameSize;
 
   // Put on a queue to wake whoever waits on it once the connection is gone
   private static final Object CLOSED = new Object();
@@ -76,11 +77,13 @@ final class CallbackChannel {
   CallbackChannel(
       SocketChannel socket,
       String name,
+      int maxFrameSize,
       Consumer<Command> notices,
       Function<Command, Object> decodeAnswer,
       LongFunction<ByteBuffer> callEnded) {
     this.socket = socket;
     this.name = name;
+    this.maxFrameSize = maxFrameSize;
     this.notices = notices;
     this.decodeAnswer = decodeAnswer;
     this.callEnded = callEnded;
@@ -209,7 +212,7 @@ final class CallbackChannel {
       lengthBuf.flip();
       int size = lengthBuf.getInt();
       lengthBuf.clear();
-      if (size <= 0 || size > MAX_FRAME_SIZE) {
+      if (size <= 0 || size > maxFrameSize) {
         throw new IOException("Invalid callback frame size: " + size);
       }
       ByteBuffer frame = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN);
