@@ -1106,7 +1106,7 @@ class JavaObject:
         """obj.method(args) -> client.invoke_method(id, method, args)"""
 
         def method_proxy(*args):
-            return self.client.invoke_method(self.object_id, name, *args)
+            return self.client._invoke_method(self.object_id, name, args, False)
 
         return method_proxy
 
@@ -4406,18 +4406,30 @@ class GatunClient(_ValueEncoder):
         # Pass bytes!
         return self._send_raw(builder.Output())
 
-    def invoke_method(
-        self, obj_id, method_name, *args, return_object_ref: bool = False
-    ):
+    def invoke_method(self, obj, method_name, *args, return_object_ref: bool = False):
         """Invoke a method on a Java object.
 
         Args:
-            obj_id: Object ID
+            obj: The JavaObject, or its object ID
             method_name: Name of the method
             *args: Arguments to pass to the method
             return_object_ref: If True, return the result as a JavaObject
                 instead of converting it (a String, a List, a BigDecimal)
         """
+        # `obj` stays referred to by this frame until the answer is in. Were it
+        # the last reference to a temporary, the wrapper's release would ride
+        # on this very command, and the server releases before it runs one.
+        if isinstance(obj, JavaObject):
+            return self._invoke_method(
+                obj.object_id, method_name, args, return_object_ref
+            )
+        return self._invoke_method(obj, method_name, args, return_object_ref)
+
+    def _invoke_method(
+        self, obj_id: int, method_name, args: tuple, return_object_ref: bool
+    ):
+        """`invoke_method` for an ID, which is what a JavaObject's own method
+        calls use: no question about the target's type on their path."""
         data = wire.pack_command(
             Act.Action.InvokeMethod,
             method_name,
@@ -4520,17 +4532,17 @@ class GatunClient(_ValueEncoder):
 
         return self._send_raw(builder.Output())
 
-    def get_field(self, obj_id, field_name, *, return_object_ref: bool = False):
+    def get_field(self, obj, field_name, *, return_object_ref: bool = False):
         """Get a field value from a Java object.
 
         Args:
-            obj_id: Object ID (or JavaObject instance)
+            obj: The JavaObject, or its object ID
             field_name: Name of the field to get
             return_object_ref: If True, return the value as a JavaObject
                 instead of converting it
         """
-        if isinstance(obj_id, JavaObject):
-            obj_id = obj_id.object_id
+        # A new name, so that `obj` keeps a temporary alive (see invoke_method)
+        obj_id = obj.object_id if isinstance(obj, JavaObject) else obj
 
         data = wire.pack_command(
             Act.Action.GetField, field_name, obj_id, (), (), return_object_ref
@@ -4552,16 +4564,16 @@ class GatunClient(_ValueEncoder):
 
         return self._send_raw(builder.Output())
 
-    def set_field(self, obj_id, field_name, value):
+    def set_field(self, obj, field_name, value):
         """Set a field value on a Java object.
 
         Args:
-            obj_id: Object ID (or JavaObject instance)
+            obj: The JavaObject, or its object ID
             field_name: Name of the field to set
             value: Value to set
         """
-        if isinstance(obj_id, JavaObject):
-            obj_id = obj_id.object_id
+        # A new name, so that `obj` keeps a temporary alive (see invoke_method)
+        obj_id = obj.object_id if isinstance(obj, JavaObject) else obj
 
         data = wire.pack_command(
             Act.Action.SetField, field_name, obj_id, (value,), self._object_ref_types

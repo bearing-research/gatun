@@ -388,7 +388,7 @@ class TestLowLevelAPI:
         client.create_object("java.util.ArrayList", 100)  # with capacity
 
         # Invoke methods
-        client.invoke_method(obj.object_id, "add", "item")
+        client.invoke_method(obj, "add", "item")
         result = client.invoke_static_method("java.lang.Math", "max", 10, 20)
         assert result == 20
 
@@ -513,9 +513,7 @@ class TestBigNumbersAndConverters:
             big = BigInteger("10")
             assert big.add(5) == 15
             dec = BigDecimal("1.50")
-            total = client.invoke_method(
-                dec.object_id, "add", Decimal(1), return_object_ref=True
-            )
+            total = client.invoke_method(dec, "add", Decimal(1), return_object_ref=True)
             assert isinstance(total, JavaObject)
             assert total.scale() == 2
         finally:

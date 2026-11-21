@@ -896,7 +896,7 @@ obj = client.create_object("java.util.ArrayList")
 obj = client.create_object("java.util.ArrayList", 100)  # with capacity
 
 # Invoke methods
-client.invoke_method(obj.object_id, "add", "item")
+client.invoke_method(obj, "add", "item")  # the object or its object_id
 result = client.invoke_static_method("java.lang.Math", "max", 10, 20)
 
 # Access static fields
@@ -1120,7 +1120,7 @@ BigDecimal("1.50").add(Decimal("0.25"))    # Decimal('1.75')
 
 - An `int` that fits in 64 bits travels as an `int` or `long`, as before. Where the parameter is a `BigInteger` or `BigDecimal` it is converted, so `big.add(5)` works like `big.add(2**70)`. A `float` is never taken for a `BigDecimal`: pass a `Decimal`.
 - `Decimal("NaN")` and the infinities raise `ValueError`: `BigDecimal` has neither. `Decimal("-0")` arrives as `0`.
-- To get the Java object instead of the value, construct it (`BigDecimal("1.50")` is a `JavaObject`) or ask for it: `client.invoke_method(dec.object_id, "add", x, return_object_ref=True)`. `invoke_static_method`, `get_field`, `get_static_field` and a batch's `call`, `call_static` and `get_field` take the same argument. It works for every value that is otherwise converted, a `String` or a `List` included.
+- To get the Java object instead of the value, construct it (`BigDecimal("1.50")` is a `JavaObject`) or ask for it: `client.invoke_method(dec, "add", x, return_object_ref=True)`. `invoke_static_method`, `get_field`, `get_static_field` and a batch's `call`, `call_static` and `get_field` take the same argument. It works for every value that is otherwise converted, a `String` or a `List` included.
 - numpy is not needed and not imported. Its scalars are sent as what they say they are: `numpy.int64(5)` as `5`, `numpy.float32(1.5)` as `1.5`. `numpy.bool_` says nothing of the kind; pass `bool(x)`.
 
 ### Converters for Your Own Types

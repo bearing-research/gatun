@@ -236,6 +236,30 @@ class TestWrapperRelease:
             client.close()
 
 
+class TestObjectPassedToTheClient:
+    """The client's methods take a JavaObject or its ID. A temporary passed to
+    one is referred to by nothing but that call, and must not be released ahead
+    of it: its release would ride on the very command that uses it."""
+
+    def test_temporary_for_each_method(self, client):
+        def builder():
+            return client.jvm.java.lang.StringBuilder("abc")
+
+        assert client.invoke_method(builder(), "length") == 3
+        assert client.get_field(builder(), "count") == 3
+        assert client.set_field(builder(), "count", 2) is None
+        assert client.is_instance_of(builder(), "java.lang.CharSequence") is True
+        assert client.get_fields(builder(), ["count"]) == [3]
+        assert client.invoke_methods(builder(), [("length", ())]) == [3]
+        assert client.ping() is True
+
+    def test_invoke_method_takes_the_object(self, client):
+        items = client.jvm.java.util.ArrayList()
+        assert client.invoke_method(items, "add", "a") is True
+        assert client.invoke_method(items.object_id, "size") == 1
+        assert client.invoke_method(items, "size") == 1
+
+
 class TestDatetimeArguments:
     """datetime values are converted through temporary java.sql objects."""
 
