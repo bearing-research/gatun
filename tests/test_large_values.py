@@ -512,8 +512,16 @@ class TestAsyncClient:
         function = await aclient.register_callback(
             lambda argument: argument, "java.util.function.Function"
         )
+        # The answer is larger than the command zone, and what lies after that
+        # zone is the payload zone, where tables are
+        start = aclient.payload_offset
+        marker = bytes(range(64))
+        aclient.shm[start : start + 64] = marker
+
         result = await aclient.invoke_static_method("Large", "apply", function, value)
+
         assert same(result, value)
+        assert aclient.shm[start : start + 64] == marker
 
     async def test_beyond_the_memory(self, large_classes):
         client = await aconnect(

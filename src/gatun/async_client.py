@@ -937,12 +937,17 @@ class AsyncGatunClient(_ValueEncoder):
         the request that is waiting for it."""
         data = self._build_callback_response(callback_id, result, is_error, error_msg)
 
-        # Write to command zone
-        self.shm.seek(self.command_offset)
-        self.shm.write(data)
+        # In the command zone if it fits there; if not it follows its length on
+        # the socket, like a command (see _exchange)
+        in_zone = len(data) <= self.payload_offset
+        if in_zone:
+            self.shm.seek(self.command_offset)
+            self.shm.write(data)
 
         # Signal Java
         self._writer.write(struct.pack("<I", len(data)))
+        if not in_zone:
+            self._writer.write(data)
         await self._writer.drain()
 
     def _build_callback_response(

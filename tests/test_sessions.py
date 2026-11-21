@@ -144,16 +144,20 @@ class TestRequestsTheServerCannotRun:
             client.invoke_method(looped.object_id, "clone")
         assert looped.size() == 1
 
-    def test_long_stack_trace_still_fits_in_a_response(self, client):
-        """A deep recursion's trace is thousands of frames; the reply is 64KB."""
+    def test_long_stack_trace_arrives_whole(self, client):
+        """A deep recursion's trace is a thousand frames, more than the 64 KB
+        of the response zone, and none of them is left out."""
         looped = client.create_object("java.util.ArrayList")
         looped.add(looped)
 
         # hashCode() of a list that contains itself recurses until the stack ends
         with pytest.raises(JavaException) as exc_info:
             looped.hashCode()
-        assert "StackOverflowError" in str(exc_info.value)
-        assert len(str(exc_info.value)) < 16_000
+        trace = str(exc_info.value)
+        assert "StackOverflowError" in trace
+        # The JVM records 1024 frames of a stack (MaxJavaStackTraceDepth)
+        assert trace.count("\n\tat ") == 1024
+        assert "more" not in trace.splitlines()[-1]
         assert client.ping() is True
 
 
