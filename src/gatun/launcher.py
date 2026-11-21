@@ -7,11 +7,14 @@ import secrets
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import weakref
+import zipfile
 from pathlib import Path
 
 from gatun.client import COMMAND_ZONE_SIZE, RESPONSE_ZONE_SIZE
@@ -22,6 +25,32 @@ logger = logging.getLogger(__name__)
 # --- Configuration ---
 MODULE_DIR = Path(__file__).parent.resolve()
 JAR_PATH = MODULE_DIR / "jars" / "gatun-server-all.jar"
+# The server without Arrow, Netty and Jackson: see _server_jar
+THIN_JAR_PATH = MODULE_DIR / "jars" / "gatun-server-thin.jar"
+
+# One class from each library the server's own code uses and the thin JAR
+# leaves out: Arrow's vectors, its message format, its memory, its Netty
+# allocator and the classes that one puts into Netty's package, Netty's buffers
+# and what they stand on, and FlatBuffers
+_HOST_ARROW_CLASSES = (
+    b"org/apache/arrow/vector/VectorSchemaRoot.class",
+    b"org/apache/arrow/flatbuf/Message.class",
+    b"org/apache/arrow/memory/BufferAllocator.class",
+    b"org/apache/arrow/memory/netty/NettyAllocationManager.class",
+    b"io/netty/buffer/PooledByteBufAllocatorL.class",
+    b"io/netty/buffer/PooledByteBufAllocator.class",
+    b"io/netty/util/internal/PlatformDependent.class",
+    b"com/google/flatbuffers/Table.class",
+)
+
+# The oldest Arrow the server runs on: the one it is compiled against
+# (gatun-core/build.gradle.kts). An older one on the classpath gets the fat JAR
+# in front of it, as every Arrow did before there was a thin one.
+MIN_HOST_ARROW = (18, 3)
+_ARROW_POM = "META-INF/maven/org.apache.arrow/arrow-vector/pom.properties"
+
+# What `server_jar` may be: the launcher's own choice, or one of the two JARs
+SERVER_JAR_CHOICES = ("auto", "thin", "full")
 
 # The shared memory holds the command zone, the payload zone and the response
 # zone. A size that leaves no payload zone makes the response zone overlap the
@@ -100,6 +129,222 @@ DEFAULT_JVM_FLAGS = [
     "-Dio.netty.tryReflectionSetAccessible=true",
     "-Dgatun.shaded.io.netty.tryReflectionSetAccessible=true",
 ]
+
+
+_LIKELY_JAR = re.compile("arrow|netty|flatbuffers", re.IGNORECASE)
+
+
+def _central_directory(path: str) -> bytes:
+    """The central directory of a JAR: the part that lists its entries.
+
+    Read whole and searched as bytes (`_jar_has`). Going through `zipfile`
+    builds an object per entry, and a Spark classpath has some 280 JARs with
+    a quarter of a million entries between them.
+    """
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        # The record that ends the file, behind a comment of at most 64 KB
+        tail_size = min(size, 22 + 65535)
+        f.seek(size - tail_size)
+        tail = f.read(tail_size)
+        end = tail.rfind(b"PK\x05\x06")
+        if end < 0 or end + 22 > len(tail):
+            return b""
+        cd_size, cd_offset = struct.unpack_from("<II", tail, end + 12)
+        if cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+            # Zip64: the real numbers are in a record that a locator, right
+            # before this one, points to
+            locator = end - 20
+            if locator < 0 or tail[locator : locator + 4] != b"PK\x06\x07":
+                return b""
+            (record_offset,) = struct.unpack_from("<Q", tail, locator + 8)
+            f.seek(record_offset)
+            record = f.read(56)
+            if len(record) < 56 or record[:4] != b"PK\x06\x06":
+                return b""
+            cd_size, cd_offset = struct.unpack_from("<QQ", record, 40)
+        f.seek(cd_offset)
+        return f.read(cd_size)
+
+
+def _jar_has(directory: bytes, name: bytes) -> bool:
+    """Whether a central directory lists exactly this entry."""
+    at = directory.find(name)
+    while at >= 0:
+        # An entry's name follows its 46-byte header, which gives its length;
+        # without this a relocated copy (shaded/org/apache/arrow/...) would do
+        header = at - 46
+        if (
+            header >= 0
+            and directory[header : header + 4] == b"PK\x01\x02"
+            and struct.unpack_from("<H", directory, header + 28)[0] == len(name)
+        ):
+            return True
+        at = directory.find(name, at + 1)
+    return False
+
+
+def _classpath_entries(classpath: list[str]) -> list[str]:
+    """The files and directories a classpath names, the way the JVM reads it:
+    `dir/*` is every JAR in `dir`."""
+    entries: list[str] = []
+    for item in classpath:
+        for entry in item.split(os.pathsep):
+            if entry.endswith(os.sep + "*") or entry == "*":
+                folder = entry[:-1] or "."
+                entries += sorted(
+                    path
+                    for path in glob.glob(os.path.join(glob.escape(folder), "*"))
+                    if path.lower().endswith(".jar")
+                )
+            elif entry:
+                entries.append(entry)
+    return entries
+
+
+def _manifest_class_path(jar: str) -> list[str]:
+    """The entries a JAR's manifest adds to the classpath (`Class-Path`), which
+    the JVM follows: relative ones are beside the JAR."""
+    try:
+        with zipfile.ZipFile(jar) as archive:
+            manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8", "replace")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return []
+    # A line that starts with a space continues the one before
+    text = manifest.replace("\r\n", "\n").replace("\r", "\n").replace("\n ", "")
+    for line in text.split("\n"):
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "class-path":
+            base = os.path.dirname(jar)
+            entries = []
+            for url in value.split():
+                path = urllib.parse.unquote(urllib.parse.urlparse(url).path)
+                if path:
+                    entries.append(os.path.normpath(os.path.join(base, path)))
+            return entries
+    return []
+
+
+def _host_arrow(classpath: list[str]) -> tuple[set[bytes], str | None]:
+    """What the classpath lacks of the Arrow the server needs (see
+    _HOST_ARROW_CLASSES), and the entry that has Arrow's vectors, or None."""
+    missing = set(_HOST_ARROW_CLASSES)
+    vectors: str | None = None
+    entries = _classpath_entries(classpath)
+    # The likely ones first, so that a long classpath is not read to its end
+    entries.sort(key=lambda entry: not _LIKELY_JAR.search(os.path.basename(entry)))
+    seen = set(entries)
+    followed = False
+    while entries:
+        for entry in entries:
+            if os.path.isdir(entry):
+                found = {
+                    name
+                    for name in missing
+                    if os.path.exists(os.path.join(entry, os.fsdecode(name)))
+                }
+            else:
+                try:
+                    directory = _central_directory(entry)
+                except (OSError, ValueError, OverflowError, struct.error):
+                    # Not there, or no JAR: the JVM skips such an entry, too
+                    continue
+                found = {name for name in missing if _jar_has(directory, name)}
+            if _HOST_ARROW_CLASSES[0] in found:
+                vectors = entry
+            missing -= found
+            if not missing:
+                return missing, vectors
+        if followed:
+            break
+        # Not all on the classpath as given. A JAR can name more of it in its
+        # manifest (a pathing JAR, Maven's addClasspath), and the JVM follows
+        # those. Read only now: a manifest costs opening the JAR as an archive.
+        followed = True
+        queue = [entry for entry in seen if not os.path.isdir(entry)]
+        entries = []
+        while queue and len(seen) < 4096:
+            for more in _manifest_class_path(queue.pop()):
+                if more not in seen:
+                    seen.add(more)
+                    entries.append(more)
+                    if not os.path.isdir(more):
+                        queue.append(more)
+    return missing, vectors
+
+
+def _arrow_version(entry: str) -> tuple[int, int] | None:
+    """The version of the Arrow in a classpath entry, from the description
+    Maven puts into arrow-vector's JAR (and an uber JAR usually keeps). None if
+    it does not say."""
+    text = ""
+    try:
+        if os.path.isdir(entry):
+            with open(os.path.join(entry, _ARROW_POM), encoding="utf-8") as f:
+                text = f.read()
+        else:
+            with zipfile.ZipFile(entry) as archive:
+                text = archive.read(_ARROW_POM).decode("utf-8", "replace")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        pass
+    found = re.search(r"^version=(\d+)\.(\d+)", text, re.MULTILINE) or re.match(
+        r"arrow-vector-(\d+)\.(\d+)", os.path.basename(entry)
+    )
+    return (int(found[1]), int(found[2])) if found else None
+
+
+def _server_jar(classpath: list[str] | None, choice: str = "auto") -> Path:
+    """The JAR to start the server from.
+
+    The fat JAR has Arrow in it (and Arrow's Netty and Jackson, both relocated).
+    In front of a classpath with an Arrow of its own it would shadow that Arrow
+    class by class, and code on the classpath built for another version breaks:
+    Spark 4.3 ships Arrow 19. Relocating the server's Arrow is no way out,
+    because that code has to receive the VectorSchemaRoot `arrow_to_java()`
+    makes, as its own class. So where the classpath brings Arrow, the server
+    is started from the thin JAR, which has the server's classes and nothing
+    else, and uses that Arrow like everything else there.
+
+    Not an Arrow older than the one the server is compiled against, though
+    (MIN_HOST_ARROW): the server may call what that one does not have. It gets
+    the fat JAR, as before. `choice` ("thin" or "full") overrides all of this.
+    """
+    if choice == "full":
+        return JAR_PATH
+    if choice == "auto":
+        if not classpath:
+            return JAR_PATH
+        missing, vectors = _host_arrow(classpath)
+        if vectors is None:
+            return JAR_PATH
+        if missing:
+            logger.warning(
+                "The classpath has Arrow but not all of it the server needs "
+                "(missing: %s), so the server's own Arrow goes in front of it",
+                ", ".join(sorted(os.fsdecode(name) for name in missing)),
+            )
+            return JAR_PATH
+        version = _arrow_version(vectors)
+        if version is not None and version < MIN_HOST_ARROW:
+            logger.warning(
+                "The classpath has Arrow %d.%d (%s) and the server needs %d.%d or "
+                "later, so the server's own Arrow goes in front of it. "
+                "server_jar='thin' runs the server on the classpath's Arrow anyway.",
+                *version,
+                vectors,
+                *MIN_HOST_ARROW,
+            )
+            return JAR_PATH
+    if not THIN_JAR_PATH.exists() and JAR_PATH.exists() and choice == "auto":
+        # A checkout that was built before there was a thin JAR
+        logger.warning(
+            "The classpath has its own Arrow, but %s is not there, so the "
+            "server's own Arrow goes in front of it. Build it with "
+            "'uv sync --reinstall-package gatun'.",
+            THIN_JAR_PATH,
+        )
+        return JAR_PATH
+    return THIN_JAR_PATH
 
 
 # A dotted Java name: identifiers separated by single dots ('$' for nested classes)
@@ -412,6 +657,7 @@ def launch_gateway(
     allowed_classes: list[str] | None = None,
     allowed_prefixes: list[str] | None = None,
     allow_all: bool | None = None,
+    server_jar: str | None = None,
 ):
     """
     Launches the embedded Java server.
@@ -442,6 +688,11 @@ def launch_gateway(
                    `System.load`, `System.loadLibrary` and `Class.newInstance`
                    stay refused. False keeps the list whatever the environment
                    or pyproject.toml say; None (the default) leaves it to them.
+        server_jar: Which of the two server JARs to start. "auto" (the default,
+                    also GATUN_SERVER_JAR and [tool.gatun] server_jar) takes the
+                    thin one, which has no Arrow of its own, when the classpath
+                    brings an Arrow the server can run on, and the full one
+                    otherwise. "thin" and "full" decide it.
 
     The allow lists from the arguments, the environment and pyproject.toml are
     combined; everything else follows arguments > environment > pyproject.toml.
@@ -462,8 +713,17 @@ def launch_gateway(
     """
     config = get_config()
 
-    if not JAR_PATH.exists():
-        raise RuntimeError(f"Gatun JAR not found at {JAR_PATH}. Did you run 'uv sync'?")
+    choice = config.server_jar if server_jar is None else server_jar
+    if choice not in SERVER_JAR_CHOICES:
+        raise ValueError(
+            f"server_jar must be one of {', '.join(SERVER_JAR_CHOICES)}, got {choice!r}"
+        )
+    jar = _server_jar(classpath, choice)
+    if not jar.exists():
+        raise RuntimeError(
+            f"Gatun JAR not found at {jar}. "
+            "Did you run 'uv sync --reinstall-package gatun'?"
+        )
 
     # 1. Apply config defaults, then parse memory
     if memory is None:
@@ -485,6 +745,18 @@ def launch_gateway(
     jvm_flags = DEFAULT_JVM_FLAGS + config.jvm_flags
     if extra_jvm_flags:
         jvm_flags.extend(extra_jvm_flags)
+    if jar == THIN_JAR_PATH:
+        # The server's Netty is the classpath's there, and reads its settings
+        # under their own names. Not passed on under them: that Netty is also
+        # the classpath's own code's, which the setting was not meant for.
+        for flag in (*config.jvm_flags, *(extra_jvm_flags or ())):
+            if flag.startswith("-Dgatun.shaded.io.netty."):
+                logger.warning(
+                    "%s has no effect: the server runs on the classpath's Arrow "
+                    "and Netty, which reads -D%s",
+                    flag.partition("=")[0],
+                    flag.partition("=")[0][len("-Dgatun.shaded.") :],
+                )
 
     # 3a. Add observability flags
     # Check environment variables first, then use function arguments
@@ -553,7 +825,7 @@ def launch_gateway(
     if classpath:
         # Use -cp with main class to allow additional classpath entries
         # java [FLAGS] -cp [CLASSPATH] org.gatun.server.GatunServer [MEM_SIZE] [SOCKET_PATH]
-        all_jars = [str(JAR_PATH)] + classpath
+        all_jars = [str(jar)] + classpath
         cp = os.pathsep.join(all_jars)
         cmd = (
             [java_cmd]
@@ -563,11 +835,7 @@ def launch_gateway(
     else:
         # Use -jar for simplicity when no extra classpath needed
         # java [FLAGS] -jar [JAR] [MEM_SIZE] [SOCKET_PATH]
-        cmd = (
-            [java_cmd]
-            + jvm_flags
-            + ["-jar", str(JAR_PATH), str(mem_bytes), socket_path]
-        )
+        cmd = [java_cmd] + jvm_flags + ["-jar", str(jar), str(mem_bytes), socket_path]
 
     logger.info("Launching Java server: %s @ %s", memory, socket_path)
     logger.debug("JVM command: %s", " ".join(cmd))

@@ -52,3 +52,52 @@ jobs:
         run: |
           uv run python --version
           uv run pytest -v
+
+  # The server on a classpath that brings its own Arrow: it starts from the thin
+  # JAR there and runs on Spark's Arrow, Netty, Jackson and FlatBuffers. The two
+  # versions differ in all four (4.1.1: Arrow 18.3; 4.3.0: Arrow 19.0).
+  spark:
+    name: Spark ${{ matrix.spark-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        spark-version: ["4.1.1", "4.3.0"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install flatc
+        run: sudo apt-get update && sudo apt-get install -y flatbuffers-compiler
+
+      - name: Set up Java 22
+        uses: actions/setup-java@v6
+        with:
+          distribution: "temurin"
+          java-version: "22"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "latest"
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync
+
+      # pyspark's package has Spark's JARs in it, which is all that is used of it
+      - name: Install Spark ${{ matrix.spark-version }}
+        run: uv pip install pyspark==${{ matrix.spark-version }}
+
+      - name: Run the Spark tests
+        env:
+          GATUN_REQUIRE_SPARK: ${{ matrix.spark-version }}
+        run: uv run --no-sync pytest -v --no-cov tests/test_spark_integration.py
+
+      - name: Run the suite with the server on Spark's classpath
+        run: |
+          jars="$(uv run --no-sync python -c 'import pathlib, pyspark; print(pathlib.Path(pyspark.__file__).parent / "jars")')"
+          ls "$jars" | grep -c .
+          # The point of this step: the server runs on Spark's Arrow, not its own
+          uv run --no-sync python -c 'import sys; from gatun import launcher; assert launcher._server_jar([sys.argv[1]]) == launcher.THIN_JAR_PATH' "$jars/*"
+          GATUN_TEST_CLASSPATH="$jars/*" uv run --no-sync pytest -v --no-cov

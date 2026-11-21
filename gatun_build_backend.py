@@ -32,10 +32,12 @@ SCHEMA_FILE = PROJECT_ROOT / "schemas" / "commands.fbs"
 JAVA_GEN_DIR = PROJECT_ROOT / "gatun-core" / "src" / "main" / "java"
 PYTHON_GEN_DIR = PROJECT_ROOT / "src" / "gatun" / "generated"
 
-# Location of the built 'Fat JAR' from Gradle
-JAR_SOURCE = PROJECT_ROOT / "gatun-core" / "build" / "libs" / "gatun-server-all.jar"
+# The JARs Gradle builds: the fat one, with everything the server needs, and the
+# thin one, for a classpath that brings its own Arrow (see launcher.py)
+JAR_BUILD_DIR = PROJECT_ROOT / "gatun-core" / "build" / "libs"
 JAR_DEST_DIR = PROJECT_ROOT / "src" / "gatun" / "jars"
-JAR_DEST_FILE = JAR_DEST_DIR / "gatun-server-all.jar"
+JAR_NAMES = ("gatun-server-all.jar", "gatun-server-thin.jar")
+JAR_TASKS = (":gatun-core:shadowJar", ":gatun-core:thinJar")
 
 
 def _generate_flatbuffers():
@@ -172,14 +174,15 @@ def _get_newest_mtime(directory):
 
 
 def _is_build_needed():
-    """Returns True if Java sources are newer than the destination JAR."""
-    # 1. If destination JAR is missing, we must build
-    if not JAR_DEST_FILE.exists():
+    """Returns True if Java sources are newer than the destination JARs."""
+    # 1. If a destination JAR is missing, we must build
+    jars = [JAR_DEST_DIR / name for name in JAR_NAMES]
+    if not all(jar.exists() for jar in jars):
         logger.info("[Gatun Backend] JAR missing. Build required.")
         return True
 
-    # 2. Get JAR timestamp
-    jar_mtime = JAR_DEST_FILE.stat().st_mtime
+    # 2. Get JAR timestamp: the older of the two
+    jar_mtime = min(jar.stat().st_mtime for jar in jars)
 
     # 3. Check Build Script (if gradle file changed, always rebuild)
     if BUILD_SCRIPT.exists() and BUILD_SCRIPT.stat().st_mtime > jar_mtime:
@@ -209,24 +212,26 @@ def _build_java():
         if not GRADLEW.exists():
             raise RuntimeError(f"Gradle wrapper not found at {GRADLEW}")
 
-        # 1. Build Fat JAR
-        cmd = [str(GRADLEW), ":gatun-core:shadowJar"]
+        # 1. Build both JARs
+        cmd = [str(GRADLEW), *JAR_TASKS]
         try:
             subprocess.check_call(cmd, cwd=PROJECT_ROOT)
         except subprocess.CalledProcessError as e:
             raise RuntimeError("Gradle build failed.") from e
 
-        # 2. Copy Artifact (Refresh the dest)
-        if not JAR_SOURCE.exists():
-            raise RuntimeError(f"Build passed but JAR missing: {JAR_SOURCE}")
-
+        # 2. Copy Artifacts (Refresh the dest)
         JAR_DEST_DIR.mkdir(parents=True, exist_ok=True)
-
-        if JAR_DEST_FILE.exists():
-            JAR_DEST_FILE.unlink()  # Clean replace
-
-        shutil.copy2(JAR_SOURCE, JAR_DEST_FILE)
-        logger.info(f"--- [Gatun Backend] Updated JAR at {JAR_DEST_FILE} ---")
+        for name in JAR_NAMES:
+            source = JAR_BUILD_DIR / name
+            if not source.exists():
+                raise RuntimeError(f"Build passed but JAR missing: {source}")
+            dest = JAR_DEST_DIR / name
+            if dest.exists():
+                dest.unlink()  # Clean replace
+            # Not copy2: a JAR whose task was up to date keeps its old time, and
+            # the copy would look older than the build script for ever after
+            shutil.copy(source, dest)
+            logger.info(f"--- [Gatun Backend] Updated JAR at {dest} ---")
 
     else:
         logger.info("--- [Gatun Backend] Java is up-to-date. Skipping build. ---")

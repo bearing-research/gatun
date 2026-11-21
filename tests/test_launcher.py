@@ -226,6 +226,397 @@ class TestMemorySize:
             assert items.get(0) == "x" * 1000
 
 
+ARROW_AND_FRIENDS = [name.decode() for name in launcher._HOST_ARROW_CLASSES]
+
+
+ARROW_POM = "META-INF/maven/org.apache.arrow/arrow-vector/pom.properties"
+
+
+def make_jar(path, names, class_path=None, arrow=None, **zip_options):
+    """A JAR with empty entries of these names. `class_path` goes into its
+    manifest, wrapped at 72 bytes as the JDK's tools write it; `arrow` is the
+    version it says its arrow-vector is."""
+    import zipfile
+
+    manifest = "Manifest-Version: 1.0\r\n"
+    if class_path is not None:
+        line = "Class-Path: " + " ".join(class_path)
+        pieces = [line[:72]] + [
+            " " + line[at : at + 71] for at in range(72, len(line), 71)
+        ]
+        manifest += "\r\n".join(pieces) + "\r\n"
+    with zipfile.ZipFile(path, "w", **zip_options) as jar:
+        jar.writestr("META-INF/MANIFEST.MF", manifest)
+        if arrow is not None:
+            jar.writestr(
+                ARROW_POM,
+                f"artifactId=arrow-vector\ngroupId=org.apache.arrow\nversion={arrow}\n",
+            )
+        for name in names:
+            jar.writestr(name, b"")
+    return str(path)
+
+
+class TestServerJar:
+    """Which JAR the server starts from: the fat one, or on a classpath that
+    brings Arrow, the thin one that uses that Arrow."""
+
+    def test_no_classpath(self):
+        assert launcher._server_jar(None) == launcher.JAR_PATH
+        assert launcher._server_jar([]) == launcher.JAR_PATH
+
+    def test_both_jars_are_packaged(self):
+        assert launcher.JAR_PATH.exists()
+        assert launcher.THIN_JAR_PATH.exists()
+
+    def test_the_thin_jar_is_the_servers_classes_alone(self):
+        import zipfile
+
+        with zipfile.ZipFile(launcher.THIN_JAR_PATH) as jar:
+            names = [n for n in jar.namelist() if n.endswith(".class")]
+        assert "org/gatun/server/GatunServer.class" in names
+        assert all(name.startswith("org/gatun/") for name in names)
+
+    def test_the_fat_jar_has_no_jackson_or_netty_under_their_own_names(self):
+        import zipfile
+
+        with zipfile.ZipFile(launcher.JAR_PATH) as jar:
+            names = jar.namelist()
+        assert "org/apache/arrow/vector/VectorSchemaRoot.class" in names
+        assert not [n for n in names if n.startswith(("com/fasterxml/", "io/netty/"))]
+        assert not [
+            n
+            for n in names
+            if n.startswith("META-INF/versions/")
+            and n.endswith(".class")
+            and "/gatun/shaded/" not in n
+        ]
+
+    def test_classpath_with_arrow_in_several_jars(self, tmp_path):
+        jars = [
+            make_jar(tmp_path / f"lib{n}.jar", [name, f"other/Thing{n}.class"])
+            for n, name in enumerate(ARROW_AND_FRIENDS)
+        ]
+        other = make_jar(tmp_path / "app.jar", ["com/example/App.class"])
+
+        assert launcher._server_jar([other, *jars]) == launcher.THIN_JAR_PATH
+
+    def test_classpath_with_arrow_in_one_jar_of_any_name(self, tmp_path):
+        uber = make_jar(tmp_path / "application.jar", ARROW_AND_FRIENDS)
+
+        assert launcher._server_jar([uber]) == launcher.THIN_JAR_PATH
+
+    def test_classpath_without_arrow(self, tmp_path):
+        jar = make_jar(tmp_path / "app.jar", ["com/example/App.class"])
+
+        assert launcher._server_jar([jar]) == launcher.JAR_PATH
+
+    @pytest.mark.parametrize("left_out", ARROW_AND_FRIENDS[1:])
+    def test_arrow_without_something_it_needs(self, tmp_path, caplog, left_out):
+        """The thin JAR could not run there, so the fat one does, and says so."""
+        names = [name for name in ARROW_AND_FRIENDS if name != left_out]
+        jar = make_jar(tmp_path / "arrow-vector.jar", names)
+
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            assert launcher._server_jar([jar]) == launcher.JAR_PATH
+        assert left_out in caplog.text
+
+    def test_no_warning_without_arrow(self, tmp_path, caplog):
+        """Netty and FlatBuffers alone are nobody's Arrow."""
+        jar = make_jar(tmp_path / "netty-buffer.jar", ARROW_AND_FRIENDS[4:])
+
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            assert launcher._server_jar([jar]) == launcher.JAR_PATH
+        assert caplog.text == ""
+
+    def test_a_relocated_arrow_is_not_arrow(self, tmp_path):
+        relocated = make_jar(
+            tmp_path / "shaded.jar",
+            [f"shaded/{name}" for name in ARROW_AND_FRIENDS]
+            + [f"META-INF/versions/17/{name}" for name in ARROW_AND_FRIENDS],
+        )
+
+        assert launcher._server_jar([relocated]) == launcher.JAR_PATH
+
+    def test_wildcard_entry(self, tmp_path):
+        """`dir/*` is every JAR in the directory, as it is for the JVM."""
+        make_jar(tmp_path / "all.jar", ARROW_AND_FRIENDS)
+        (tmp_path / "notes.txt").write_text("not a jar")
+
+        assert launcher._server_jar([f"{tmp_path}/*"]) == launcher.THIN_JAR_PATH
+        assert launcher._server_jar([str(tmp_path)]) == launcher.JAR_PATH
+
+    @pytest.mark.parametrize("version", ["18.3.0", "19.0.0", "20.1.0-SNAPSHOT"])
+    def test_an_arrow_the_server_can_run_on(self, tmp_path, version):
+        jar = make_jar(tmp_path / "app.jar", ARROW_AND_FRIENDS, arrow=version)
+
+        assert launcher._server_jar([jar]) == launcher.THIN_JAR_PATH
+
+    @pytest.mark.parametrize("version", ["15.0.2", "18.2.0", "9.0.0"])
+    def test_an_arrow_older_than_the_servers(self, tmp_path, caplog, version):
+        """The server may call what that Arrow does not have: it keeps its own,
+        as before there was a thin JAR, and says so."""
+        jar = make_jar(tmp_path / "app.jar", ARROW_AND_FRIENDS, arrow=version)
+
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            assert launcher._server_jar([jar]) == launcher.JAR_PATH
+        assert version.rsplit(".", 1)[0] in caplog.text
+        assert "server_jar='thin'" in caplog.text
+
+    def test_the_version_in_a_jars_name(self, tmp_path):
+        """A JAR that says nothing inside is still named like Maven names it."""
+        old = tmp_path / "old"
+        old.mkdir()
+        new = tmp_path / "new"
+        new.mkdir()
+        make_jar(old / "arrow-vector-12.0.1.jar", ARROW_AND_FRIENDS)
+        make_jar(new / "arrow-vector-19.0.0.jar", ARROW_AND_FRIENDS)
+
+        assert launcher._server_jar([f"{old}/*"]) == launcher.JAR_PATH
+        assert launcher._server_jar([f"{new}/*"]) == launcher.THIN_JAR_PATH
+
+    def test_an_arrow_in_a_directory_of_classes(self, tmp_path):
+        for name in [*ARROW_AND_FRIENDS, ARROW_POM]:
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("version=17.0.0\n")
+
+        assert launcher._server_jar([str(tmp_path)]) == launcher.JAR_PATH
+        (tmp_path / ARROW_POM).write_text("version=18.3.0\n")
+        assert launcher._server_jar([str(tmp_path)]) == launcher.THIN_JAR_PATH
+
+    def test_the_choice_can_be_made_by_hand(self, tmp_path, caplog):
+        old = make_jar(tmp_path / "old.jar", ARROW_AND_FRIENDS, arrow="15.0.0")
+        new = make_jar(tmp_path / "new.jar", ARROW_AND_FRIENDS, arrow="19.0.0")
+
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            assert launcher._server_jar([old], "thin") == launcher.THIN_JAR_PATH
+            assert launcher._server_jar([new], "full") == launcher.JAR_PATH
+            assert launcher._server_jar(None, "thin") == launcher.THIN_JAR_PATH
+        assert caplog.text == ""
+
+    def test_arrow_named_by_a_manifest(self, tmp_path):
+        """A JAR's manifest adds to the classpath, and the JVM follows it: a
+        pathing JAR, or an application whose manifest lists its libraries."""
+        lib = tmp_path / "lib with space"
+        lib.mkdir()
+        names = []
+        for n, name in enumerate(ARROW_AND_FRIENDS):
+            make_jar(lib / f"dependency-{n}.jar", [name])
+            names.append(f"lib%20with%20space/dependency-{n}.jar")
+        app = make_jar(tmp_path / "app.jar", ["com/example/App.class"], names)
+
+        assert launcher._manifest_class_path(app) == [
+            str(lib / f"dependency-{n}.jar") for n in range(len(names))
+        ]
+        assert launcher._server_jar([app]) == launcher.THIN_JAR_PATH
+
+    def test_manifests_that_name_each_other(self, tmp_path):
+        make_jar(tmp_path / "a.jar", ["A.class"], ["b.jar", "missing.jar"])
+        make_jar(tmp_path / "b.jar", ARROW_AND_FRIENDS[:2], ["a.jar", "c.jar"])
+        make_jar(tmp_path / "c.jar", ARROW_AND_FRIENDS[2:], ["a.jar"])
+
+        assert launcher._server_jar([str(tmp_path / "a.jar")]) == launcher.THIN_JAR_PATH
+
+    @pytest.mark.parametrize(
+        "locator_offset, cd_size",
+        [(2**64 - 1, 0), (0, 2**63 + 5), (0, 2**64 - 1)],
+    )
+    def test_a_damaged_jar_is_skipped(self, tmp_path, locator_offset, cd_size):
+        """Numbers taken from the file are not all numbers a file can have."""
+        import struct
+
+        record = b"PK\x06\x06" + bytes(36) + struct.pack("<QQ", cd_size, 0)
+        locator = b"PK\x06\x07" + struct.pack("<IQI", 0, locator_offset, 1)
+        end = b"PK\x05\x06" + struct.pack(
+            "<HHHHIIH", 0, 0, 0, 0, 2**32 - 1, 2**32 - 1, 0
+        )
+        damaged = tmp_path / "damaged.jar"
+        damaged.write_bytes(record + locator + end)
+        (tmp_path / "empty.jar").write_bytes(b"")
+        (tmp_path / "text.jar").write_text("not a jar at all")
+        good = make_jar(tmp_path / "good.jar", ARROW_AND_FRIENDS)
+        entries = [
+            str(damaged),
+            str(tmp_path / "empty.jar"),
+            str(tmp_path / "text.jar"),
+        ]
+
+        assert launcher._server_jar(entries) == launcher.JAR_PATH
+        assert launcher._server_jar([*entries, good]) == launcher.THIN_JAR_PATH
+
+    def test_a_thin_jar_that_was_never_built(self, tmp_path, monkeypatch, caplog):
+        """A checkout from before there were two JARs: the launcher says how
+        to get the other, and goes on with the one it has."""
+        jar = make_jar(tmp_path / "app.jar", ARROW_AND_FRIENDS)
+        monkeypatch.setattr(launcher, "THIN_JAR_PATH", tmp_path / "no-such.jar")
+
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            assert launcher._server_jar([jar]) == launcher.JAR_PATH
+        assert "uv sync --reinstall-package gatun" in caplog.text
+
+        with pytest.raises(RuntimeError, match="reinstall-package"):
+            launcher.launch_gateway(classpath=[jar], server_jar="thin")
+
+    def test_a_choice_that_is_none_of_the_three(self):
+        with pytest.raises(ValueError, match="auto, thin, full"):
+            launcher.launch_gateway(server_jar="slim")
+
+    def test_directory_of_classes(self, tmp_path):
+        for name in ARROW_AND_FRIENDS:
+            target = tmp_path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"")
+
+        assert launcher._server_jar([str(tmp_path)]) == launcher.THIN_JAR_PATH
+
+    def test_entries_joined_with_the_path_separator(self, tmp_path):
+        first = make_jar(tmp_path / "a.jar", ARROW_AND_FRIENDS[:2])
+        second = make_jar(tmp_path / "b.jar", ARROW_AND_FRIENDS[2:])
+
+        assert (
+            launcher._server_jar([first + os.pathsep + second])
+            == launcher.THIN_JAR_PATH
+        )
+
+    def test_entries_that_are_missing_or_no_jar(self, tmp_path):
+        text = tmp_path / "readme.jar"
+        text.write_text("PK is not enough to make a zip file " * 10)
+        empty = tmp_path / "empty.jar"
+        empty.write_bytes(b"")
+        real = make_jar(tmp_path / "real.jar", ARROW_AND_FRIENDS)
+
+        classpath = [str(tmp_path / "missing.jar"), str(text), str(empty)]
+        assert launcher._server_jar(classpath) == launcher.JAR_PATH
+        assert launcher._server_jar([*classpath, real]) == launcher.THIN_JAR_PATH
+
+    def test_jar_with_a_comment_and_many_entries(self, tmp_path):
+        import zipfile
+
+        path = tmp_path / "big.jar"
+        with zipfile.ZipFile(path, "w") as jar:
+            for n in range(3000):
+                jar.writestr(f"com/example/pkg{n % 50}/Class{n}.class", b"")
+            for name in ARROW_AND_FRIENDS:
+                jar.writestr(name, b"")
+            jar.comment = b"c" * 5000
+
+        assert launcher._server_jar([str(path)]) == launcher.THIN_JAR_PATH
+
+    def test_zip64_jar(self, tmp_path):
+        """More than 65,535 entries: the directory's place is in a second record."""
+        import zipfile
+
+        path = tmp_path / "huge.jar"
+        with zipfile.ZipFile(path, "w") as jar:
+            for n in range(66_000):
+                jar.writestr(f"p/C{n}.class", b"")
+            for name in ARROW_AND_FRIENDS:
+                jar.writestr(name, b"")
+
+        directory = launcher._central_directory(str(path))
+        assert launcher._jar_has(directory, b"p/C65999.class")
+        assert not launcher._jar_has(directory, b"p/C66000.class")
+        assert launcher._server_jar([str(path)]) == launcher.THIN_JAR_PATH
+
+    def test_the_directory_search_agrees_with_zipfile(self):
+        """On a real JAR, with thousands of entries: every name is found, and
+        no part of a name is taken for one."""
+        import zipfile
+
+        directory = launcher._central_directory(str(launcher.JAR_PATH))
+        with zipfile.ZipFile(launcher.JAR_PATH) as jar:
+            names = jar.namelist()
+
+        assert len(names) > 1000
+        assert all(launcher._jar_has(directory, name.encode()) for name in names)
+        assert not launcher._jar_has(
+            directory, b"apache/arrow/vector/VectorSchemaRoot.class"
+        )
+        assert not launcher._jar_has(
+            directory, b"org/apache/arrow/vector/VectorSchemaRoot"
+        )
+
+    def test_the_thin_jar_is_what_starts(self, tmp_path, started_processes):
+        uber = make_jar(tmp_path / "application.jar", ARROW_AND_FRIENDS)
+
+        # Empty classes: the server cannot start on this classpath
+        with pytest.raises(RuntimeError, match="failed to start"):
+            launch_gateway(classpath=[uber])
+
+        (process,) = started_processes
+        command = process.args
+        classpath = command[command.index("-cp") + 1].split(os.pathsep)
+        assert classpath == [str(launcher.THIN_JAR_PATH), uber]
+
+    def test_the_choice_reaches_the_command(
+        self, tmp_path, started_processes, monkeypatch, tmp_path_factory, config
+    ):
+        """As an argument, from the environment and from pyproject.toml, the
+        argument first."""
+        uber = make_jar(tmp_path / "application.jar", ARROW_AND_FRIENDS)
+
+        def first_jar(**options):
+            started_processes.clear()
+            session = launch_gateway(classpath=[uber], **options)
+            session.stop()
+            (process,) = started_processes
+            command = process.args
+            return command[command.index("-cp") + 1].split(os.pathsep)[0]
+
+        assert first_jar(server_jar="full") == str(launcher.JAR_PATH)
+
+        monkeypatch.setenv("GATUN_SERVER_JAR", "full")
+        reset_config()
+        assert first_jar() == str(launcher.JAR_PATH)
+        with pytest.raises(RuntimeError, match="failed to start"):
+            launch_gateway(classpath=[uber], server_jar="thin")
+        assert (
+            started_processes[-1]
+            .args[started_processes[-1].args.index("-cp") + 1]
+            .startswith(str(launcher.THIN_JAR_PATH))
+        )
+
+        monkeypatch.setenv("GATUN_SERVER_JAR", "slim")
+        reset_config()
+        with pytest.raises(ValueError, match="auto, thin, full"):
+            launch_gateway(classpath=[uber])
+
+        monkeypatch.delenv("GATUN_SERVER_JAR")
+        project = tmp_path_factory.mktemp("project")
+        (project / "pyproject.toml").write_text('[tool.gatun]\nserver_jar = "full"\n')
+        monkeypatch.chdir(project)
+        reset_config()
+        assert first_jar() == str(launcher.JAR_PATH)
+
+    def test_a_setting_for_the_servers_own_netty_on_the_thin_jar(
+        self, tmp_path, started_processes, caplog
+    ):
+        """There the server's Netty is the classpath's, which does not read
+        the relocated name. Said, and not passed on under the plain name."""
+        uber = make_jar(tmp_path / "application.jar", ARROW_AND_FRIENDS)
+        flag = "-Dgatun.shaded.io.netty.maxDirectMemory=2g"
+
+        with (
+            caplog.at_level("WARNING", logger="gatun.launcher"),
+            pytest.raises(RuntimeError, match="failed to start"),
+        ):
+            launch_gateway(classpath=[uber], extra_jvm_flags=[flag])
+
+        assert "-Dio.netty.maxDirectMemory" in caplog.text
+        assert "no effect" in caplog.text
+        (process,) = started_processes
+        assert not [a for a in process.args if a.startswith("-Dio.netty.maxDirect")]
+
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            session = launch_gateway(
+                classpath=[uber], extra_jvm_flags=[flag], server_jar="full"
+            )
+            session.stop()
+        assert caplog.text == ""
+
+
 class TestSignalHandlers:
     @pytest.fixture(autouse=True)
     def _restore_handlers(self, monkeypatch):

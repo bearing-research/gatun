@@ -10,6 +10,7 @@ Example pyproject.toml:
     allowed_classes = ["java.util.concurrent.atomic.AtomicLong"]
     allowed_prefixes = ["com.example"]
     allow_all = false
+    server_jar = "auto"
 
 Configuration precedence (highest to lowest):
     1. Function arguments (e.g., connect(memory="32MB"))
@@ -45,10 +46,16 @@ class GatunConfig:
     allowed_prefixes: list[str] = field(default_factory=list)
     # Allow every class, lifting that list
     allow_all: bool = False
+    # "auto", "thin" or "full": see launcher._server_jar, which checks the value
+    server_jar: str = "auto"
 
     # Timeouts
     connect_timeout: float = 5.0  # seconds
-    startup_timeout: float = 5.0  # seconds
+    # Seconds to wait for the server's socket. It only bounds a server that
+    # neither listens nor exits: one that exits is reported at once. A JVM with
+    # a few hundred JARs on its classpath (Spark's) needs more than five seconds
+    # to get there on a small machine.
+    startup_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         # Expand ~ in socket_path
@@ -144,6 +151,8 @@ def load_config(pyproject_path: Path | None = None) -> GatunConfig:
                         f"strings, got {type(value).__name__}: {value!r}"
                     )
                 setattr(config, option, list(value))
+        if "server_jar" in gatun_config:
+            config.server_jar = gatun_config["server_jar"]
         if "allow_all" in gatun_config:
             value = gatun_config["allow_all"]
             # A string is true whatever it says
@@ -169,6 +178,8 @@ def load_config(pyproject_path: Path | None = None) -> GatunConfig:
         config.allowed_classes += _split_names(env_classes)
     if env_prefixes := os.environ.get("GATUN_ALLOWED_PREFIXES"):
         config.allowed_prefixes += _split_names(env_prefixes)
+    if env_server_jar := os.environ.get("GATUN_SERVER_JAR"):
+        config.server_jar = env_server_jar
     if env_allow_all := os.environ.get("GATUN_ALLOW_ALL"):
         config.allow_all = parse_switch(env_allow_all, "GATUN_ALLOW_ALL")
 

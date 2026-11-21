@@ -921,6 +921,17 @@ export GATUN_LOG_LEVEL=FINE
 
 Gatun can load and drive Spark's JVM classes directly (pass the Spark JARs via `connect(classpath=...)`), and ships a `BridgeAdapter` abstraction designed as the contract between PySpark and a JVM backend. Stock PySpark releases talk to the JVM through Py4J and do not use Gatun; running PySpark itself on Gatun requires a PySpark build ported to the `BridgeAdapter` interface (see [docs/bridge_adapter_spec.md](docs/bridge_adapter_spec.md)).
 
+### The Classpath's Arrow
+
+Spark ships its own Apache Arrow, and so may your application. A JVM has room for one: with two on the classpath, whichever comes first shadows the other class by class, and code built for the other version breaks. So the server comes as two JARs, and the launcher picks one from the `classpath` you pass:
+
+- **No Arrow on the classpath** (or no classpath): the server runs from the JAR that has everything, Arrow included. Arrow's two large dependencies, Netty and Jackson, are in there under other package names, so they are never in front of yours. The small ones are there under their own (`slf4j-api`, `commons-codec`, `flatbuffers-java`) and do come first; put your own copy of the server's Arrow on the classpath if that matters.
+- **Arrow on the classpath**: the server runs from a JAR with its own classes and nothing else, and uses your Arrow, with the Netty, Jackson and FlatBuffers that Arrow came with. `arrow_to_java()` then returns a `VectorSchemaRoot` of your Arrow, which your Java code can take as an argument.
+
+Nothing has to be set. The classpath must bring all of Arrow that the server uses (`arrow-vector`, `arrow-format`, `arrow-memory-core`, `arrow-memory-netty` and its buffer patch, Netty's `netty-buffer` and `netty-common`, `flatbuffers-java`), which Spark's does, in JARs it names or in ones their manifests name (`Class-Path`). It must also be Arrow 18.3 or later, the one the server is built with. A classpath whose Arrow is older or incomplete gets the first JAR, as every classpath did before, and a warning that says why. The server is tested on Spark 4.1.1 (Arrow 18.3) and Spark 4.3.0 (Arrow 19.0).
+
+To decide it yourself, pass `server_jar="thin"` or `server_jar="full"` to `connect()` (also `GATUN_SERVER_JAR`, and `server_jar` under `[tool.gatun]`); the default is `"auto"`. On your Arrow the server's Netty is yours too, and reads its settings under their own names: `-Dio.netty.maxDirectMemory`, not `-Dgatun.shaded.io.netty.maxDirectMemory`, which the launcher warns about there. That limit is then one limit for the server's Arrow memory and your code's Netty buffers together.
+
 The BridgeAdapter API can be used directly:
 
 ```python
@@ -963,6 +974,8 @@ Or environment variables:
 export GATUN_MEMORY=64MB
 export GATUN_SOCKET_PATH=/tmp/gatun.sock
 ```
+
+The launcher waits `startup_timeout` seconds (default 30; `GATUN_STARTUP_TIMEOUT`) for the server to listen. A server that fails to start is reported at once with its output; the timeout is only for one that neither starts nor exits. A JVM with a few hundred JARs on its classpath can take several seconds on a small machine.
 
 `memory` takes `KB` / `MB` / `GB` (or `K` / `M` / `G`), a fraction such as `"1.5GB"`, or a number of bytes; the minimum is 192KB. With a fixed `socket_path`, launching fails if a live server is already listening there.
 

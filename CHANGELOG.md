@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- A second server JAR, `gatun-server-thin.jar`, with the server's own classes and nothing else. The launcher starts the server from it when the `classpath` brings its own Apache Arrow, and the server then runs on that Arrow and on the Netty, Jackson and FlatBuffers it came with. Spark 4.3.0 (Arrow 19.0, Jackson 2.21) works: 26 of the 39 Spark tests failed there, because the server's Arrow 18.3 and Jackson 2.20 stood in front of Spark's
+- `server_jar="thin"` / `"full"` for `connect()`, `aconnect()`, `launch_gateway()` and `GatunAdapter`, also `server_jar` under `[tool.gatun]` and `GATUN_SERVER_JAR`, decide which server JAR is started. The default, `"auto"`, takes the thin one when the classpath (its entries, and what their manifests add with `Class-Path`) brings all of an Arrow 18.3 or later; an Arrow that is older or incomplete gets the full JAR in front of it, as before, and a warning
+- CI runs the Spark tests, and the whole suite with the server on Spark's classpath, against Spark 4.1.1 and 4.3.0
 - `benchmarks/benchmark_comparison.py --py4j-nodelay` runs Py4J's server with `TCP_NODELAY` set on the connections it accepts
 - A Python `int` that does not fit in 64 bits is sent as a `java.math.BigInteger`, and a `decimal.Decimal` as a `java.math.BigDecimal` with the same digits and scale. Both were refused (`TypeError`). An `int` that fits travels as before, and is converted where the parameter is a `BigInteger` or `BigDecimal`, so that `big.add(5)` works like `big.add(2**70)`; a `float` is never taken for a `BigDecimal`. `Decimal("NaN")` and the infinities raise `ValueError`
 - Numbers of other libraries are accepted as arguments: any `numbers.Integral` value is sent as an `int` and any `numbers.Real` value as a `float`, which covers numpy's scalars. numpy is not imported
@@ -18,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Python 3.11 and 3.12 are supported; the floor was 3.13. CI runs the suite on 3.11, 3.12, 3.13 and 3.14
 
 ### Changed
+- Jackson is relocated in the server's JAR (`gatun.shaded.com.fasterxml.jackson`), like Netty. It was there under its own name, at the version of Spark 4.1, in front of whatever Jackson the classpath had
+- On a classpath with its own Arrow the server's Netty is the classpath's: it reads `-Dio.netty.maxDirectMemory`, and that limit covers the server's Arrow memory and the classpath's Netty buffers together. `-Dgatun.shaded.io.netty.*` flags have no effect there, and the launcher warns about one
+- `tests/test_spark_integration.py` skips a Spark older than 4, and fails instead of skipping when `GATUN_REQUIRE_SPARK` names a version that is not the one found
+- `startup_timeout` defaults to 30 seconds, from 5. With Spark's 280 JARs on the classpath a server on a small machine has needed more than five seconds to listen. A server that fails to start is still reported at once
+- `tests/test_spark_integration.py` finds Spark through `SPARK_HOME`, a distribution extracted in the repository root, or an installed `pyspark`. It looked for `spark-4.1.1-bin-hadoop3/` only
 - **A `java.math.BigDecimal` is returned as a `decimal.Decimal` and a `java.math.BigInteger` as an `int`**, as return values, field values, callback arguments and elements of lists and maps. They were `JavaObject`s. Code that called methods on such a result (`value.add(...)`, `value.toString()`) now gets the Python number instead; to keep the Java object, construct it (`client.jvm.java.math.BigDecimal("1.50")` is still a `JavaObject`) or pass `return_object_ref=True`. Subclasses of the two, and other `Number` classes such as `AtomicLong`, are objects as before
 - A bridge method is called only when no other method matches. `dec.compareTo(5)` on a `BigDecimal` went to the compiler-made `compareTo(Object)`, whose `Object` parameter scored above the conversion of the int, and failed in its cast
 - Protocol version is now 7: two new values, `BigIntVal` and `DecimalVal`, and `Response.error_object`. Client and server must be upgraded together

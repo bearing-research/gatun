@@ -371,6 +371,7 @@ def test_gatun_adapter_passes_classpath(monkeypatch):
         socket_timeout=120.0,
         callback_timeout=None,
         allow_all=True,
+        server_jar="full",
     )
 
     assert seen == {
@@ -381,4 +382,5 @@ def test_gatun_adapter_passes_classpath(monkeypatch):
         "socket_timeout": 120.0,
         "callback_timeout": None,
         "allow_all": True,
+        "server_jar": "full",
     }

@@ -39,6 +39,7 @@ class GatunAdapter(BridgeAdapter):
         socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
         callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
         allow_all: bool | None = None,
+        server_jar: str | None = None,
     ):
         """Create a new GatunAdapter.
 
@@ -50,6 +51,8 @@ class GatunAdapter(BridgeAdapter):
             socket_timeout: Seconds to wait for one call's response; None for no limit
             callback_timeout: Seconds a Python callback may run; None for no limit
             allow_all: True lifts the class allowlist: every class can be used
+            server_jar: "thin" or "full" to choose the server JAR; by default the
+                        launcher takes the thin one on a classpath with its own Arrow
         """
         # connect() launches the server and returns a connected client
         self._client: GatunClient | None = gatun_connect(
@@ -60,6 +63,7 @@ class GatunAdapter(BridgeAdapter):
             socket_timeout=socket_timeout,
             callback_timeout=callback_timeout,
             allow_all=allow_all,
+            server_jar=server_jar,
         )
 
     # === Object Lifecycle ===
