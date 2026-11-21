@@ -255,10 +255,11 @@ def test_list_of_bools_and_ints_keeps_both(client):
     assert [type(item) for item in back] == [bool, int, bool]
 
 
-def test_list_with_an_integer_past_64_bits_is_refused(client):
-    with pytest.raises(Exception, match="(?i)int|range|format|overflow"):
-        client.jvm.java.util.ArrayList([1, 2**64])
-    # the half-built command was dropped, and the client still works
+def test_list_with_an_integer_past_64_bits(client):
+    """The list cannot be one vector of longs; it travels element by element,
+    the large one as a BigInteger."""
+    items = client.jvm.java.util.ArrayList([1, 2**64, -(2**70)])
+    assert list(items) == [1, 2**64, -(2**70)]
     assert client.jvm.java.util.ArrayList([1, 2]).size() == 2
 
 

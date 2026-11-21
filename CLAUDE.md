@@ -883,6 +883,8 @@ Gatun uses specificity scoring to resolve overloaded Java methods:
 2. Compatible types (e.g., `String` matching `CharSequence`) get medium priority
 3. `Object` parameters get lowest priority
 4. Non-varargs methods are preferred over varargs
+5. A Python `int` matches a `BigInteger` or `BigDecimal` parameter below all of the above
+6. A bridge method (the compiler's `compareTo(Object)` beside `compareTo(BigDecimal)`) is called only when nothing else matches: its `Object` parameter would outscore every conversion the real method needs
 
 Note: For methods with `double` parameters (like `Math.pow`), pass Python floats:
 ```python

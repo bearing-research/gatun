@@ -598,9 +598,9 @@ class TestPackedCalls:
         assert items.size() == 5
         assert items.get(3) == {"a": 1}
         assert items.get(4) == 5
-        # The builder's own refusal of an integer past 64 bits
-        with pytest.raises(TypeError, match="bad number"):
-            items.add(2**70)
+        # An integer past 64 bits is the builder's too: a BigInteger
+        items.add(2**70)
+        assert items.get(5) == 2**70
 
     def test_a_command_that_does_not_fit_is_refused(self, client):
         items = client.create_object("java.util.ArrayList")

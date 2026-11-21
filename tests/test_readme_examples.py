@@ -2,7 +2,7 @@
 
 import pytest
 
-from gatun import JavaArray, aconnect, connect, java_import
+from gatun import JavaArray, JavaObject, aconnect, connect, java_import
 
 
 class TestQuickStart:
@@ -474,7 +474,10 @@ class TestBigNumbersAndConverters:
             big = BigInteger("10")
             assert big.add(5) == 15
             dec = BigDecimal("1.50")
-            total = client.invoke_method(dec, "add", Decimal(1), return_object_ref=True)
+            total = client.invoke_method(
+                dec.object_id, "add", Decimal(1), return_object_ref=True
+            )
+            assert isinstance(total, JavaObject)
             assert total.scale() == 2
         finally:
             client.close()

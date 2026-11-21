@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **A `java.math.BigDecimal` is returned as a `decimal.Decimal` and a `java.math.BigInteger` as an `int`**, as return values, field values, callback arguments and elements of lists and maps. They were `JavaObject`s. Code that called methods on such a result (`value.add(...)`, `value.toString()`) now gets the Python number instead; to keep the Java object, construct it (`client.jvm.java.math.BigDecimal("1.50")` is still a `JavaObject`) or pass `return_object_ref=True`. Subclasses of the two, and other `Number` classes such as `AtomicLong`, are objects as before
+- A bridge method is called only when no other method matches. `dec.compareTo(5)` on a `BigDecimal` went to the compiler-made `compareTo(Object)`, whose `Object` parameter scored above the conversion of the int, and failed in its cast
 - Protocol version is now 6: two new values, `BigIntVal` and `DecimalVal`. Client and server must be upgraded together
 
 ### Fixed
