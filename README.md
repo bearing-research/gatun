@@ -29,19 +29,23 @@ Measured on Linux (8 vCPUs of a shared AMD EPYC 7713, OpenJDK 22.0.2, Python 3.1
 
 ### Single Calls
 
-A call with plain arguments is one round trip and takes 31 to 39 μs. Py4J (PySpark's bridge) takes 41 to 67 μs for an instance call and makes two round trips for a static one. The gap is wider where a call carries a collection or returns something large:
+A call with plain arguments is one round trip and takes 31 to 39 μs. A plain instance call and creating an object cost about the same through Py4J (PySpark's bridge), which makes two round trips for a static call. The gap is wide where a call carries a collection or returns something large:
 
 | Operation | Gatun | Py4J | |
 |-----------|------:|-----:|---|
-| Instance method call (`list.size()`) | 33 μs | 42 μs | Gatun 1.3x faster |
+| Instance method call (`list.size()`) | 33 μs | 42 μs | about the same |
+| Create an object and drop it (`ArrayList()`) | 46 μs | 47 μs | about the same |
 | Static method call (`Math.max(10, 20)`) | 39 μs | 113 μs | Gatun 2.9x faster |
-| Create an object and drop it (`ArrayList()`) | 46 μs | 47 μs | the same |
-| Calls in a loop | 28,500 /s | 18,800 /s | Gatun 1.5x faster |
 | Python list of 100 as an argument | 0.28 ms | 5.6 ms | Gatun 20x faster |
 | `is_instance_of` | 31 μs | 275 μs | Gatun 8.8x faster |
-| Return a 16 KB `byte[]` | 66 μs | 42 ms | Gatun 640x faster |
+| Return a 16 KB `byte[]` | 66 μs | 42 ms | Gatun 640x faster, see below |
 
-Both bridges were given the same JVM settings and a warm JVM, with classes bound once (`Math = jvm.java.lang.Math`). A handle that is dropped is released with the next call, not with a round trip of its own. Two runs on this shared machine differ by up to a third on a single row, so read the small differences as "about the same".
+Both bridges were given the same JVM settings and a warm JVM, with classes bound once (`Math = jvm.java.lang.Math`). A handle that is dropped is released with the next call, not with a round trip of its own.
+
+Two things to know before reading the table:
+
+- **The first two rows are not a lead.** Two runs on this shared machine differ by up to a third on a single row, and a run on another machine (2 vCPUs) had Py4J level with Gatun on both, or up to 1.4 times ahead. What reproduced there is the rest: static calls, `is_instance_of`, collections as arguments and bulk data.
+- **The last row is Nagle's algorithm, not Py4J's protocol.** Py4J's server does not set `TCP_NODELAY`, so a value of 8 KB or more that it returns waits about 40 ms for a delayed acknowledgement. With the option set on the server's connections, the same Py4J returned strings of 8 to 32 KB in 0.2 to 0.3 ms, which leaves Gatun about 3 times faster. A program on stock Py4J sees the 40 ms.
 
 ### Fewer Round Trips
 
@@ -86,7 +90,7 @@ A callback made during a request (a Python comparator in `Collections.sort`) cos
 
 | Use Case | Recommendation |
 |----------|----------------|
-| Many small calls, one at a time | Either: Gatun made about 1.5 times the calls per second on the test machine |
+| Many small calls, one at a time | Either: plain instance calls and object creation cost about the same; static calls are one round trip for Gatun and two for Py4J |
 | Bulk data | Gatun: Arrow tables through shared memory |
 | Collections as arguments, large return values | Gatun |
 | Many operations that can be sent together | Gatun: `batch()` and the vectorized calls |
