@@ -149,13 +149,23 @@ public class GatunServer {
    * Holds session context for callback invocations. This is captured by the callback proxy so that
    * callbacks can be invoked from any thread, not just the handleClient thread.
    */
+  /**
+   * What the threads of one client share: its objects, its callbacks, its limits and its callback
+   * connection. The connections themselves are its channels, one per Python thread (see {@link
+   * ChannelContext}).
+   */
   private static class SessionContext {
-    final SocketChannel channel;
-    final MemorySegment sharedMem;
-    final Set<Long> sessionObjectIds; // Track object IDs for cleanup
-    final Set<Long> sessionCallbackIds;
+    // Several threads register and release objects for one session: each channel's own, and
+    // the threads that call Python on the callback connection
+    final Set<Long> sessionObjectIds = ConcurrentHashMap.newKeySet();
+    final Set<Long> sessionCallbackIds = ConcurrentHashMap.newKeySet();
     final SessionQuota quota;
-    final SessionControl control = new SessionControl();
+
+    // The connection that made the session, and that it lives as long as. Set before the
+    // session can be found by anyone else.
+    volatile ChannelContext first;
+    // Every channel that is open, the first among them
+    final Set<ChannelContext> channels = ConcurrentHashMap.newKeySet();
 
     // The callback connection, for threads other than the session's own. The listener is set
     // from OpenCallbackChannel until the client has connected to it; the channel from then on.
@@ -167,27 +177,48 @@ public class GatunServer {
     // for as long as there are any, whatever its own channel is doing.
     final AtomicInteger channelCalls = new AtomicInteger();
 
-    SessionContext(
-        SocketChannel channel,
-        MemorySegment sharedMem,
-        Set<Long> sessionObjectIds,
-        Set<Long> sessionCallbackIds,
-        SessionQuota quota) {
-      this.channel = channel;
-      this.sharedMem = sharedMem;
-      this.sessionObjectIds = sessionObjectIds;
-      this.sessionCallbackIds = sessionCallbackIds;
+    SessionContext(SessionQuota quota) {
       this.quota = quota;
+    }
+
+    /** Whether any channel is running a request. */
+    boolean isRequestActive() {
+      for (ChannelContext channel : channels) {
+        if (channel.control.isRequestActive()) {
+          return true;
+        }
+      }
+      return false;
     }
   }
 
   /**
-   * Lets another connection cancel the request a session is running.
+   * One connection of a session: a socket, a shared memory file of its own, and the thread that
+   * serves them, which is the thread that makes one. A client has one for each of its threads that
+   * calls Java, so that all calls of a Python thread run on one JVM thread and no thread waits for
+   * another's request. The first is made by connecting to the server's socket and creates the
+   * session; the others join it on the join socket.
+   */
+  private static final class ChannelContext {
+    final SessionContext session;
+    final SocketChannel socket;
+    final MemorySegment sharedMem;
+    final SessionControl control = new SessionControl();
+
+    ChannelContext(SessionContext session, SocketChannel socket, MemorySegment sharedMem) {
+      this.session = session;
+      this.socket = socket;
+      this.sharedMem = sharedMem;
+    }
+  }
+
+  /**
+   * Lets another connection cancel the request a channel is running.
    *
-   * <p>A session's own channel is busy for as long as its request runs, so a cancel has to come in
-   * on a different connection, which names the session by its shared memory path. Cancelling
-   * interrupts the session's thread, but only while it is running the request's Java code:
-   * interrupting a thread that is reading or writing the session's socket would close the socket.
+   * <p>A channel is busy for as long as its request runs, so a cancel has to come in on a different
+   * connection, which names the channel by its shared memory path. Cancelling interrupts the
+   * channel's thread, but only while it is running the request's Java code: interrupting a thread
+   * that is reading or writing the channel's socket would close the socket.
    */
   private static final class SessionControl {
     private final Thread thread = Thread.currentThread();
@@ -242,18 +273,27 @@ public class GatunServer {
     synchronized boolean isRequestActive() {
       return requestActive;
     }
-
-    boolean isSessionThread() {
-      return Thread.currentThread() == thread;
-    }
   }
 
-  // Sessions by shared memory path, for Cancel and for reaping idle sessions
+  // Sessions by the shared memory path of their first channel, for joining one and for reaping
+  // the idle ones
   private final Map<String, SessionContext> sessions = new ConcurrentHashMap<>();
   private final AtomicInteger sessionCount = new AtomicInteger();
+  // Every channel by its shared memory path, for Cancel
+  private final Map<String, ChannelContext> channels = new ConcurrentHashMap<>();
 
-  // Per-session context stored in ThreadLocal for the handleClient thread
+  // The session a thread is working for: on a channel's thread the channel's session, and on
+  // any other thread only while it runs something for one (see callOnChannel)
   private static final ThreadLocal<SessionContext> sessionContext = new ThreadLocal<>();
+
+  // The channel a thread serves, on the threads that serve one
+  private static final ThreadLocal<ChannelContext> channelContext = new ThreadLocal<>();
+
+  /** The channel of {@code session} that the current thread serves, or null. */
+  private static ChannelContext ownChannel(SessionContext session) {
+    ChannelContext channel = channelContext.get();
+    return channel != null && channel.session == session ? channel : null;
+  }
 
   // Per-session: current request ID for cancellation support
   private static final ThreadLocal<Long> currentRequestId = new ThreadLocal<>();
@@ -392,6 +432,9 @@ public class GatunServer {
             }));
 
     // --- START SOCKET SERVER ---
+    // Before the server's own socket: a client that could connect there must find this one
+    openJoinSocket();
+
     try (ServerSocketChannel serverChannel =
         ServerSocketChannel.open(StandardProtocolFamily.UNIX)) {
       serverChannel.bind(UnixDomainSocketAddress.of(socketPath));
@@ -449,7 +492,7 @@ public class GatunServer {
               }
               return;
             }
-            handleClient(client, sessionId);
+            handleClient(client, sessionId, null);
           });
         } catch (OutOfMemoryError | RuntimeException e) {
           // No thread for it: the process is at its limit of threads, which the JVM reports
@@ -526,6 +569,126 @@ public class GatunServer {
   // How long a connection waits for a session slot before it is refused
   private static final long SESSION_SLOT_WAIT_MS = 2_000;
 
+  // Appended to the server's socket path: where further channels of a session connect
+  private static final String JOIN_SUFFIX = ".join";
+  private static final int JOIN_BACKLOG = 1024;
+
+  /**
+   * Listen on {@code <socket>.join}, where a client's further threads connect for a channel of
+   * their own in a session that exists.
+   *
+   * <p>A socket of its own, and not a request on the session's channel: that channel is the one
+   * that is busy when another thread wants to call. And not the server's socket: a connection there
+   * is a new session, which counts against {@code max_sessions}, before the client has said
+   * anything. Without this socket (a path too long to bind, say) the server runs as it did, and a
+   * client's threads share its one channel.
+   */
+  private void openJoinSocket() {
+    Path path = Path.of(socketPath.toString() + JOIN_SUFFIX);
+    ServerSocketChannel listener = null;
+    try {
+      Files.deleteIfExists(path);
+      listener = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
+      sessionFiles.add(path);
+      // A pool of threads makes its first calls at once, and each is a connection here. A
+      // full queue refuses on macOS, where the system caps this number at 128 by default.
+      listener.bind(UnixDomainSocketAddress.of(path), JOIN_BACKLOG);
+      Files.setPosixFilePermissions(path, OWNER_ONLY);
+      // Known before the first connection is accepted: isSameUser lets everyone in until it
+      // is, and a connection may have been queued between the two lines above
+      serverUser = Files.getOwner(path);
+      ServerSocketChannel accepting = listener;
+      Thread.ofPlatform().daemon(true).name("gatun-join").start(() -> acceptJoins(accepting));
+    } catch (IOException | RuntimeException | OutOfMemoryError e) {
+      LOG.log(
+          Level.WARNING, "No join socket at " + path + ": threads of a client share a channel", e);
+      if (listener != null) {
+        try {
+          listener.close();
+        } catch (IOException closing) {
+          // nothing was listening
+        }
+      }
+      deleteQuietly(path);
+      sessionFiles.remove(path);
+    }
+  }
+
+  private void acceptJoins(ServerSocketChannel listener) {
+    while (true) {
+      SocketChannel client;
+      try {
+        client = listener.accept();
+      } catch (java.nio.channels.ClosedChannelException e) {
+        return;
+      } catch (IOException e) {
+        // Out of file descriptors, typically; see the server's own accept loop
+        LOG.log(Level.WARNING, "Could not accept a channel", e);
+        try {
+          Thread.sleep(100);
+        } catch (InterruptedException interrupted) {
+          return;
+        }
+        continue;
+      }
+      long channelId = sessionCounter.incrementAndGet();
+      try {
+        if (!isSameUser(client)) {
+          LOG.warning("Refused a channel from another user");
+          client.close();
+          continue;
+        }
+        // A new thread each time, like a session's: all calls of one Python thread run on
+        // it, and its thread-locals end with it
+        Thread.ofPlatform()
+            .daemon(true)
+            .name("gatun-channel-" + channelId)
+            .start(() -> joinSession(client, channelId));
+      } catch (IOException | OutOfMemoryError | RuntimeException e) {
+        LOG.log(Level.WARNING, "Refused a channel: could not start its thread", e);
+        try {
+          client.close();
+        } catch (IOException closing) {
+          // already gone
+        }
+      }
+    }
+  }
+
+  /**
+   * Read which session a new channel is for and serve it. The client sends {@code [4 bytes:
+   * protocol version][2 bytes: length][the shared memory path of the session's first channel]} and
+   * gets the handshake a session gets, with this channel's own shared memory, or a closed
+   * connection. The path is no secret and need not be one: the socket is the user's own, as the
+   * server's is.
+   */
+  private void joinSession(SocketChannel client, long channelId) {
+    SessionContext session = null;
+    try {
+      ByteBuffer head = ByteBuffer.allocate(6).order(ByteOrder.LITTLE_ENDIAN);
+      if (readFully(client, head)) {
+        head.flip();
+        int version = head.getInt();
+        ByteBuffer name = ByteBuffer.allocate(head.getShort() & 0xFFFF);
+        if (version == PROTOCOL_VERSION && readFully(client, name)) {
+          session = sessions.get(new String(name.array(), java.nio.charset.StandardCharsets.UTF_8));
+        }
+      }
+    } catch (IOException e) {
+      // the client went away
+    }
+    if (session == null || session.closed) {
+      LOG.fine("Refused channel " + channelId + ": it names no session that is open");
+      try {
+        client.close();
+      } catch (IOException e) {
+        // already gone
+      }
+      return;
+    }
+    handleClient(client, channelId, session);
+  }
+
   /**
    * Count one more session, if the limit allows. A slot is given back when the server notices its
    * session's socket closing, a moment after the client closed it, so a connection that arrives
@@ -584,12 +747,16 @@ public class GatunServer {
         return;
       }
       for (SessionContext session : sessions.values()) {
-        if (session.quota.isTimedOut()
-            && !session.control.isRequestActive()
+        // Idle is when no channel runs a request and no callback is in flight. Closing the
+        // first channel ends the session, and with it the others.
+        ChannelContext first = session.first;
+        if (first != null
+            && session.quota.isTimedOut()
+            && !session.isRequestActive()
             && session.channelCalls.get() == 0) {
           LOG.warning("Closing idle session " + session.quota.getSessionId());
           try {
-            session.channel.close();
+            first.socket.close();
           } catch (IOException e) {
             // already closing
           }
@@ -832,18 +999,34 @@ public class GatunServer {
     }
   }
 
-  private void handleClient(SocketChannel client, long sessionId) {
-    // Threads calling Python on the callback connection register the objects they pass
-    Set<Long> sessionObjectIds = ConcurrentHashMap.newKeySet();
-    // Concurrent: a callback on another thread can unregister one
-    Set<Long> sessionCallbackIds = ConcurrentHashMap.newKeySet();
+  /**
+   * Serve one channel until its connection closes, on the thread that will run all its requests.
+   *
+   * @param channelId names the channel's shared memory file, and the session if this channel makes
+   *     one
+   * @param joined the session this channel joins, or null for a connection to the server's own
+   *     socket, which makes a session and is its first channel
+   */
+  private void handleClient(SocketChannel client, long channelId, SessionContext joined) {
+    boolean first = joined == null;
+    SessionContext ctx = first ? new SessionContext(new SessionQuota(channelId)) : joined;
+    long sessionId = ctx.quota.getSessionId();
+    Set<Long> sessionObjectIds = ctx.sessionObjectIds;
+    Set<Long> sessionCallbackIds = ctx.sessionCallbackIds;
+    // Each channel has its own: it follows the one request the channel's thread runs
     SessionObserver observer = new SessionObserver(sessionId);
-    SessionQuota quota = new SessionQuota(sessionId);
-    LOG.fine("New client session " + sessionId + " started");
+    SessionQuota quota = ctx.quota;
+    LOG.fine(
+        first
+            ? "New client session " + sessionId + " started"
+            : "Channel " + channelId + " joins session " + sessionId);
 
-    // Create per-session shared memory file
-    Path sessionShmPath = Path.of(socketPath.toString() + "." + sessionId + ".shm");
+    // Create the channel's shared memory file
+    Path sessionShmPath = Path.of(socketPath.toString() + "." + channelId + ".shm");
     sessionFiles.add(sessionShmPath);
+    ChannelContext self = null;
+    // Arrow bytes this channel's arena has charged to the session's quota
+    long arenaBytes = 0;
 
     // Tables the client lends are read through a mapping of their own, which is made by the
     // first loan and can outlive the session (see ArrowLoans)
@@ -862,12 +1045,23 @@ public class GatunServer {
 
       LOG.fine("Session " + sessionId + " SHM mapped at: " + sessionShmPath);
 
-      // Set up session context for callbacks (captured by callback proxies)
-      SessionContext ctx =
-          new SessionContext(client, sharedMem, sessionObjectIds, sessionCallbackIds, quota);
+      // The session is what callback proxies capture; the channel is this thread's own
+      self = new ChannelContext(ctx, client, sharedMem);
       sessionContext.set(ctx);
-      SessionControl control = ctx.control;
-      sessions.put(sessionShmPath.toString(), ctx);
+      channelContext.set(self);
+      SessionControl control = self.control;
+      ctx.channels.add(self);
+      channels.put(sessionShmPath.toString(), self);
+      if (first) {
+        ctx.first = self;
+        sessions.put(sessionShmPath.toString(), ctx);
+      } else if (ctx.closed) {
+        // It ended while this channel was being set up, and did not find it to close
+        throw new IOException("the session has ended");
+      } else {
+        // A thread of the client is about to call: the session is not idle
+        quota.touchActivity();
+      }
       // Each command is copied here before it is read (see the request loop)
       byte[] commandCopy = new byte[(int) PAYLOAD_OFFSET];
 
@@ -890,7 +1084,9 @@ public class GatunServer {
       }
 
       // Notify observer of session start
-      observer.onSessionStart(sessionShmPath.toString());
+      if (first) {
+        observer.onSessionStart(sessionShmPath.toString());
+      }
 
       ByteBuffer lengthBuf = ByteBuffer.allocate(4);
       lengthBuf.order(ByteOrder.LITTLE_ENDIAN);
@@ -901,8 +1097,10 @@ public class GatunServer {
 
       while (readFully(client, lengthBuf)) {
         // A request that arrives after the idle timeout is answered with the reason before the
-        // session closes; the reaper may not have got to this session yet
-        if (quota.isTimedOut()) {
+        // session closes; the reaper may not have got to this session yet. Idle is what it is
+        // for the reaper: a request that another channel is running, or a callback in flight,
+        // records no activity until it ends, and a session in use is not idle.
+        if (quota.isTimedOut() && !ctx.isRequestActive() && ctx.channelCalls.get() == 0) {
           LOG.warning("Session " + sessionId + " timed out due to inactivity");
           // The client is still sending a command that follows its length, and would get a
           // broken pipe in place of the reason
@@ -976,8 +1174,8 @@ public class GatunServer {
         // Cancel names another session by its shared memory path and asks for its running
         // request to be interrupted. It is answered at once: true if there was one.
         if (cmd.action() == Action.Cancel) {
-          SessionContext target = sessions.get(String.valueOf(cmd.targetName()));
-          boolean delivered = target != null && target != ctx && target.control.cancel();
+          ChannelContext target = channels.get(String.valueOf(cmd.targetName()));
+          boolean delivered = target != null && target != self && target.control.cancel();
           LOG.fine("Cancel for " + cmd.targetName() + (delivered ? " delivered" : " ignored"));
           observer.onRequestEnd(true, null, null);
 
@@ -1259,6 +1457,7 @@ public class GatunServer {
               arrowHandler.close(); // over quota: do not keep the batch
               throw e;
             }
+            arenaBytes += received.totalBytes();
             observer.onArrowTransfer(
                 "python_to_java", received.numRows(), received.totalBytes(), true);
             result = "Received " + received.numRows() + " rows via zero-copy buffers";
@@ -1269,8 +1468,10 @@ public class GatunServer {
             arrowHandler.reset();
             // The client is about to reuse the whole zone
             loans.endAll();
-            // Reset Arrow buffer quota when arena is reset
-            quota.resetArrowBytes();
+            // The arena's bytes come off the session's count. This channel's only: the
+            // count is the session's, and another thread's arena is still in use.
+            quota.releaseArrowBytes(arenaBytes);
+            arenaBytes = 0;
             result = true;
           }
           // --- GET ARROW DATA (Java -> Python) ---
@@ -1508,21 +1709,46 @@ public class GatunServer {
           builder.finish(responseOffset);
           resBuf = builder.dataBuffer();
           resSize = resBuf.remaining();
+        } else if (!first && ctx.closed) {
+          // The session ended while the request ran, and its cleanup may already have gone
+          // past what the request registered. The socket is closed; nobody reads this.
+          discardNested(
+              requestSuccess ? result : null,
+              requestSuccess ? vectorResults : null,
+              packedIds,
+              ctx);
+          packedIds.clear();
+          vectorResults = null;
+          result = null;
         }
 
         // Record request completion in observer
         observer.onRequestEnd(requestSuccess, errorType, errorMessage);
 
         // 5. Signal Python
-        if (resSize <= RESPONSE_ZONE_SIZE) {
-          MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
-          responseSlice.copyFrom(MemorySegment.ofBuffer(resBuf));
-          lengthBuf.putInt(resSize);
-          lengthBuf.flip();
-          client.write(lengthBuf);
-          lengthBuf.clear();
-        } else {
-          writeMessage(client, sharedMem, resBuf);
+        try {
+          if (resSize <= RESPONSE_ZONE_SIZE) {
+            MemorySegment responseSlice = sharedMem.asSlice(this.responseOffset, resSize);
+            responseSlice.copyFrom(MemorySegment.ofBuffer(resBuf));
+            lengthBuf.putInt(resSize);
+            lengthBuf.flip();
+            client.write(lengthBuf);
+            lengthBuf.clear();
+          } else {
+            writeMessage(client, sharedMem, resBuf);
+          }
+        } catch (IOException e) {
+          if (!first) {
+            // The thread this channel served is gone, or gave the request up (a timeout),
+            // and its session goes on: nobody will release what this response names. When
+            // the first channel is lost the session ends, and everything goes with it.
+            discardNested(
+                requestSuccess ? result : null,
+                requestSuccess ? vectorResults : null,
+                packedIds,
+                ctx);
+          }
+          throw e;
         }
         if (builderGrew) {
           responseBuilder = new FlatBufferBuilder(1024);
@@ -1533,8 +1759,10 @@ public class GatunServer {
     } catch (IOException e) {
       // Losing the connection is how sessions normally end; failing to set one up is not
       LOG.log(
-          sessions.containsKey(sessionShmPath.toString()) ? Level.FINE : Level.WARNING,
-          "Client session " + sessionId + " ended: " + e.getMessage());
+          self != null ? Level.FINE : Level.WARNING,
+          (first ? "Client session " + sessionId : "Channel " + channelId)
+              + " ended: "
+              + e.getMessage());
     } catch (RuntimeException | Error e) {
       // Nothing waits on this task's result, so an unexpected failure (during session setup,
       // say) would otherwise close the connection without a trace
@@ -1547,22 +1775,42 @@ public class GatunServer {
       } catch (IOException e) {
         // already gone
       }
-      closeCallbackConnection(sessionContext.get());
+      channels.remove(sessionShmPath.toString());
+      if (self != null) {
+        ctx.channels.remove(self);
+      }
+      if (first) {
+        // The session ends with its first channel. This sets `closed`: from here on a
+        // request still running on another channel drops what it registers.
+        closeCallbackConnection(ctx);
+        for (ChannelContext other : ctx.channels) {
+          try {
+            other.socket.close();
+          } catch (IOException e) {
+            // already gone
+          }
+        }
 
-      // Notify observer of session end
-      observer.onSessionEnd(quota.getTotalObjectsCreated());
+        // Notify observer of session end
+        observer.onSessionEnd(quota.getTotalObjectsCreated());
 
-      // Log quota summary
-      LOG.fine(quota.getSummary());
+        // Log quota summary
+        LOG.fine(quota.getSummary());
 
-      // Cleanup orphans: remove session objects and callbacks from global registries
-      for (Long id : sessionObjectIds) removeObject(id);
-      for (Long id : sessionCallbackIds) callbackRegistry.remove(id);
-      // After the objects: that ended the loans the registry knew of
+        // Cleanup orphans: remove session objects and callbacks from global registries
+        for (Long id : sessionObjectIds) removeObject(id);
+        for (Long id : sessionCallbackIds) callbackRegistry.remove(id);
+        sessions.remove(sessionShmPath.toString());
+        sessionCount.decrementAndGet();
+      }
+      // After the objects: that ended the loans the registry knew of. On a channel that
+      // joined, this is what ends the tables lent from its memory; the objects stay, they
+      // are the session's.
       loans.close();
-      sessions.remove(sessionShmPath.toString());
-      sessionCount.decrementAndGet();
+      // What this channel's arena held is gone with its memory
+      quota.releaseArrowBytes(arenaBytes);
       sessionContext.remove();
+      channelContext.remove();
       currentRequestId.remove();
       argumentNestingDepth.remove();
       // Clean up session shared memory file
@@ -1594,11 +1842,11 @@ public class GatunServer {
    * @return true if the current request was cancelled
    */
   public static boolean isCancelled() {
-    // A cancel is for the request the session's own thread is running, not for whatever a
+    // A cancel is for the request a channel's own thread is running, not for whatever a
     // callback on another thread has that thread do for the session meanwhile
-    SessionContext ctx = sessionContext.get();
+    ChannelContext channel = ownChannel(sessionContext.get());
     return Thread.currentThread().isInterrupted()
-        || (ctx != null && ctx.control.isSessionThread() && ctx.control.isCancelled());
+        || (channel != null && channel.control.isCancelled());
   }
 
   /**
@@ -2970,7 +3218,8 @@ public class GatunServer {
                     callbackId, method.getName(), args == null ? new Object[0] : args, ctx);
             // A cancel that arrived during the round trip, when it could not interrupt. It is
             // aimed at the request's thread; another thread's call carries on.
-            if (ctx.control.isSessionThread() && ctx.control.isCancelled()) {
+            ChannelContext own = ownChannel(ctx);
+            if (own != null && own.control.isCancelled()) {
               throw new InterruptedException("Request was cancelled");
             }
             return callbackResult(result, method);
@@ -2999,10 +3248,13 @@ public class GatunServer {
    */
   private Object invokeCallback(
       long callbackId, String methodName, Object[] args, SessionContext ctx) throws Exception {
-    if (ctx == null || ctx.channel == null || ctx.sharedMem == null) {
+    if (ctx == null) {
       throw new IllegalStateException("Callback invoked with invalid session context");
     }
-    boolean inBand = ctx.control.isSessionThread();
+    // In band on the channel whose request this thread is running, if it is one of the
+    // session's: whichever thread of the client made that request is reading it
+    ChannelContext own = ownChannel(ctx);
+    boolean inBand = own != null;
     if (ctx.closed) {
       throw new IllegalStateException(
           "Python callback " + methodName + " was called after its client disconnected");
@@ -3021,7 +3273,7 @@ public class GatunServer {
     try {
       Object returnValue =
           inBand
-              ? exchangeCallback(callbackId, methodName, args, ctx)
+              ? exchangeCallback(callbackId, methodName, args, ctx, own)
               : callOnChannel(callbackId, methodName, args, ctx);
       success = true;
       return returnValue;
@@ -3160,13 +3412,14 @@ public class GatunServer {
 
   /** One callback round-trip in band: the request thread sends and reads on its own channel. */
   private Object exchangeCallback(
-      long callbackId, String methodName, Object[] args, SessionContext ctx) throws Exception {
+      long callbackId, String methodName, Object[] args, SessionContext ctx, ChannelContext own)
+      throws Exception {
 
-    SocketChannel channel = ctx.channel;
-    MemorySegment sharedMem = ctx.sharedMem;
+    SocketChannel channel = own.socket;
+    MemorySegment sharedMem = own.sharedMem;
 
     // The round trip uses the socket, so a cancel must not interrupt it
-    ctx.control.beginSocketUse();
+    own.control.beginSocketUse();
     try {
       ByteBuffer resBuf =
           buildCallbackRequest(0, callbackId, methodName, args, ctx, new ArrayList<>());
@@ -3201,7 +3454,7 @@ public class GatunServer {
 
       return readCallbackResult(Command.getRootAsCommand(cmdBuf));
     } finally {
-      ctx.control.endSocketUse();
+      own.control.endSocketUse();
     }
   }
 

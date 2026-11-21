@@ -1,6 +1,6 @@
 # Threads: one client, a channel per thread
 
-**Status: design. Nothing here is implemented yet.** Today a `GatunClient` shared between threads runs one request at a time (`_exchange_lock` in `client.py`), and a second client has objects of its own. This note says how several threads of one client will call Java at the same time on the same objects, and what that decides for two features that come first: the Java object an exception carries, and values larger than 64 KB.
+**Status: implemented** in the sync client and the server (`_Channel` in `client.py`, `ChannelContext` in `GatunServer.java`; tests in `tests/test_threads.py`). The note is kept as the reasoning behind that code, in the words of the time it was written: "today" below is the state before it, when a `GatunClient` shared between threads ran one request at a time (`_exchange_lock` in `client.py`) and a second client had objects of its own. It says how several threads of one client call Java at the same time on the same objects, and what that decided for two features that came first: the Java object an exception carries, and values larger than 64 KB.
 
 ## What it has to do
 

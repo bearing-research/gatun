@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import calendar
+import contextlib
 import contextvars
 import datetime
 import decimal
@@ -18,7 +19,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any, Generic, Literal, Self, TypeVar, cast, overload
 
 import flatbuffers
@@ -655,7 +656,7 @@ class ArrowTableView:
         self,
         table: pa.Table,
         epoch: int,
-        client: GatunClient | CallMemory,
+        client: _Channel | CallMemory,
         *,
         any_write: bool = False,
     ):
@@ -752,13 +753,20 @@ class _Loan:
     """The client's record of a table that is lent to Java: where it lies in
     the payload zone, and whether the server has been told that it is over."""
 
-    __slots__ = ("end", "ended", "object_id", "start")
+    __slots__ = ("channel", "end", "ended", "object_id", "released", "start")
 
-    def __init__(self, object_id: int, start: int, end: int):
+    def __init__(self, channel: _Channel, object_id: int, start: int, end: int):
+        # The channel whose payload zone the table lies in: the loan is ended
+        # on it, whichever thread ends it
+        self.channel = channel
         self.object_id = object_id
         self.start = start
         self.end = end
+        # The loan is over: the server has taken the table back
         self.ended = False
+        # The table's object went to the client's releases, because the loan's
+        # channel ended before the loan did (see GatunClient._end_loan)
+        self.released = False
 
 
 class ArrowLoan:
@@ -1911,6 +1919,37 @@ def _read_arrow_stream(
     return pa.ipc.open_stream(data).read_all()
 
 
+# How long a thread goes on trying a join socket that refuses it
+_JOIN_RETRY_SECONDS = 3.0
+
+
+def _connect_to_join_socket(path: str, client: Any) -> socket.socket:
+    """A connection to the server's join socket, for a thread's new channel.
+
+    A refusal is tried again for a while. macOS refuses a connection when the
+    listening socket's queue is full, which a pool of threads that make their
+    first calls at once can do; a server that is gone refuses every time.
+    FileNotFoundError, a server with no join socket, is the caller's to handle.
+    """
+    delay = 0.005
+    deadline = time.monotonic() + _JOIN_RETRY_SECONDS
+    while True:
+        # A new socket for each try: one that was refused is not good for another
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(path)
+            return sock
+        except ConnectionRefusedError:
+            sock.close()
+            if client._closed or client._dead or time.monotonic() >= deadline:
+                raise
+        except BaseException:
+            sock.close()
+            raise
+        time.sleep(delay)
+        delay = min(delay * 2, 0.1)
+
+
 def _close_shared_memory(client: Any) -> None:
     """Release a client's mapping of the shared memory file, best effort.
 
@@ -2730,7 +2769,167 @@ class _ValueEncoder:
             return Value.Value.ArrayVal, ArrayVal.End(builder)
 
 
+class _Channel:
+    """One connection of a client to its session: a socket, a mapping of a
+    shared memory file of its own, and on the server the thread that serves
+    them.
+
+    A client has one for each of its threads that calls Java, so every call
+    of a Python thread runs on one JVM thread, and no thread waits for a
+    request of another. The first is made by connect() and is the session:
+    it stays until close(). Each further thread joins the session with its
+    first call (GatunClient._open_channel) and its channel closes when the
+    thread ends.
+
+    The attributes have the names they had on the client, which reads them
+    through properties (the calling thread's channel) and so does a table
+    view, which is given the channel its memory belongs to.
+    """
+
+    def __init__(self, first: bool = False, frees: deque[int] | None = None):
+        self.first = first
+        # The client's queue of objects to release (GatunClient._pending_frees),
+        # for the lent tables this channel can no longer end itself
+        self._frees = frees
+        # The thread it serves (a weak reference), for cancel(thread)
+        self.thread: Any = None
+        # Set when the channel can carry no more requests: closed, or an
+        # exchange on it was interrupted after its command went out
+        self.dead = False
+        self.sock: socket.socket | None = None
+        # A socket that was shut down while a thread was inside an exchange,
+        # for that thread to close
+        self._shut: socket.socket | None = None
+        self.shm_file: Any = None  # BufferedRandom when connected
+        self.shm: mmap.mmap | None = None
+        self.memory_path: str | None = None
+
+        # One exchange at a time. Its own thread never waits for it; it is
+        # there for the things another thread does with this channel's memory:
+        # copying a table view out of it, ending a loan in it. Re-entrant
+        # because unpacking a response can itself make a call (hashing a
+        # JavaObject).
+        self._exchange_lock = threading.RLock()
+
+        # Schemas of the tables read in place, by the hash the server sends
+        # in their place. The server keeps its side of this per channel.
+        self._arrow_schema_cache: dict[int, pa.Schema] = {}
+
+        # Arena epoch for lifetime safety - tracks current valid epoch
+        self._arena_epoch: int = 0
+
+        # Where the batch Java loaded in place (send_arrow_buffers) ends in the
+        # payload zone; anything written before this would corrupt it
+        self._arrow_loaded_end: int = 0
+
+        # Bumped whenever something is written into the part of the payload
+        # zone that get_arrow_data()'s ArrowTableViews point at; see
+        # _note_payload_write
+        self._payload_generation: int = 0
+
+        # Bumped whenever anything is written into the payload zone at all. A
+        # table read in place by arrow_from_java(copy=False) can lie anywhere in it
+        self._payload_writes: int = 0
+
+        # Tables lent to Java (arrow_to_java(copy=False)) that the server has
+        # not been told are over: nothing may be written where they lie
+        self._loans: list[_Loan] = []
+        # Loans that are over as far as Python is concerned, waiting for the
+        # channel to tell the server. Handles append here when garbage collected
+        self._loan_ends: deque[_Loan] = deque()
+
+    def close(self) -> None:
+        """Shut the socket down, which is what ends the channel on the server,
+        and let go of the mapping. From any thread, and more than once.
+
+        A thread that is inside an exchange on the channel is woken by the
+        shutdown, fails, and closes the rest itself (GatunClient._mark_dead
+        ends here again). The descriptor is not closed under it: on macOS a
+        read that the shutdown has made runnable, and that finds its
+        descriptor closed when it runs, goes back to waiting until its
+        timeout. The mapping stays for the same thread, which may be reading
+        its response there.
+        """
+        self.dead = True
+        # The server ends a channel's loans with the channel, and keeps their
+        # objects: those whose end was queued here are released like any other
+        # object. A loan that is still open follows when it is closed or
+        # dropped (GatunClient._end_loan, _queue_loan_end).
+        frees = self._frees
+        while self._loan_ends:
+            try:
+                record = self._loan_ends.popleft()
+            except IndexError:
+                break
+            if frees is not None and not record.released:
+                record.released = record.ended = True
+                frees.append(record.object_id)
+        self._loans.clear()
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # not connected, or gone already
+            self._shut = sock
+        if not self._exchange_lock.acquire(blocking=False):
+            return
+        try:
+            shut, self._shut = self._shut, None
+            if shut is not None:
+                try:
+                    shut.close()
+                except OSError:
+                    pass
+            _close_shared_memory(self)
+        finally:
+            self._exchange_lock.release()
+
+
+class _ThreadChannel:
+    """What a thread's threading.local holds for its channel: Python drops it
+    when the thread ends, and that closes the channel. Nothing is sent; the
+    server reads the end of the stream and lets the channel's thread go."""
+
+    __slots__ = ("channel",)
+
+    def __init__(self, channel: _Channel):
+        self.channel = channel
+
+    def __del__(self):
+        # At interpreter exit anything can be gone
+        with contextlib.suppress(Exception):
+            self.channel.close()
+
+
+def _of_channel(name: str) -> Any:
+    """A client attribute that is the calling thread's channel's."""
+
+    def get(self):
+        return getattr(self._channel(), name)
+
+    def put(self, value):
+        setattr(self._channel(), name, value)
+
+    return property(get, put)
+
+
 class GatunClient(_ValueEncoder):
+    # What describes a connection belongs to a channel, and each thread has
+    # its own. Read on the client, these are the calling thread's.
+    sock = _of_channel("sock")
+    shm = _of_channel("shm")
+    shm_file = _of_channel("shm_file")
+    memory_path = _of_channel("memory_path")
+    _exchange_lock = _of_channel("_exchange_lock")
+    _arrow_schema_cache = _of_channel("_arrow_schema_cache")
+    _arena_epoch = _of_channel("_arena_epoch")
+    _arrow_loaded_end = _of_channel("_arrow_loaded_end")
+    _payload_generation = _of_channel("_payload_generation")
+    _payload_writes = _of_channel("_payload_writes")
+    _loans = _of_channel("_loans")
+    _loan_ends = _of_channel("_loan_ends")
+
     def __init__(
         self,
         socket_path=None,
@@ -2760,9 +2959,19 @@ class GatunClient(_ValueEncoder):
             socket_path = os.path.expanduser("~/gatun.sock")
 
         self.socket_path = socket_path
-        self.memory_path: str | None = (
-            None  # Set during connect() from server handshake
-        )
+        # The channel connect() makes, which is the session, and each
+        # thread's own (`channel`, and `owner`, which closes it with the
+        # thread). The first belongs to the client: to the thread that
+        # connected, and until close().
+        self._first = _Channel(first=True)
+        self._local = threading.local()
+        self._local.channel = self._first
+        # The channels of other threads, for cancel() and close()
+        self._channels: weakref.WeakSet[_Channel] = weakref.WeakSet()
+        self._channels_lock = threading.Lock()
+        # Set when the server has no join socket: threads then share the first
+        # channel and take turns
+        self._shared_channel = False
         # None disables the corresponding timeout
         self.callback_timeout = _usable_timeout(callback_timeout)
         self.socket_timeout = _usable_timeout(socket_timeout)
@@ -2770,11 +2979,7 @@ class GatunClient(_ValueEncoder):
         # Server process launched for this client by connect(); stopped on close()
         self._server_session: Any = None
 
-        self.sock: socket.socket | None = socket.socket(
-            socket.AF_UNIX, socket.SOCK_STREAM
-        )
-        self.shm_file: Any = None  # BufferedRandom when connected
-        self.shm: mmap.mmap | None = None
+        self._first.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
         # These are set during connect()
         self.memory_size = 0
@@ -2794,33 +2999,9 @@ class GatunClient(_ValueEncoder):
         # Opened with the first register_callback; see _ensure_callback_channel
         self._callback_channel: CallbackChannel | None = None
         self._callback_channel_tried = False
+        self._callback_channel_lock = threading.Lock()
 
         # Arrow schema cache for Java -> Python transfers: hash -> Schema
-        self._arrow_schema_cache: dict[int, pa.Schema] = {}
-
-        # Arena epoch for lifetime safety - tracks current valid epoch
-        self._arena_epoch: int = 0
-
-        # Where the batch Java loaded in place (send_arrow_buffers) ends in the
-        # payload zone; anything written before this would corrupt it
-        self._arrow_loaded_end: int = 0
-
-        # Bumped whenever something is written into the part of the payload
-        # zone that get_arrow_data()'s ArrowTableViews point at; see
-        # _note_payload_write
-        self._payload_generation: int = 0
-
-        # Bumped whenever anything is written into the payload zone at all. A
-        # table read in place by arrow_from_java(copy=False) can lie anywhere in it
-        self._payload_writes: int = 0
-
-        # Tables lent to Java (arrow_to_java(copy=False)) that the server has
-        # not been told are over: nothing may be written where they lie
-        self._loans: list[_Loan] = []
-        # Loans that are over as far as Python is concerned, waiting for the
-        # channel to tell the server. Handles append here when garbage collected
-        self._loan_ends: deque[_Loan] = deque()
-
         # FlatBuffers builder pool - reuse builders to reduce allocation overhead.
         # One pool per thread: a command is built before the channel is taken,
         # so threads sharing a client would otherwise build into the same buffer.
@@ -2838,11 +3019,6 @@ class GatunClient(_ValueEncoder):
         # another request, inside a callback, on another thread, at interpreter
         # exit), so it must never touch the socket or the command zone itself.
         self._pending_frees: deque[int] = deque()
-
-        # One request/response exchange at a time. The channel carries a single
-        # exchange, so threads sharing a client take turns. Re-entrant because
-        # unpacking a response can itself make a call (hashing a JavaObject).
-        self._exchange_lock = threading.RLock()
 
         # Threads that are running a callback. A Java call from one of them would
         # deadlock: Java is waiting for that callback's result on the only channel.
@@ -2949,6 +3125,9 @@ class GatunClient(_ValueEncoder):
 
     def connect(self):
         logger.debug("Connecting to %s", self.socket_path)
+        # The first channel is used by the thread that connects
+        self._local.channel = self._first
+        self._first.thread = weakref.ref(threading.current_thread())
         try:
             self.sock.connect(self.socket_path)
 
@@ -3003,6 +3182,129 @@ class GatunClient(_ValueEncoder):
             self.connect_error = e
             return False
 
+    def _channel(self) -> _Channel:
+        """The calling thread's channel, opened if it has none yet."""
+        try:
+            channel: _Channel = self._local.channel
+        except AttributeError:
+            return self._open_channel()
+        if (
+            channel.dead
+            and not channel.first
+            and not getattr(self._local, "borrowed", False)
+        ):
+            return self._open_channel()
+        return channel
+
+    def _open_channel(self) -> _Channel:
+        """Give the calling thread a channel of its own in the client's session.
+
+        The thread connects to the server's join socket and names the session
+        by the shared memory path of its first channel. What comes back is the
+        handshake connect() gets, with a shared memory file of this channel's
+        own, and on the server a thread that runs every call this thread
+        makes. The channel is kept in the thread's threading.local, so it
+        closes when the thread ends.
+
+        Before connect() and after close() there is nothing to join and the
+        answer is the first channel, which says so itself.
+        """
+        first = self._first
+        local = self._local
+        if (
+            self._closed
+            or self._dead
+            or self._shared_channel
+            or first.memory_path is None
+        ):
+            return first
+        channel = _Channel(frees=self._pending_frees)
+        sock: socket.socket | None = None
+        try:
+            try:
+                sock = _connect_to_join_socket(f"{self.socket_path}.join", self)
+            except FileNotFoundError:
+                if self._closed or self._dead:
+                    raise
+                # The server could not make its join socket (a socket path at
+                # the length limit). Threads take turns on the first channel.
+                if not self._shared_channel:
+                    self._shared_channel = True
+                    logger.warning(
+                        "The server at %s has no join socket: the threads of "
+                        "this client share one channel and run one request at "
+                        "a time",
+                        self.socket_path,
+                    )
+                local.channel = first
+                return first
+            session = first.memory_path.encode("utf-8")
+            sock.sendall(struct.pack("<IH", PROTOCOL_VERSION, len(session)) + session)
+            header = _recv_exactly(sock, 18, timeout=self.handshake_timeout)
+            version, arena_epoch, memory_size, path_len = struct.unpack("<IIQH", header)
+            if version != PROTOCOL_VERSION or memory_size != self.memory_size:
+                raise RuntimeError(
+                    "the server answered with another session's handshake"
+                )
+            path = _recv_exactly(sock, path_len, timeout=self.handshake_timeout)
+            channel.memory_path = path.decode("utf-8")
+            channel._arena_epoch = arena_epoch
+            channel.shm_file = open(channel.memory_path, "r+b")  # noqa: SIM115
+            channel.shm = mmap.mmap(channel.shm_file.fileno(), memory_size)
+            channel.sock = sock
+        except BaseException as e:
+            if sock is not None:
+                sock.close()
+            _close_shared_memory(channel)
+            if isinstance(e, Exception):
+                # The server closes the connection when the session is over
+                raise DeadConnectionError(
+                    f"Could not open a channel for this thread: {e}"
+                ) from None
+            raise
+        channel.thread = weakref.ref(threading.current_thread())
+        with self._channels_lock:
+            self._channels.add(channel)
+        if self._closed:  # type: ignore[unreachable]
+            # close() ran on another thread meanwhile and did not see this channel
+            channel.close()  # type: ignore[unreachable]
+            return first
+        local.channel = channel
+        local.owner = _ThreadChannel(channel)
+        return channel
+
+    @contextlib.contextmanager
+    def _borrowing(self, channel: _Channel, wait: bool = True) -> Iterator[bool]:
+        """Run on `channel` as if it were the calling thread's, holding it.
+
+        For what belongs to the memory of the channel it came from, whichever
+        thread does it: ending a loan, an allocation in a payload arena.
+        Yields False, holding nothing, for a channel that has ended, and
+        without waiting if `wait` is False and the channel is busy.
+
+        A channel that ends while it is borrowed stays the borrowed one until
+        the block is left (`borrowed`): _channel() gives a thread whose
+        channel has ended a new one, and here that would replace, and with it
+        close, the borrowing thread's own.
+        """
+        if channel.dead or not channel._exchange_lock.acquire(blocking=wait):
+            yield False
+            return
+        local = self._local
+        own = getattr(local, "channel", None)
+        was_borrowed = getattr(local, "borrowed", False)
+        local.channel = channel
+        local.borrowed = True
+        try:
+            yield not channel.dead
+        finally:
+            local.borrowed = was_borrowed
+            if own is None:
+                del local.channel
+            else:
+                local.channel = own
+            channel._exchange_lock.release()
+
     def get_payload_arena(self) -> PayloadArena:
         """Get a PayloadArena view into the client's shared memory.
 
@@ -3030,13 +3332,20 @@ class GatunClient(_ValueEncoder):
         # What is put in the arena lands on whatever views point at there. The
         # arena must not keep the client alive, so it gets a weak reference.
         client_ref = weakref.ref(self)
+        # The arena is this thread's: it hands out places in the memory of the
+        # thread's channel, whichever thread allocates in it
+        channel = self._channel()
 
         def written(start: int, end: int) -> None:
+            # No waiting for the channel here. An allocation made inside a
+            # callback would wait for the request that waits for the callback.
             client = client_ref()
-            if client is not None:
-                if client._loans or client._loan_ends:
-                    client._require_clear_of_loans(start, end, "The payload arena")
-                client._note_payload_write(end)
+            if client is not None and not channel.dead:
+                if channel._loans or channel._loan_ends:
+                    client._require_clear_of_loans(
+                        start, end, "The payload arena", channel
+                    )
+                client._note_payload_write(end, channel)
 
         arena._on_allocate = written
         return arena
@@ -3103,11 +3412,21 @@ class GatunClient(_ValueEncoder):
             if routed:
                 return result
 
-        with self._exchange_lock:
+        # The calling thread's channel. Other threads have their own, so
+        # nobody waits here but a thread that borrowed this one.
+        try:
+            channel = self._local.channel
+        except AttributeError:
+            channel = self._open_channel()
+        if channel.dead and not channel.first:
+            # An exchange on it was interrupted; this thread starts over
+            channel = self._open_channel()
+
+        with channel._exchange_lock:
             # 2. End the loans whose handles were garbage collected. Before the
             # releases below: this step can fail the request, and by then no
             # object ID may have left the queue for a command that is not sent.
-            if self._loan_ends:
+            if channel._loan_ends:
                 self._flush_loan_ends()
 
             # 3. Release objects whose wrappers were garbage collected since the
@@ -3125,11 +3444,11 @@ class GatunClient(_ValueEncoder):
                 if riding is None:
                     self._flush_pending_frees()
 
-            self._write_command(data)
+            self._write_command(data, channel)
             if riding is None:
-                return self._read_response()
+                return self._read_response(channel=channel)
             try:
-                return self._read_response()
+                return self._read_response(channel=channel)
             except CancelledException:
                 # The request may have been interrupted before the server got
                 # to them. It ignores an ID it has already released.
@@ -3207,9 +3526,11 @@ class GatunClient(_ValueEncoder):
                 "Queue work for later or restructure code to avoid nested calls."
             )
 
-    def _write_command(self, data: bytes) -> None:
+    def _write_command(self, data: bytes, channel: _Channel | None = None) -> None:
         """Write one command to shared memory and signal Java."""
-        if self.shm is None:
+        ch = channel if channel is not None else self._channel()
+        shm = ch.shm
+        if shm is None:
             raise DeadConnectionError("Client is not connected")
         # A command that fits the command zone goes there. A larger one follows
         # its length on the socket, and the length is what tells Java which.
@@ -3221,25 +3542,26 @@ class GatunClient(_ValueEncoder):
             # to Java as soon as they are written, and the length sent on the socket
             # afterwards is what orders the two. flush() is an msync of the whole
             # mapping, a system call per command that buys nothing here.
-            self.shm.seek(self.command_offset)
-            self.shm.write(data)
+            shm.seek(self.command_offset)
+            shm.write(data)
 
         # Signal Java (Send Length)
         # Verify socket is open (check None first to avoid AttributeError)
-        if not self.sock or self.sock.fileno() == -1:
-            self._mark_dead()
+        sock = ch.sock
+        if not sock or sock.fileno() == -1:
+            self._mark_dead(ch)
             raise DeadConnectionError("Socket already closed")
 
         try:
-            self.sock.sendall(struct.pack("<I", len(data)))
+            sock.sendall(struct.pack("<I", len(data)))
             if not in_zone:
-                self.sock.sendall(data)
+                sock.sendall(data)
         except (OSError, BrokenPipeError, ConnectionResetError) as e:
-            self._mark_dead()
+            self._mark_dead(ch)
             raise ProtocolDesyncError(f"Socket error sending command: {e}")
         except BaseException:
             # Interrupted (Ctrl-C) with the length possibly half sent
-            self._mark_dead()
+            self._mark_dead(ch)
             raise
 
     def _queue_free(self, object_id: int) -> None:
@@ -3288,8 +3610,14 @@ class GatunClient(_ValueEncoder):
 
         Called by a finalizer, so like _queue_free it only queues.
         """
-        if not self._dead:
-            self._loan_ends.append(record)
+        if self._dead or record.released:
+            return
+        if record.channel.dead:
+            # The server ended the loan with its channel and still has the object
+            record.released = record.ended = True
+            self._pending_frees.append(record.object_id)
+        else:
+            record.channel._loan_ends.append(record)
 
     def _flush_loan_ends(self) -> None:
         """Tell the server which lent tables are over. The caller holds the channel.
@@ -3338,46 +3666,70 @@ class GatunClient(_ValueEncoder):
                 pass  # reset_payload_arena() ended it already
 
     def _end_loan(self, record: _Loan) -> None:
-        """End a loan now, or with the next request if the channel is not free."""
-        if self._dead or self.sock is None or self.sock.fileno() == -1:
+        """End a loan now, or with its channel's next request if that channel
+        is not free. The channel is the one whose memory the table lies in,
+        which is another thread's when the loan was handed to this one."""
+        channel = record.channel
+        if self._dead or self._closed or record.released:
             return
-        self._loan_ends.append(record)
+        sock = channel.sock
+        if channel.dead or sock is None or sock.fileno() == -1:
+            # The loan ended with its channel (a thread that ended, a call that
+            # timed out). The server still has the table's object, closed,
+            # and no channel of its own to hear about it on: it is released
+            # like any other object.
+            record.released = record.ended = True
+            self._pending_frees.append(record.object_id)
+            return
+        channel._loan_ends.append(record)
         if (
             _channel_call_of(self) is None
             and threading.get_ident() not in self._callback_threads
         ):
+            # Its own thread never waits here. Another thread does not wait
+            # either: the owner may be inside a request for a long time.
+            own = getattr(self._local, "channel", None) is channel
             try:
-                with self._exchange_lock:
-                    self._flush_loan_ends()
+                with self._borrowing(channel, wait=own) as held:
+                    if held:
+                        self._flush_loan_ends()
             except OSError:
                 pass
 
-    def _require_clear_of_loans(self, start: int, end: int, what: str) -> None:
-        """Refuse to write the payload zone from `start` to `end` over a lent table."""
+    def _require_clear_of_loans(
+        self, start: int, end: int, what: str, channel: _Channel | None = None
+    ) -> None:
+        """Refuse to write the payload zone from `start` to `end` over a lent
+        table. The zone is the calling thread's channel's, or `channel`'s."""
+        ch = channel if channel is not None else self._channel()
         if (
-            self._loan_ends
+            ch._loan_ends
             # Not inside a callback: on the thread that runs the request the
             # lock is already ours, in the middle of an exchange
             and _channel_call_of(self) is None
             and threading.get_ident() not in self._callback_threads
-            and self._exchange_lock.acquire(blocking=False)
         ):
             # Loans whose handles were dropped are over; say so if the channel
             # is free. Waiting for it could wait for the caller's own callback.
-            try:
-                if not self._closed and not self._dead:
+            with self._borrowing(ch, wait=False) as held:
+                if held and not self._closed and not self._dead:
                     self._flush_loan_ends()
-            finally:
-                self._exchange_lock.release()
-        for record in list(self._loans):
+        for record in list(ch._loans):
             if start < record.end and end > record.start:
                 raise RuntimeError(
                     f"{what} would overwrite a table that is lent to Java "
                     "(arrow_to_java(copy=False)). Close the loan first."
                 )
 
-    def _mark_dead(self):
-        """Mark client as dead after protocol desync.
+    def _mark_dead(self, channel: _Channel | None = None):
+        """Give up a channel after a protocol desync; the client's, if it is the
+        first one.
+
+        A channel of another thread is closed and forgotten: the session and
+        the client's other threads go on, and the thread opens a new channel,
+        on a new JVM thread, with its next call. The server drops what the
+        interrupted request registers for a response nobody receives. The
+        first channel is the session, so losing it is losing the client:
 
         After a timeout or invalid response, the connection is in an unknown state.
         We must close the socket to prevent cascading failures from reading garbage.
@@ -3389,34 +3741,44 @@ class GatunClient(_ValueEncoder):
         - The socket is closed (shutdown + close)
         - The client cannot be reused - create a new one
         """
+        ch = channel if channel is not None else self._channel()
+        if not ch.first or self._closed:
+            # close() ran while this thread was inside its exchange and left
+            # the socket and the mapping for it to release
+            ch.close()
+            return
         if self._dead:
             return  # Already dead
 
         self._dead = True
         self._pending_frees.clear()
-        self._loan_ends.clear()
-        self._loans.clear()
-        channel, self._callback_channel = self._callback_channel, None
-        if channel is not None:
-            channel.close()
+        callbacks, self._callback_channel = self._callback_channel, None
+        if callbacks is not None:
+            callbacks.close()
+        for other in self._other_channels():
+            other.close()
 
-        # Shutdown socket to unblock any pending reads, then close
-        try:
-            if self.sock:
-                try:
-                    self.sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass  # May fail if already disconnected
-                self.sock.close()
-                self.sock = None
-        except OSError:
-            pass
+        # As above: the socket goes, the mapping stays for what points into it
+        shm, shm_file = ch.shm, ch.shm_file
+        ch.shm = ch.shm_file = None
+        ch.close()
+        ch.shm, ch.shm_file = shm, shm_file
+
+    def _other_channels(self) -> list[_Channel]:
+        """The channels of the threads that joined the session."""
+        with self._channels_lock:
+            return list(self._channels)
 
     def _unpack_value(self, val_type: int, val_table: Any) -> Any:
         """Unpack a FlatBuffer Value union to a Python object."""
         return _unpack_value_impl(val_type, val_table, self, JavaObject)
 
-    def _read_response(self, timeout: float | None = None, _use_default: bool = True):
+    def _read_response(
+        self,
+        timeout: float | None = None,
+        _use_default: bool = True,
+        channel: _Channel | None = None,
+    ):
         """Read and parse a response from the server.
 
         Args:
@@ -3439,22 +3801,38 @@ class GatunClient(_ValueEncoder):
         # can reach the server first, on the callback connection. Java's next
         # message on this channel shows it has.
         answered_with: list[Any] = []
+        ch = channel if channel is not None else self._channel()
+        sock = ch.sock
+        shm = ch.shm
+        if sock is None or shm is None:
+            # close() got here between this thread's command and its answer
+            self._mark_dead(ch)
+            raise DeadConnectionError(
+                "The client was closed while this call was waiting for its answer"
+                if self._closed
+                else "The channel was closed while this call was waiting for its answer"
+            )
         while True:
             # 1. Read Length with timeout
             try:
-                sz_data = _recv_exactly(self.sock, 4, timeout=timeout)
+                sz_data = _recv_exactly(sock, 4, timeout=timeout)
             except SocketTimeoutError:
                 # Timeout during read means connection is in unknown state
-                self._mark_dead()
+                self._mark_dead(ch)
                 raise
             except (RuntimeError, OSError, BrokenPipeError, ConnectionResetError) as e:
                 # Socket closed or error - mark dead and convert to ProtocolDesyncError
-                self._mark_dead()
+                self._mark_dead(ch)
+                if self._closed:
+                    raise DeadConnectionError(
+                        "The client was closed while this call was waiting for "
+                        "its answer"
+                    ) from None
                 raise ProtocolDesyncError(f"Socket error reading response: {e}")
             except BaseException:
                 # Ctrl-C, SystemExit or anything else while waiting: the response
                 # is still on its way, and the next call would read it as its own
-                self._mark_dead()
+                self._mark_dead(ch)
                 raise
             sz = struct.unpack("<I", sz_data)[0]
             answered_with.clear()
@@ -3463,12 +3841,12 @@ class GatunClient(_ValueEncoder):
             # This catches protocol desync (garbage data) early
             # On invalid size, close the connection to prevent cascading failures
             if sz == 0:
-                self._mark_dead()
+                self._mark_dead(ch)
                 raise ProtocolDesyncError(
                     "Invalid response size: 0 bytes (empty response)", response_size=sz
                 )
             if sz > self._max_message:
-                self._mark_dead()
+                self._mark_dead(ch)
                 raise ProtocolDesyncError(
                     f"Response size {sz} exceeds the largest a response can be "
                     f"({self._max_message})",
@@ -3478,15 +3856,15 @@ class GatunClient(_ValueEncoder):
             resp_buf: bytes | bytearray
             if sz > RESPONSE_ZONE_SIZE:
                 # 3a. Too large for the response zone: it follows on the socket
-                resp_buf = self._recv_message(sz, timeout)
+                resp_buf = self._recv_message(sz, timeout, ch, sock)
             else:
                 # 3b. Read Data from SHM
-                self.shm.seek(self.response_offset)
-                resp_buf = self.shm.read(sz)
+                shm.seek(self.response_offset)
+                resp_buf = shm.read(sz)
 
                 # Validate we got all the bytes (mmap.read can return fewer)
                 if len(resp_buf) != sz:
-                    self._mark_dead()
+                    self._mark_dead(ch)
                     raise ProtocolDesyncError(
                         f"SHM read returned {len(resp_buf)} bytes, expected {sz}",
                         response_size=sz,
@@ -3507,31 +3885,39 @@ class GatunClient(_ValueEncoder):
                     answered_with.append(self._handle_callback(resp))
                 except (OSError, BrokenPipeError, ConnectionResetError) as e:
                     # Socket error while sending callback response
-                    self._mark_dead()
+                    self._mark_dead(ch)
                     raise ProtocolDesyncError(f"Socket error during callback: {e}")
                 except BaseException:
                     # Interrupted before the callback's result went out; Java is
                     # still waiting for it
-                    self._mark_dead()
+                    self._mark_dead(ch)
                     raise
                 # After handling callback, continue reading for the actual response
                 continue
 
             return self._parse_response(resp)
 
-    def _recv_message(self, size: int, timeout: float | None) -> bytearray:
+    def _recv_message(
+        self, size: int, timeout: float | None, ch: _Channel, sock: socket.socket
+    ) -> bytearray:
         """Read a response that follows its length on the socket. Anything that
-        stops the read leaves the rest of it on the way, so the client is dead."""
+        stops the read leaves the rest of it on the way, so the channel is dead.
+        `sock` is the socket the length came from: close() takes the channel's
+        own away."""
         try:
-            return _recv_large(self.sock, size, timeout)
+            return _recv_large(sock, size, timeout)
         except SocketTimeoutError:
-            self._mark_dead()
+            self._mark_dead(ch)
             raise
         except (RuntimeError, OSError) as e:
-            self._mark_dead()
+            self._mark_dead(ch)
+            if self._closed:
+                raise DeadConnectionError(
+                    "The client was closed while this call was waiting for its answer"
+                ) from None
             raise ProtocolDesyncError(f"Socket error reading response: {e}")
         except BaseException:
-            self._mark_dead()
+            self._mark_dead(ch)
             raise
 
     def _parse_response(self, resp) -> Any:
@@ -3775,9 +4161,9 @@ class GatunClient(_ValueEncoder):
         # channel may be held by the request waiting for it
         if self._callback_channel is not None:
             return
-        # Under the lock: threads registering callbacks at the same time open
-        # it once
-        with self._exchange_lock:
+        # Under a lock of the client's: threads registering callbacks at the
+        # same time, each on its own channel, open it once
+        with self._callback_channel_lock, self._exchange_lock:
             if self._callback_channel_tried:
                 return
             builder = self._get_builder()
@@ -3898,7 +4284,7 @@ class GatunClient(_ValueEncoder):
 
         # Build table from arrays and wrap in epoch-validating view
         table = pa.Table.from_arrays(arrays, schema=schema)
-        return ArrowTableView(table, descriptor_epoch, self)
+        return ArrowTableView(table, descriptor_epoch, self._channel())
 
     def _send_callback_response(
         self, callback_id: int, result, is_error: bool, error_msg: str | None
@@ -4723,7 +5109,9 @@ class GatunClient(_ValueEncoder):
         wrappers release themselves when garbage collected, so this is only
         needed for objects that were detach()ed.
         """
-        if self._dead or self.sock is None or self.sock.fileno() == -1:
+        # Not self.sock: that is the calling thread's channel, and asking for
+        # it gives a thread one. A callback's thread has no use for a channel.
+        if self._dead or self._closed or self._first.sock is None:
             return
         self._pending_frees.append(object_id)
         call = _channel_call_of(self)
@@ -4868,8 +5256,9 @@ class GatunClient(_ValueEncoder):
             # offsets the arena hands out. Offsets into any other arena would be
             # read as whatever happens to be at those places.
             raise ValueError(
-                "send_arrow_buffers needs the arena from client.get_payload_arena(); "
-                "this arena is not part of the client's shared memory"
+                "send_arrow_buffers needs the arena from client.get_payload_arena(), "
+                "called on this thread: this arena is not part of the shared "
+                "memory of the thread's channel"
             )
 
         if isinstance(table, pa.RecordBatch):
@@ -5010,8 +5399,9 @@ class GatunClient(_ValueEncoder):
         self._loans.clear()
         return response
 
-    def _note_payload_write(self, end: int) -> None:
+    def _note_payload_write(self, end: int, channel: _Channel | None = None) -> None:
         """Record that the payload zone is about to be overwritten up to offset `end`.
+        The zone is the calling thread's channel's, or `channel`'s.
 
         Tables from get_arrow_data() point into the second half of the zone. A
         write that reaches it invalidates them, so that they raise
@@ -5021,9 +5411,10 @@ class GatunClient(_ValueEncoder):
         Call it before the first byte is written: a write that fails halfway
         has still changed the zone.
         """
-        self._payload_writes += 1
+        ch = channel if channel is not None else self._channel()
+        ch._payload_writes += 1
         if end > (self.response_offset - self.payload_offset) // 2:
-            self._payload_generation += 1
+            ch._payload_generation += 1
 
     def _end_views(self) -> None:
         """Invalidate every outstanding ArrowTableView, wherever it points."""
@@ -5271,7 +5662,7 @@ class GatunClient(_ValueEncoder):
         root, offset, size = self._send_arrow_stream(
             table, ArrowForm.ArrowForm.LentTable
         )
-        record = _Loan(root.object_id, offset, offset + size)
+        record = _Loan(self._channel(), root.object_id, offset, offset + size)
         self._loans.append(record)
         # Freeing the object is what ends the loan, and the client has to know
         # when the server has done it: the release goes through _loan_ends, not
@@ -5447,31 +5838,52 @@ class GatunClient(_ValueEncoder):
         if copy:
             return _read_arrow_stream(self, (offset, length))
         borrowed = _read_arrow_stream(self, (offset, length), in_place=True)
-        return ArrowTableView(borrowed, self._arena_epoch, self, any_write=True)
+        return ArrowTableView(
+            borrowed, self._arena_epoch, self._channel(), any_write=True
+        )
 
-    def cancel(self) -> bool:
-        """Interrupt the request this client is running. Call it from another thread.
+    def cancel(self, thread: threading.Thread | None = None) -> bool:
+        """Interrupt the requests this client is running. Call it from another thread.
 
-        The request's thread is interrupted on the server. Java code that is
-        blocked in an interruptible call (sleeping, waiting, most I/O, a Spark
-        job) stops there; code that polls ``GatunServer.checkCancelled()`` or
-        ``Thread.interrupted()`` stops at its next check; code that does neither
-        runs to completion. A cancelled request raises CancelledException in the
-        thread that made it.
+        Each thread of a client runs its requests on a JVM thread of its own.
+        Without an argument every request in flight is interrupted; with a
+        thread, the request of that thread only.
 
-        The signal travels on a short-lived connection of its own, because the
-        client's channel is occupied by the request being cancelled.
+        The request's JVM thread is interrupted. Java code that is blocked in
+        an interruptible call (sleeping, waiting, most I/O, a Spark job) stops
+        there; code that polls ``GatunServer.checkCancelled()`` or
+        ``Thread.interrupted()`` stops at its next check; code that does
+        neither runs to completion. A cancelled request raises
+        CancelledException in the thread that made it.
+
+        The signal travels on a short-lived connection of its own, because a
+        channel is occupied by the request being cancelled.
+
+        Args:
+            thread: The thread whose request to interrupt. All, by default.
 
         Returns:
-            True if a request was running and was signalled; False if there was
-            nothing to cancel.
+            True if at least one request was running and was signalled; False
+            if there was nothing to cancel.
 
         Example:
             worker = threading.Thread(target=lambda: client.jvm.my.Job.run())
             worker.start()
-            client.cancel()
+            client.cancel()        # or client.cancel(worker)
         """
-        if self._dead or self._closed or self.memory_path is None:
+        if self._dead or self._closed or self._first.memory_path is None:
+            return False
+        paths = [
+            channel.memory_path
+            for channel in (self._first, *self._other_channels())
+            if not channel.dead
+            and channel.memory_path is not None
+            and (
+                thread is None
+                or (channel.thread is not None and channel.thread() is thread)
+            )
+        ]
+        if not paths:
             return False
         control = GatunClient(
             self.socket_path,
@@ -5481,13 +5893,18 @@ class GatunClient(_ValueEncoder):
         try:
             if not control.connect():
                 return False
-            builder = flatbuffers.Builder(256)
-            session = builder.CreateString(self.memory_path)
-            Cmd.CommandStart(builder)
-            Cmd.CommandAddAction(builder, Act.Action.Cancel)
-            Cmd.CommandAddTargetName(builder, session)
-            builder.Finish(Cmd.CommandEnd(builder))
-            return control._send_raw(builder.Output()) is True
+            delivered = False
+            for path in paths:
+                # A channel is named by its shared memory path
+                builder = flatbuffers.Builder(256)
+                target = builder.CreateString(path)
+                Cmd.CommandStart(builder)
+                Cmd.CommandAddAction(builder, Act.Action.Cancel)
+                Cmd.CommandAddTargetName(builder, target)
+                builder.Finish(Cmd.CommandEnd(builder))
+                if control._send_raw(builder.Output()) is True:
+                    delivered = True
+            return delivered
         finally:
             control.close()
 
@@ -5529,20 +5946,18 @@ class GatunClient(_ValueEncoder):
         return BatchContext(self, stop_on_error)
 
     def close(self):
+        """Close the client: every thread's channel, and with the first one
+        the session. A thread that is inside a call gets DeadConnectionError."""
         self._closed = True
         try:
-            # The socket goes first and on its own: it is what ends the session on
-            # the server, and a failure to release the mapping must not keep it open.
-            sock, self.sock = self.sock, None
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-            channel, self._callback_channel = self._callback_channel, None
-            if channel is not None:
-                channel.close()
-            _close_shared_memory(self)
+            # The sockets go first: the first is what ends the session on the
+            # server, and a failure to release a mapping must not keep it open.
+            for other in self._other_channels():
+                other.close()
+            callbacks, self._callback_channel = self._callback_channel, None
+            self._first.close()
+            if callbacks is not None:
+                callbacks.close()
         finally:
             # A server started for this client by connect() goes away with it
             session, self._server_session = self._server_session, None
@@ -5551,7 +5966,7 @@ class GatunClient(_ValueEncoder):
 
     def __enter__(self):
         # Only connect if not already connected
-        if self.shm is None and not self.connect():
+        if self._first.shm is None and not self.connect():
             raise RuntimeError(
                 f"Failed to connect to Gatun server at {self.socket_path}: "
                 f"{self.connect_error}"
