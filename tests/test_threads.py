@@ -7,8 +7,10 @@ and the objects, the limits and the callbacks are the client's.
 """
 
 import asyncio
+import gc
 import glob
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -16,6 +18,7 @@ import time
 import pyarrow as pa
 import pytest
 
+import gatun.client as client_module
 from gatun import (
     CancelledException,
     DeadConnectionError,
@@ -195,21 +198,21 @@ class TestCallsAtTheSameTime:
         # One after the other they take 4.8 s
         assert time.perf_counter() - started < 2.4
 
-    def test_many_threads_calling_the_same_objects(self, shared):
-        items = shared.jvm.java.util.concurrent.ConcurrentLinkedQueue
-        del items
-        counter = shared.jvm.java.util.ArrayList()
-        lock = threading.Lock()
+    def test_many_threads_calling_the_same_object(self, shared):
+        """One Java object, called by twelve threads with nothing in Python
+        between them: each thread's own text comes out whole, and so does
+        the count of what all of them appended to the one buffer."""
+        everyones = shared.jvm.java.lang.StringBuffer()  # synchronized in Java
         seen = []
+        ready = threading.Barrier(12)
 
         def work(n):
             mine = shared.jvm.java.lang.StringBuilder()
+            ready.wait()
             for i in range(200):
                 mine.append(f"{n}:{i};")
-            text = mine.toString()
-            with lock:
-                seen.append((n, text))
-                counter.add(n)
+                everyones.append("x")
+            seen.append((n, mine.toString()))
 
         threads = [threading.Thread(target=work, args=(n,)) for n in range(12)]
         for thread in threads:
@@ -217,7 +220,8 @@ class TestCallsAtTheSameTime:
         for thread in threads:
             thread.join()
 
-        assert counter.size() == 12
+        assert everyones.length() == 12 * 200
+        assert len(seen) == 12
         for n, text in seen:
             assert text == "".join(f"{n}:{i};" for i in range(200))
 
@@ -259,6 +263,36 @@ class TestOneSession:
 
             del held[:5]
             assert on_thread(client.create_object, "java.util.ArrayList") is not None
+        finally:
+            client.close()
+
+    def test_the_object_limit_holds_for_threads_that_create_at_once(
+        self, channels_classes
+    ):
+        client = start(
+            channels_classes, extra_jvm_flags=["-Dgatun.limits.max_objects=30"]
+        )
+        try:
+            held = []
+            refused = []
+            ready = threading.Barrier(8)
+
+            def create():
+                ready.wait()
+                for _ in range(10):
+                    try:
+                        held.append(client.create_object("java.util.ArrayList"))
+                    except JavaException:
+                        refused.append(1)
+
+            threads = [threading.Thread(target=create) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            assert len(held) == 30
+            assert len(refused) == 50
         finally:
             client.close()
 
@@ -487,6 +521,129 @@ class TestAChannelThatIsLost:
         with pytest.raises(DeadConnectionError):
             on_thread(items.size)
 
+    def test_a_hundred_threads_make_their_first_call_at_once(self, client):
+        """Each is a connection to the join socket at the same moment."""
+        Channels = client.jvm.Channels
+        Channels.threadId()
+        ready = threading.Barrier(100)
+        ids = []
+
+        def first_call():
+            ready.wait()
+            ids.append(Channels.threadId())
+
+        threads = [threading.Thread(target=first_call) for _ in range(100)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(set(ids)) == 100
+        assert client._shared_channel is False
+
+    def test_a_refused_join_is_tried_again(self, channels_classes, monkeypatch, caplog):
+        """macOS refuses a connection when the listening socket's queue is
+        full. That is no server without a join socket: one refusal must not
+        put the client's threads on one channel for good."""
+        client = start(channels_classes)
+        refusals = [1, 1, 1]
+
+        class Refusing(socket.socket):
+            def connect(self, address):
+                if str(address).endswith(".join") and refusals:
+                    refusals.pop()
+                    raise ConnectionRefusedError(61, "Connection refused")
+                return super().connect(address)
+
+        monkeypatch.setattr(client_module.socket, "socket", Refusing)
+        try:
+            Channels = client.jvm.Channels
+            with caplog.at_level("WARNING", logger="gatun.client"):
+                name = on_thread(Channels.threadName)
+
+            assert refusals == []
+            assert name.startswith("gatun-channel-")
+            assert name != Channels.threadName()
+            assert client._shared_channel is False
+            assert caplog.text == ""
+        finally:
+            client.close()
+
+    def test_a_join_that_is_always_refused_fails_the_call(
+        self, channels_classes, monkeypatch
+    ):
+        client = start(channels_classes)
+
+        class Refusing(socket.socket):
+            def connect(self, address):
+                if str(address).endswith(".join"):
+                    raise ConnectionRefusedError(61, "Connection refused")
+                return super().connect(address)
+
+        monkeypatch.setattr(client_module.socket, "socket", Refusing)
+        monkeypatch.setattr(client_module, "_JOIN_RETRY_SECONDS", 0.3)
+        try:
+            with pytest.raises(DeadConnectionError, match="Could not open a channel"):
+                on_thread(client.ping)
+
+            assert client._shared_channel is False
+            assert client.ping() is True
+        finally:
+            client.close()
+
+    def test_close_between_a_command_and_its_answer(self, channels_classes):
+        """The thread finds its channel's socket gone when it turns to read."""
+        for where in (lambda call: call(), on_thread):
+            client = start(channels_classes)
+            real = client._write_command
+
+            def write_then_close(data, channel=None, real=real, client=client):
+                real(data, channel)
+                on_thread(client.close)
+
+            client._write_command = write_then_close
+            with pytest.raises(DeadConnectionError, match="closed while"):
+                where(client.ping)
+
+    def test_borrowing_a_channel_that_has_ended(self, client):
+        """What a thread does on another thread's channel (ending a loan) must
+        not cost it its own when that channel is gone, or goes meanwhile."""
+        Channels = client.jvm.Channels
+        release = threading.Event()
+        theirs = []
+
+        def other():
+            Channels.threadId()
+            theirs.append(client._channel())
+            release.wait(30)
+
+        thread = threading.Thread(target=other)
+        thread.start()
+        assert wait_until(lambda: theirs)
+
+        def borrower():
+            jvm_thread = Channels.threadId()
+            mine = client._channel()
+            with client._borrowing(theirs[0], wait=False) as held:
+                assert held is True
+                theirs[0].close()
+                # The calling thread's channel is the borrowed one in here,
+                # ended or not: no new one is opened in its place
+                assert client._channel() is theirs[0]
+                assert len(client._loan_ends) == 0
+            assert client._channel() is mine
+            assert not mine.dead
+            with client._borrowing(theirs[0]) as held:
+                assert held is False
+                assert client._channel() is mine
+            return jvm_thread == Channels.threadId()
+
+        try:
+            assert on_thread(borrower) is True
+        finally:
+            release.set()
+            thread.join()
+
     def test_without_a_join_socket_threads_take_turns(self, channels_classes, caplog):
         client = start(channels_classes)
         try:
@@ -587,6 +744,64 @@ class TestArrow:
         loan.close()
         assert loan.closed
 
+    def test_a_loan_of_a_thread_that_ended_gives_its_object_back(
+        self, channels_classes
+    ):
+        """The server ends such a loan with the thread's channel and keeps
+        the table's object. Nothing but the client can release it."""
+        client = start(
+            channels_classes, extra_jvm_flags=["-Dgatun.limits.max_objects=12"]
+        )
+        small = pa.table({"n": [1, 2, 3]})
+        try:
+
+            def lend():
+                return client.arrow_to_java(small, copy=False)
+
+            def lend_and_drop():
+                client.arrow_to_java(small, copy=False)
+                # Its end is queued on this thread's channel, which ends first
+                gc.collect()
+
+            for round_ in range(40):
+                if round_ % 3 == 0:
+                    on_thread(lend).close()
+                elif round_ % 3 == 1:
+                    on_thread(lend)  # dropped here, after its thread
+                    gc.collect()
+                else:
+                    on_thread(lend_and_drop)
+                assert client.ping() is True
+
+            held = [client.create_object("java.util.ArrayList") for _ in range(10)]
+            assert len(held) == 10
+        finally:
+            client.close()
+
+    def test_a_loan_of_a_thread_whose_call_timed_out(self, channels_classes):
+        client = start(
+            channels_classes, extra_jvm_flags=["-Dgatun.limits.max_objects=6"]
+        )
+        small = pa.table({"n": [1, 2, 3]})
+        try:
+
+            def lend_and_time_out():
+                loan = client.arrow_to_java(small, copy=False)
+                client.socket_timeout = 0.3
+                try:
+                    client.jvm.Channels.sleep(1500)
+                except SocketTimeoutError:
+                    pass
+                finally:
+                    client.socket_timeout = 30.0
+                loan.close()
+
+            for _ in range(10):
+                on_thread(lend_and_time_out)
+                assert client.ping() is True
+        finally:
+            client.close()
+
     def test_an_arena_of_another_thread_is_refused(self, shared):
         arena = on_thread(shared.get_payload_arena)
 
@@ -677,6 +892,78 @@ class TestCallbacks:
             thread.join()
 
         assert sorted(results) == [2, 4]
+
+    def test_releasing_inside_a_callback_opens_no_channel(self, client, monkeypatch):
+        """A callback's thread releases through the callback connection, or
+        with the next request. It has no use for a channel of its own."""
+        opened = []
+        real = client._open_channel
+
+        def recording():
+            opened.append(threading.current_thread().name)
+            return real()
+
+        monkeypatch.setattr(client, "_open_channel", recording)
+        spare = [client.create_object("java.util.ArrayList") for _ in range(2)]
+        ids = [handle.object_id for handle in spare]
+        for handle in spare:
+            handle.detach()
+        table = pa.table({"n": [1, 2, 3]})
+        rows = []
+
+        def in_band(value):
+            client.free_object(ids[0])
+            return value
+
+        def on_the_connection(value):
+            client.free_object(ids[1])
+            # A copy that ends with the block, which close() frees
+            with client.arrow_to_java(table, copy=False) as root:
+                rows.append(root.getRowCount())
+            return value
+
+        Channels = client.jvm.Channels
+        first = client.register_callback(in_band, "java.util.function.Function")
+        second = client.register_callback(
+            on_the_connection, "java.util.function.Function"
+        )
+
+        assert Channels.apply(first, "a") == "a"
+        assert Channels.applyOnNewThread(second, "b") == "b"
+
+        assert rows == [3]
+        assert opened == []
+        for object_id in ids:
+            with pytest.raises(JavaException, match="not found"):
+                client.invoke_method(object_id, "size")
+
+    def test_an_arena_used_inside_a_callback_does_not_wait(self, channels_classes):
+        """The request's thread holds its channel while it waits for the
+        callback: an allocation that waited for the channel would wait for
+        itself, until the callback timeout."""
+        client = start(channels_classes, callback_timeout=20.0)
+        try:
+            arena = client.get_payload_arena()
+            view_before = client._payload_writes
+            allocated = []
+
+            def allocate(value):
+                allocated.append(arena.allocate(64).length)
+                return value
+
+            proxy = client.register_callback(allocate, "java.util.function.Function")
+            Channels = client.jvm.Channels
+
+            started = time.monotonic()
+            assert Channels.apply(proxy, "in band") == "in band"
+            assert Channels.applyOnNewThread(proxy, "other") == "other"
+            assert time.monotonic() - started < 10
+
+            assert allocated == [64, 64]
+            # Counted on the channel the arena belongs to, whoever allocated
+            assert client._payload_writes == view_before + 2
+        finally:
+            client.close()
 
 
 class TestWhatIsSharedIsOpenedOnce:
@@ -840,6 +1127,34 @@ class TestIdleTimeout:
         try:
             # The first channel is idle for 3 s while another thread works
             assert on_thread(client.jvm.Channels.sleep, 3000) == "slept"
+            assert client.ping() is True
+        finally:
+            client.close()
+
+    def test_a_call_while_another_thread_is_inside_a_long_request(
+        self, channels_classes
+    ):
+        """A running request records no activity until it ends. The calls
+        other threads make meanwhile are not calls to an idle session."""
+        client = start(
+            channels_classes,
+            extra_jvm_flags=["-Dgatun.limits.session_idle_timeout_ms=1000"],
+        )
+        try:
+            Channels = client.jvm.Channels
+            Channels.threadId()
+            outcome = []
+            worker = threading.Thread(
+                target=lambda: outcome.append(Channels.sleep(4000))
+            )
+            worker.start()
+
+            time.sleep(2.5)
+            assert client.ping() is True
+            assert on_thread(Channels.threadName).startswith("gatun-channel-")
+
+            worker.join()
+            assert outcome == ["slept"]
             assert client.ping() is True
         finally:
             client.close()

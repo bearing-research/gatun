@@ -571,6 +571,7 @@ public class GatunServer {
 
   // Appended to the server's socket path: where further channels of a session connect
   private static final String JOIN_SUFFIX = ".join";
+  private static final int JOIN_BACKLOG = 1024;
 
   /**
    * Listen on {@code <socket>.join}, where a client's further threads connect for a channel of
@@ -589,8 +590,13 @@ public class GatunServer {
       Files.deleteIfExists(path);
       listener = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
       sessionFiles.add(path);
-      listener.bind(UnixDomainSocketAddress.of(path));
+      // A pool of threads makes its first calls at once, and each is a connection here. A
+      // full queue refuses on macOS, where the system caps this number at 128 by default.
+      listener.bind(UnixDomainSocketAddress.of(path), JOIN_BACKLOG);
       Files.setPosixFilePermissions(path, OWNER_ONLY);
+      // Known before the first connection is accepted: isSameUser lets everyone in until it
+      // is, and a connection may have been queued between the two lines above
+      serverUser = Files.getOwner(path);
       ServerSocketChannel accepting = listener;
       Thread.ofPlatform().daemon(true).name("gatun-join").start(() -> acceptJoins(accepting));
     } catch (IOException | RuntimeException | OutOfMemoryError e) {
@@ -1091,8 +1097,10 @@ public class GatunServer {
 
       while (readFully(client, lengthBuf)) {
         // A request that arrives after the idle timeout is answered with the reason before the
-        // session closes; the reaper may not have got to this session yet
-        if (quota.isTimedOut()) {
+        // session closes; the reaper may not have got to this session yet. Idle is what it is
+        // for the reaper: a request that another channel is running, or a callback in flight,
+        // records no activity until it ends, and a session in use is not idle.
+        if (quota.isTimedOut() && !ctx.isRequestActive() && ctx.channelCalls.get() == 0) {
           LOG.warning("Session " + sessionId + " timed out due to inactivity");
           // The client is still sending a command that follows its length, and would get a
           // broken pipe in place of the reason

@@ -55,10 +55,14 @@ public class SessionQuota {
    * @throws ResourceLimits.ObjectLimitExceededException if limit would be exceeded
    */
   public void allocateObject() {
-    int current = objectCount.get();
-    ResourceLimits.checkObjectLimit(current);
-
-    int newCount = objectCount.incrementAndGet();
+    // One step: the channels of a session, and its callbacks, create objects at the same
+    // time, and threads that each saw room for one more would all take it
+    int current;
+    do {
+      current = objectCount.get();
+      ResourceLimits.checkObjectLimit(current);
+    } while (!objectCount.compareAndSet(current, current + 1));
+    int newCount = current + 1;
     totalObjectsCreated.incrementAndGet();
 
     // Update peak (may race, but approximate is fine)

@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `reset_payload_arena()` gives back the Arrow bytes of the calling thread's connection, and a connection that closes gives back its own
 
 ### Fixed
+- `gatun.limits.max_objects` could be exceeded when a session created objects on several threads at once (callbacks from Java threads, and now the threads of a client): the check and the count were two steps
 - A command length of zero, or one that is negative as Java reads it, ends the session after its error. The server answered and went on reading, so the next four bytes on the socket were taken for a length, and bytes that passed for the size of the command still in shared memory ran that command a second time. The clients never send such a length
 - The request log kept the whole error text of a session's last 64 failed requests; it keeps the 100 characters a log line shows
 - README and `docs/benchmarks.md` said a plain instance call is 1.3 times faster through Gatun than through Py4J. Plain instance calls and object creation cost about the same: a second machine had Py4J level or ahead on them. The claims for static calls, `is_instance_of`, collections as arguments and bulk data stand
