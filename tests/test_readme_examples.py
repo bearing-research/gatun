@@ -410,6 +410,20 @@ class TestExceptionHandling:
         except JavaNumberFormatException:
             pass  # Expected
 
+    def test_java_exception(self, client):
+        from gatun import JavaException
+
+        try:
+            client.jvm.java.lang.Integer.parseInt("not_a_number")
+            assert False, "Should have raised exception"
+        except JavaException as e:
+            thrown = e.java_exception
+            assert thrown.getMessage() == 'For input string: "not_a_number"'
+            assert thrown.getCause() is None
+            assert thrown.getStackTrace()[0].getMethodName() == "forInputString"
+            assert client.is_instance_of(thrown, "java.lang.IllegalArgumentException")
+            assert str(e) == e.stack_trace
+
 
 class TestObservability:
     """Test Observability (get_metrics) examples."""

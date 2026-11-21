@@ -55,7 +55,7 @@ public class GatunServer {
   // Protocol version - increment when making breaking changes to the protocol
   // Version 2: Per-client shared memory (handshake includes SHM path)
   // Version 4: Callback connection (Action.OpenCallbackChannel, call_id)
-  public static final int PROTOCOL_VERSION = 6;
+  public static final int PROTOCOL_VERSION = 7;
 
   private static final Set<PosixFilePermission> OWNER_ONLY =
       PosixFilePermissions.fromString("rw-------");
@@ -1440,7 +1440,8 @@ public class GatunServer {
           errorMessage = formatException(cause);
           errorType = cause.getClass().getName();
           requestSuccess = false;
-          responseOffset = packError(builder, errorMessage, errorType);
+          responseOffset =
+              packThrown(builder, cause, errorMessage, sessionObjectIds, quota, packedIds, 0);
           // The client gets the error, not the results gathered before it
           discardResultRefs(vectorResults, sessionObjectIds, quota);
         } finally {
@@ -3238,7 +3239,15 @@ public class GatunServer {
       result = null;
       errorType = cause.getClass().getName();
       builder = new FlatBufferBuilder(256);
-      response = packError(builder, formatException(cause), errorType, callId);
+      response =
+          packThrown(
+              builder,
+              cause,
+              formatException(cause),
+              ctx.sessionObjectIds,
+              ctx.quota,
+              registered,
+              callId);
     }
     builder.finish(response);
     ByteBuffer frame = builder.dataBuffer();
@@ -3507,7 +3516,14 @@ public class GatunServer {
           throw interrupted;
         }
         subResponseOffsets[i] =
-            packError(builder, formatException(subCause), subCause.getClass().getName());
+            packThrown(
+                builder,
+                subCause,
+                formatException(subCause),
+                sessionObjectIds,
+                quota,
+                registered,
+                0);
         executedCount++;
 
         if (stopOnError) {
@@ -3705,6 +3721,14 @@ public class GatunServer {
   }
 
   private int packError(FlatBufferBuilder builder, String msg, String errorType, long callId) {
+    return packError(builder, msg, errorType, callId, 0);
+  }
+
+  /**
+   * @param errorObject the ID the exception was registered under for the client, or 0
+   */
+  private int packError(
+      FlatBufferBuilder builder, String msg, String errorType, long callId, long errorObject) {
     int errOff = builder.createString(msg == null ? "Unknown Error" : msg);
     int typeOff =
         builder.createString(errorType == null ? "java.lang.RuntimeException" : errorType);
@@ -3715,7 +3739,43 @@ public class GatunServer {
     if (callId != 0) {
       Response.addCallId(builder, callId);
     }
+    if (errorObject != 0) {
+      Response.addErrorObject(builder, errorObject);
+    }
     return Response.endResponse(builder);
+  }
+
+  /**
+   * Pack the error a command ended in, and with it the exception itself: it is registered for the
+   * session like a returned object, so that the client's exception can carry it and reach its
+   * cause, its stack trace's elements and whatever its class declares. The client releases it when
+   * its own exception is collected.
+   *
+   * <p>A session at its object limit gets the error without the object. The caller is being told
+   * what went wrong, and that must not turn into a complaint about the limit.
+   *
+   * @param message the formatted exception, which callers also log
+   * @param registered receives the object's ID, for a caller that may still have to drop it because
+   *     the response is never delivered
+   * @param callId for a response on the callback connection, the call it belongs to; 0 otherwise
+   */
+  private int packThrown(
+      FlatBufferBuilder builder,
+      Throwable thrown,
+      String message,
+      Set<Long> sessionObjectIds,
+      SessionQuota quota,
+      List<Long> registered,
+      long callId) {
+    long id = 0;
+    if (quota.getObjectCount() < ResourceLimits.MAX_OBJECTS_PER_SESSION) {
+      id = objectIdCounter.getAndIncrement();
+      putObject(id, thrown);
+      sessionObjectIds.add(id);
+      quota.countRegisteredObjects(1);
+      registered.add(id);
+    }
+    return packError(builder, message, thrown.getClass().getName(), callId, id);
   }
 
   /**

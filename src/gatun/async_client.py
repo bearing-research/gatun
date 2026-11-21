@@ -712,8 +712,13 @@ class AsyncGatunClient(_ValueEncoder):
                 if error_type_bytes
                 else "java.lang.RuntimeException"
             )
+            error_object = resp.ErrorObject()
             try:
-                _raise_java_exception_impl(error_type, error_msg)
+                _raise_java_exception_impl(
+                    error_type,
+                    error_msg,
+                    AsyncJavaObject(self, error_object) if error_object else None,
+                )
             except Exception as e:
                 # Not every server error maps to a JavaException subclass
                 # (PayloadTooLargeError, CancelledException); all of them

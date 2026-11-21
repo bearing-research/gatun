@@ -161,7 +161,7 @@ def _create_typed_vector(builder, data: bytes, itemsize: int, num_elements: int)
 
 # Protocol version - must match the server version
 # Version 2: Per-client shared memory (handshake includes SHM path)
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 
 # Memory zone sizes - must match GatunServer.java constants
 COMMAND_ZONE_SIZE = wire.COMMAND_ZONE_SIZE  # 64KB for commands
@@ -257,12 +257,25 @@ class JavaException(Exception):
         java_class: The fully qualified Java exception class name
         message: The exception message
         stack_trace: The full Java stack trace as a string
+        java_exception: The exception that was thrown, as a Java object: call
+            `getCause()`, `getStackTrace()` or the methods of its own class on
+            it. It is an object of the session like any other and is released
+            when this exception is collected, so keep the exception (or the
+            object) for as long as it is used. None for an error that is not a
+            Java exception, and when the session was at its object limit.
     """
 
-    def __init__(self, java_class: str, message: str, stack_trace: str = ""):
+    def __init__(
+        self,
+        java_class: str,
+        message: str,
+        stack_trace: str = "",
+        java_exception: Any = None,
+    ):
         self.java_class = java_class
         self.message = message
         self.stack_trace = stack_trace
+        self.java_exception = java_exception
         super().__init__(stack_trace or f"{java_class}: {message}")
 
 
@@ -421,7 +434,9 @@ _JAVA_EXCEPTION_MAP: dict[str, type[Exception]] = {
 }
 
 
-def _raise_java_exception_impl(error_type: str, error_msg: str) -> None:
+def _raise_java_exception_impl(
+    error_type: str, error_msg: str, java_exception: Any = None
+) -> None:
     """Raise the appropriate Python exception for a Java error.
 
     This is the core implementation used by both sync and async clients.
@@ -429,6 +444,8 @@ def _raise_java_exception_impl(error_type: str, error_msg: str) -> None:
     Args:
         error_type: The fully qualified Java exception class name
         error_msg: The full error message including stack trace
+        java_exception: The thrown exception as a Java object, if the server
+            sent one
     """
     import re
 
@@ -458,8 +475,10 @@ def _raise_java_exception_impl(error_type: str, error_msg: str) -> None:
     if ": " in message:
         message = message.split(": ", 1)[1]
 
-    # Create and raise the exception
-    raise exc_class(error_type, message, error_msg)
+    # Raised without a name for it here: a local variable would make a cycle
+    # with the traceback, and the Java object would then wait for the garbage
+    # collector instead of going with the exception
+    raise exc_class(error_type, message, error_msg, java_exception)
 
 
 class SocketTimeoutError(Exception):
@@ -1575,7 +1594,7 @@ def _release_unread_response(client: Any, reply: bytes) -> None:
     ids: list[int] = []
     try:
         resp = Response.Response.GetRootAsResponse(reply, 0)
-        if resp.IsError() or resp.IsCallback():
+        if resp.IsCallback():
             return
         batch = resp.Batch()
         results = (
@@ -1585,6 +1604,9 @@ def _release_unread_response(client: Any, reply: bytes) -> None:
         )
         for result in results:
             if result.IsError():
+                # The exception that was thrown is an object of the client too
+                if result.ErrorObject():
+                    ids.append(result.ErrorObject())
                 continue
             # No wrappers, which would be Java objects to hash as a map's keys
             _unpack_value_impl(
@@ -3414,7 +3436,7 @@ class GatunClient(_ValueEncoder):
                 if error_type_bytes
                 else "java.lang.RuntimeException"
             )
-            self._raise_java_exception(error_type, error_msg)
+            self._raise_java_exception(error_type, error_msg, resp.ErrorObject())
 
         # A batch's sub-responses are unpacked by BatchContext
         batch = resp.Batch()
@@ -3432,9 +3454,20 @@ class GatunClient(_ValueEncoder):
 
         return self._unpack_value(resp.ReturnValType(), resp.ReturnVal())
 
-    def _raise_java_exception(self, error_type: str, error_msg: str) -> None:
-        """Raise the appropriate Python exception for a Java error."""
-        _raise_java_exception_impl(error_type, error_msg)
+    def _raise_java_exception(
+        self, error_type: str, error_msg: str, error_object: int = 0
+    ) -> None:
+        """Raise the appropriate Python exception for a Java error.
+
+        `error_object` is the ID the server registered the thrown exception
+        under, or 0. An exception class that has no place for it (a cancelled
+        request) drops the wrapper, which releases the object.
+        """
+        _raise_java_exception_impl(
+            error_type,
+            error_msg,
+            JavaObject(self, error_object) if error_object else None,
+        )
 
     def _handle_callback(
         self,
@@ -5701,7 +5734,9 @@ class BatchContext:
                     else "java.lang.RuntimeException"
                 )
                 # Store exception object instead of raising
-                exc = self._make_exception(error_type, error_msg)
+                exc = self._make_exception(
+                    error_type, error_msg, sub_resp.ErrorObject()
+                )
                 self._results.append(exc)
             else:
                 value = self._client._unpack_value(
@@ -5775,9 +5810,19 @@ class BatchContext:
 
         return bytes(builder.Output())
 
-    def _make_exception(self, error_type: str, error_msg: str) -> Exception:
-        """Create an exception object without raising it."""
+    def _make_exception(
+        self, error_type: str, error_msg: str, error_object: int = 0
+    ) -> Exception:
+        """Create an exception object without raising it.
+
+        `error_object` is the ID of the thrown exception, or 0. A class with no
+        place for it drops the wrapper, which releases the object.
+        """
         import re
+
+        java_exception = (
+            JavaObject(self._client, error_object) if error_object else None
+        )
 
         # Handle special exception types
         if error_type == "org.gatun.PayloadTooLargeException":
@@ -5799,4 +5844,4 @@ class BatchContext:
         lines = error_msg.split("\n")
         message = lines[0] if lines else error_msg
 
-        return exc_class(error_type, message, error_msg)
+        return exc_class(error_type, message, error_msg, java_exception)
