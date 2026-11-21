@@ -39,6 +39,7 @@ import jdk.net.ExtendedSocketOptions;
 import jdk.net.UnixDomainPrincipal;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.gatun.PayloadTooLargeException;
 import org.gatun.protocol.*; // Import all generated classes
@@ -4336,10 +4337,44 @@ public class GatunServer {
               + target.getClass().getName()
               + ", not an org.apache.arrow.vector.VectorSchemaRoot");
     }
+    requireReadable(targetId, table);
     long length = arrow.writeIpcTable(table, free);
     SessionObserver.recordArrowTransfer(
         sessionId, "java_to_python", table.getRowCount(), length, false);
     return length;
+  }
+
+  /**
+   * Refuse a table that has been closed, before it is written out. A closed table keeps its row
+   * count over vectors that hold nothing, and the stream written from it is one pyarrow refuses
+   * ("Array length did not match record batch length") without saying why. A loan that has ended
+   * closed its table, so that case is named.
+   */
+  private void requireReadable(long targetId, VectorSchemaRoot table) {
+    ArrowLoans.Loan loan = lentTables.get(targetId);
+    if (loan != null && loan.ended()) {
+      throw new IllegalStateException(
+          "Object "
+              + targetId
+              + " is a table Python lent to Java, and its loan has ended (the block or"
+              + " reset_payload_arena() ended it, or the thread that lent it): it can no longer"
+              + " be read. Read it while the loan lasts, or send a copy (copy=True)");
+    }
+    int rows = table.getRowCount();
+    for (FieldVector vector : table.getFieldVectors()) {
+      if (vector.getValueCount() < rows) {
+        throw new IllegalStateException(
+            "Object "
+                + targetId
+                + " is a table that has been closed: its "
+                + rows
+                + " rows are gone (column "
+                + vector.getName()
+                + " holds "
+                + vector.getValueCount()
+                + ")");
+      }
+    }
   }
 
   /** Where in a call's memory {@link #arrowFromObject} left a stream for a nested command. */

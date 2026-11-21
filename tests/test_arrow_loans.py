@@ -388,6 +388,30 @@ class TestEndOfALoan:
         with pytest.raises(JavaException, match="not found"):
             loan.root.getRowCount()
 
+    def test_a_table_whose_loan_ended_cannot_be_read_back(self, client):
+        """Ending a loan closes the table, which keeps its row count over
+        empty vectors: written out, that was a stream pyarrow refused."""
+        loan = client.arrow_to_java(pa.table({"x": [1, 2, 3]}), copy=False)
+        root = loan.root
+        client.reset_payload_arena()
+
+        with pytest.raises(JavaException, match="loan has ended"):
+            client.arrow_from_java(root)
+        with pytest.raises(JavaException, match="loan has ended"):
+            client.arrow_from_java(root, copy=False)
+        assert client.ping() is True
+        loan.close()
+
+    def test_a_closed_table_cannot_be_read_back(self, client):
+        """The same for a table Java code closed: a closed table is no table."""
+        root = client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
+        produced = root.slice(1, 2)
+        produced.close()
+
+        with pytest.raises(JavaException, match="has been closed"):
+            client.arrow_from_java(produced)
+        assert client.arrow_from_java(root).num_rows == 3
+
     def test_end_that_was_cancelled_is_tried_again(self, client, monkeypatch):
         """cancel() can catch the exchange that ends a loan. The server has
         not taken the table back then, and the client must not act as if."""

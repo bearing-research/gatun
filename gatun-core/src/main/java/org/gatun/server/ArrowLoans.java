@@ -98,6 +98,13 @@ final class ArrowLoans {
       return table;
     }
 
+    /** Whether the table has been taken back (and closed). */
+    boolean ended() {
+      synchronized (ArrowLoans.this) {
+        return ended;
+      }
+    }
+
     /** Take the table back: it cannot be read from here on, and its bytes are the client's. */
     void end() {
       synchronized (ArrowLoans.this) {
