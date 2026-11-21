@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# A new push to a pull request makes its running checks moot. On main every
+# commit is checked: a group allows one pending run and cancels it for a newer
+# one whatever cancel-in-progress says, so each commit there has a group of its
+# own
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
@@ -34,6 +42,9 @@ jobs:
         with:
           distribution: "temurin"
           java-version: "22"
+          # The build's dependencies, so that it does not fetch them from Maven
+          # Central every time: that answers 429 to busy runners
+          cache: gradle
 
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.3
@@ -52,6 +63,12 @@ jobs:
         run: |
           uv run python --version
           uv run pytest -v
+
+      # The build left a daemon holding locks in ~/.gradle/caches, which
+      # setup-java saves after the last step
+      - name: Stop Gradle
+        if: always()
+        run: ./gradlew --stop
 
   # The server on a classpath that brings its own Arrow: it starts from the thin
   # JAR there and runs on Spark's Arrow, Netty, Jackson and FlatBuffers. The two
@@ -75,6 +92,9 @@ jobs:
         with:
           distribution: "temurin"
           java-version: "22"
+          # The build's dependencies, so that it does not fetch them from Maven
+          # Central every time: that answers 429 to busy runners
+          cache: gradle
 
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.3
@@ -101,3 +121,7 @@ jobs:
           # The point of this step: the server runs on Spark's Arrow, not its own
           uv run --no-sync python -c 'import sys; from gatun import launcher; assert launcher._server_jar([sys.argv[1]]) == launcher.THIN_JAR_PATH' "$jars/*"
           GATUN_TEST_CLASSPATH="$jars/*" uv run --no-sync pytest -v --no-cov
+
+      - name: Stop Gradle
+        if: always()
+        run: ./gradlew --stop

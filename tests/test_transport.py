@@ -2,6 +2,7 @@
 
 import threading
 import time
+import traceback
 
 import pytest
 
@@ -31,7 +32,7 @@ class TestThreads:
         for thread in threads:
             thread.join()
 
-        assert errors == []
+        assert errors == [], "".join(traceback.format_exception(errors[0]))
         assert client.ping() is True
 
     def test_threads_build_their_commands_apart(self, client):
@@ -61,7 +62,10 @@ class TestThreads:
         finally:
             sys.setswitchinterval(interval)
 
-        assert errors == []
+        # A socket timeout long before its 30 seconds was seen on macOS
+        # runners; the first error's whole chain says where it came from
+        # ("timed out" from Python's poll(), an errno from the system)
+        assert errors == [], "".join(traceback.format_exception(errors[0]))
 
     def test_threads_sending_arrow_tables(self, client):
         """Writing the payload zone and sending the request are one step."""
@@ -93,7 +97,7 @@ class TestThreads:
         finally:
             sys.setswitchinterval(interval)
 
-        assert errors == []
+        assert errors == [], "".join(traceback.format_exception(errors[0]))
 
     def test_another_thread_waits_out_a_callback(self, client):
         """A callback on one thread does not make other threads reentrant."""
