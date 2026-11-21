@@ -1086,24 +1086,26 @@ class AsyncGatunClient(_ValueEncoder):
         return cast(AsyncJavaObject, await self._send_raw(builder.Output()))
 
     async def invoke_method(
-        self, obj, method_name: str, *args, return_object_ref: bool = False
+        self, obj_id, method_name: str, *args, return_object_ref: bool = False
     ):
         """Invoke a method on a Java object asynchronously.
 
         With `return_object_ref` the result is an AsyncJavaObject instead of a
         converted value (a String, a List, a BigDecimal).
         """
-        # A new name, so that `obj` keeps a temporary alive until the answer is
-        # in: as the last reference to it, the wrapper's release would ride on
-        # this very command, and the server releases before it runs one
-        obj_id = (
-            obj.object_id if isinstance(obj, (JavaObject, AsyncJavaObject)) else obj
+        # A name of its own, so that `obj_id` keeps a temporary alive until the
+        # answer is in: as the last reference to it, the wrapper's release would
+        # ride on this very command, and the server releases before it runs one
+        target_id = (
+            obj_id.object_id
+            if isinstance(obj_id, (JavaObject, AsyncJavaObject))
+            else obj_id
         )
 
         data = wire.pack_command(
             Act.Action.InvokeMethod,
             method_name,
-            obj_id,
+            target_id,
             args,
             self._object_ref_types,
             return_object_ref,
@@ -1129,7 +1131,7 @@ class AsyncGatunClient(_ValueEncoder):
 
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.InvokeMethod)
-        Cmd.CommandAddTargetId(builder, obj_id)
+        Cmd.CommandAddTargetId(builder, target_id)
         Cmd.CommandAddTargetName(builder, name_off)
         if args_vec:
             Cmd.CommandAddArgs(builder, args_vec)
@@ -1192,21 +1194,25 @@ class AsyncGatunClient(_ValueEncoder):
 
         return await self._send_raw(builder.Output())
 
-    async def get_field(self, obj, field_name: str, *, return_object_ref: bool = False):
+    async def get_field(
+        self, obj_id, field_name: str, *, return_object_ref: bool = False
+    ):
         """Get a field value from a Java object asynchronously.
 
         With `return_object_ref` the value is an AsyncJavaObject instead of a
         converted value.
         """
-        # A new name, so that `obj` keeps a temporary alive until the answer is
-        # in: as the last reference to it, the wrapper's release would ride on
-        # this very command, and the server releases before it runs one
-        obj_id = (
-            obj.object_id if isinstance(obj, (JavaObject, AsyncJavaObject)) else obj
+        # A name of its own, so that `obj_id` keeps a temporary alive until the
+        # answer is in: as the last reference to it, the wrapper's release would
+        # ride on this very command, and the server releases before it runs one
+        target_id = (
+            obj_id.object_id
+            if isinstance(obj_id, (JavaObject, AsyncJavaObject))
+            else obj_id
         )
 
         data = wire.pack_command(
-            Act.Action.GetField, field_name, obj_id, (), (), return_object_ref
+            Act.Action.GetField, field_name, target_id, (), (), return_object_ref
         )
         if data is not None:
             return await self._send_raw(data, packed=True)
@@ -1216,7 +1222,7 @@ class AsyncGatunClient(_ValueEncoder):
 
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.GetField)
-        Cmd.CommandAddTargetId(builder, obj_id)
+        Cmd.CommandAddTargetId(builder, target_id)
         Cmd.CommandAddTargetName(builder, name_off)
         if return_object_ref:
             Cmd.CommandAddReturnObjectRef(builder, True)
@@ -1225,17 +1231,19 @@ class AsyncGatunClient(_ValueEncoder):
 
         return await self._send_raw(builder.Output())
 
-    async def set_field(self, obj, field_name: str, value):
+    async def set_field(self, obj_id, field_name: str, value):
         """Set a field value on a Java object asynchronously."""
-        # A new name, so that `obj` keeps a temporary alive until the answer is
-        # in: as the last reference to it, the wrapper's release would ride on
-        # this very command, and the server releases before it runs one
-        obj_id = (
-            obj.object_id if isinstance(obj, (JavaObject, AsyncJavaObject)) else obj
+        # A name of its own, so that `obj_id` keeps a temporary alive until the
+        # answer is in: as the last reference to it, the wrapper's release would
+        # ride on this very command, and the server releases before it runs one
+        target_id = (
+            obj_id.object_id
+            if isinstance(obj_id, (JavaObject, AsyncJavaObject))
+            else obj_id
         )
 
         data = wire.pack_command(
-            Act.Action.SetField, field_name, obj_id, (value,), self._object_ref_types
+            Act.Action.SetField, field_name, target_id, (value,), self._object_ref_types
         )
         if data is not None:
             return await self._send_raw(data, packed=True)
@@ -1252,7 +1260,7 @@ class AsyncGatunClient(_ValueEncoder):
 
         Cmd.CommandStart(builder)
         Cmd.CommandAddAction(builder, Act.Action.SetField)
-        Cmd.CommandAddTargetId(builder, obj_id)
+        Cmd.CommandAddTargetId(builder, target_id)
         Cmd.CommandAddTargetName(builder, name_off)
         Cmd.CommandAddArgs(builder, args_vec)
         cmd = Cmd.CommandEnd(builder)
