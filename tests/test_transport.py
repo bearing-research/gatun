@@ -190,9 +190,10 @@ class TestInterruptedExchange:
     def test_request_that_was_never_sent_leaves_the_client_usable(self, client):
         items = client.jvm.java.util.ArrayList()
         with pytest.raises(PayloadTooLargeError) as exc_info:
-            items.add("x" * 100_000)
+            items.add("x" * (client.max_message_size + 1))
 
-        assert "whatever the memory setting" in str(exc_info.value)
+        assert exc_info.value.max_size == client.max_message_size
+        assert "connect with more" in str(exc_info.value)
         assert client.ping() is True
         assert items.size() == 0
 
@@ -267,7 +268,8 @@ class TestBatchFailures:
     def test_batch_too_large_to_send_has_not_run(self, client):
         items = client.jvm.java.util.ArrayList()
         batch = client.batch()
-        results = [batch.call(items, "add", "x" * 30_000) for _ in range(4)]
+        third = client.max_message_size // 3
+        results = [batch.call(items, "add", "x" * third) for _ in range(4)]
 
         with pytest.raises(PayloadTooLargeError):
             batch.execute()

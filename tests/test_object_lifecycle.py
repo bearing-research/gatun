@@ -110,7 +110,7 @@ class TestWrapperRelease:
         """The client never learns the IDs of what the batch made."""
         # The count is the whole server's, so on a server of its own: on the
         # shared one, sessions of earlier tests are still being cleaned up
-        client = connect(memory="16MB")
+        client = connect(memory="192KB")
 
         def live_objects():
             report = client.get_metrics()
@@ -123,7 +123,7 @@ class TestWrapperRelease:
             with pytest.raises(PayloadTooLargeError), client.batch() as b:
                 for _ in range(5):
                     b.create("java.util.ArrayList")
-                b.call(text, "repeat", 40_000)
+                b.call(text, "repeat", 120_000)
 
             assert live_objects() == before
         finally:

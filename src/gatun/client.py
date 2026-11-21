@@ -5781,8 +5781,8 @@ class BatchContext:
             raise PayloadTooLargeError(len(data), limit, "Command")
         call = _channel_call_of(self._client)
         if call is not None:
-            # On the callback connection the command travels wrapped, in a
-            # frame with a limit of its own: refused here, it was not sent
+            # On the callback connection the command travels wrapped, which
+            # adds to its size: refused here, it was not sent
             _nested_command(call.call_id, data, limit)
 
         self._executed = True

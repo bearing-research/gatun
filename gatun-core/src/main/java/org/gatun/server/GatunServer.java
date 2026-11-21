@@ -1483,6 +1483,9 @@ public class GatunServer {
         builder.finish(responseOffset);
         ByteBuffer resBuf = builder.dataBuffer();
         int resSize = resBuf.remaining();
+        // The builder keeps the buffer it grew to; one large response must not cost the session
+        // that much memory for the rest of its life
+        boolean builderGrew = resSize > RESPONSE_ZONE_SIZE;
 
         // More than a session may send: the client gets an error in its place
         if (resSize > maxMessageSize) {
@@ -1516,8 +1519,8 @@ public class GatunServer {
           lengthBuf.clear();
         } else {
           writeMessage(client, sharedMem, resBuf);
-          // The builder keeps the buffer it grew to; one large response must not cost the
-          // session that much memory for the rest of its life
+        }
+        if (builderGrew) {
           responseBuilder = new FlatBufferBuilder(1024);
         }
 

@@ -1121,7 +1121,7 @@ client.max_message_size                              # 67108864: the memory size
 
 - A command or a response of up to 64 KB is written to shared memory, as before. A larger one follows its length on the socket. Nothing else changes for the caller, and it holds for single calls, a batch (its commands taken together, and its results), the vectorized calls, callback arguments and results, both clients, and calls made inside a callback.
 - Beyond `max_message_size` a command raises `PayloadTooLargeError` before it is sent, and a response arrives as that error; the client stays usable. Connect with more memory, split the call, or move the data as Arrow.
-- The server's limits apply as they did: 10 MB per string (`gatun.limits.max_string_length`) and 100,000 entries per list or map (`gatun.limits.max_list_entries`) by default, raised with `extra_jvm_flags=["-Dgatun.limits.max_string_length=67108864"]`.
+- The server's limits on what Python sends apply as they did: 10 MB per string (`gatun.limits.max_string_length`) and 100,000 entries per list or map (`gatun.limits.max_list_entries`) by default, raised with `extra_jvm_flags=["-Dgatun.limits.max_string_length=67108864"]`. What Java returns is bounded by the memory size alone.
 - A large value takes no room in the payload zone, so it cannot disturb an Arrow table that is lent or read in place. For bulk data Arrow remains several times faster: a value travels through the socket and is decoded element by element.
 - A Java stack trace arrives whole. It is shortened only past a megabyte, or a quarter of the memory if that is less.
 

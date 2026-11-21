@@ -478,6 +478,21 @@ class TestAllowingYourOwnClasses:
             client.close()
 
 
+class TestLargeValues:
+    """The 'Large Values' example."""
+
+    def test_large_values(self):
+        client = connect(memory="64MB")
+        try:
+            text = "x" * 5_000_000
+            builder = client.jvm.java.lang.StringBuilder(text)
+            assert builder.toString() == text
+
+            assert client.max_message_size == 67108864
+        finally:
+            client.close()
+
+
 class TestBigNumbersAndConverters:
     """The 'Big Numbers' and 'Converters for Your Own Types' examples."""
 

@@ -361,10 +361,11 @@ class TestLimits:
         assert small.jvm.Large.text(100_000) == "j" * 100_000
 
     def test_a_batch_beyond_the_memory(self, small):
-        with small.batch() as b:
-            results = [b.call_static("Large", "text", 50_000) for _ in range(5)]
         # The results taken together are what does not fit
-        with pytest.raises(RuntimeError, match="batch failed as a whole"):
+        with pytest.raises(PayloadTooLargeError) as raised, small.batch() as b:
+            results = [b.call_static("Large", "text", 50_000) for _ in range(5)]
+        assert raised.value.max_size == 192 * KB
+        with pytest.raises(RuntimeError):
             results[0].get()
 
         with pytest.raises(PayloadTooLargeError), small.batch() as b:

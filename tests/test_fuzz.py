@@ -158,17 +158,28 @@ class TestMalformedCommandHandling:
         except (BrokenPipeError, ConnectionResetError):
             pass  # Expected - server rejected
 
-    def test_oversized_command(self, make_client):
-        """Command larger than command zone should be rejected."""
+    def test_large_command_that_never_arrives(self, make_client):
+        """A length past the command zone announces bytes on the socket. A
+        client that sends none and goes away ends its own session only."""
         client = make_client()
-        # Command zone is 64KB (65536 bytes)
-        oversized = 100000  # 100KB
+        client.sock.sendall(struct.pack("<I", 100000))
+        client.sock.close()
 
-        try:
-            client.sock.sendall(struct.pack("<I", oversized))
-            # Server should reject this
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # Expected
+        other = make_client()
+        assert other.ping() is True
+
+    def test_command_larger_than_the_memory(self, make_client):
+        """No command is that large: the session is told and closed, since
+        whatever follows such a length is not a length."""
+        client = make_client()
+        client.sock.sendall(struct.pack("<I", client.memory_size + 1))
+        size = struct.unpack("<I", client.sock.recv(4))[0]
+        client.shm.seek(client.response_offset)
+        assert b"Invalid command size" in client.shm.read(size)
+        assert client.sock.recv(4) == b""
+
+        other = make_client()
+        assert other.ping() is True
 
     def test_truncated_flatbuffer(self, make_client):
         """Truncated FlatBuffer should be handled gracefully."""

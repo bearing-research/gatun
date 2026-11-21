@@ -39,9 +39,8 @@ from gatun.generated.org.gatun.protocol import Action, Value
 COMMAND_ZONE_SIZE = 65536
 
 # The longest command packed here. Short of the zone by more than a packed
-# command's extra bytes and the wrapper a command gets inside a callback, where
-# it travels in a frame with the zone's limit (`_nested_command` in client.py):
-# what the builder could fit in a frame must not be refused for being packed.
+# command's extra bytes: what the builder fits into the command zone must not
+# be sent on the socket, as a command past the zone is, for being packed.
 _PACKED_LIMIT = COMMAND_ZONE_SIZE - 512
 
 _INT = Value.Value.IntVal
