@@ -133,6 +133,18 @@ DEFAULT_JVM_FLAGS = [
 
 _LIKELY_JAR = re.compile("arrow|netty|flatbuffers", re.IGNORECASE)
 
+# slf4j's API, which the fat JAR has under its own name: Arrow logs through it
+_SLF4J_API = b"org/slf4j/LoggerFactory.class"
+# What of the fat JAR must stay the server's own, whatever the classpath has
+_SERVER_OWN_CLASSES = (
+    b"org/apache/arrow/vector/VectorSchemaRoot.class",
+    b"org/apache/arrow/flatbuf/Message.class",
+    b"org/apache/arrow/memory/BufferAllocator.class",
+    b"org/apache/arrow/memory/netty/NettyAllocationManager.class",
+    b"com/google/flatbuffers/Table.class",
+    b"org/gatun/server/GatunServer.class",
+)
+
 
 def _central_directory(path: str) -> bytes:
     """The central directory of a JAR: the part that lists its entries.
@@ -271,6 +283,38 @@ def _host_arrow(classpath: list[str]) -> tuple[set[bytes], str | None]:
                     if not os.path.isdir(more):
                         queue.append(more)
     return missing, vectors
+
+
+def _application_slf4j(classpath: list[str]) -> str | None:
+    """The classpath entry whose slf4j API the application would use without
+    the server in front of it: the first that has one. None if there is none,
+    or if that entry also has a library the server must keep its own of.
+
+    The fat JAR's slf4j-api (2.x) comes first otherwise, and slf4j 2.x ignores
+    the bindings of 1.7 (slf4j-reload4j, slf4j-simple 1.7): the application's
+    logging went nowhere. Arrow calls only what slf4j 1.7 has too, so with the
+    application's API in front, Arrow logs where the application does.
+    """
+    for entry in _classpath_entries(classpath):
+        directory: bytes | None = None
+        if not os.path.isdir(entry):
+            try:
+                directory = _central_directory(entry)
+            except (OSError, ValueError, OverflowError, struct.error):
+                continue
+        if _entry_has(entry, directory, _SLF4J_API):
+            if any(_entry_has(entry, directory, n) for n in _SERVER_OWN_CLASSES):
+                return None
+            return entry
+    return None
+
+
+def _entry_has(entry: str, directory: bytes | None, name: bytes) -> bool:
+    """Whether a classpath entry has `name`: a JAR by its central directory,
+    a folder of classes when `directory` is None."""
+    if directory is None:
+        return os.path.exists(os.path.join(entry, os.fsdecode(name)))
+    return _jar_has(directory, name)
 
 
 def _arrow_version(entry: str) -> tuple[int, int] | None:
@@ -832,6 +876,10 @@ def launch_gateway(
         # Use -cp with main class to allow additional classpath entries
         # java [FLAGS] -cp [CLASSPATH] org.gatun.server.GatunServer [MEM_SIZE] [SOCKET_PATH]
         all_jars = [str(jar)] + classpath
+        if jar == JAR_PATH:
+            slf4j = _application_slf4j(classpath)
+            if slf4j is not None:
+                all_jars.insert(0, slf4j)
         cp = os.pathsep.join(all_jars)
         cmd = (
             [java_cmd]

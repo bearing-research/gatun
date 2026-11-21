@@ -15,6 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from gatun import GatunClient, connect, launcher
@@ -277,13 +278,19 @@ class TestServerJar:
         assert "org/gatun/server/GatunServer.class" in names
         assert all(name.startswith("org/gatun/") for name in names)
 
-    def test_the_fat_jar_has_no_jackson_or_netty_under_their_own_names(self):
+    def test_the_fat_jar_has_no_jackson_netty_or_codec_under_their_own_names(self):
         import zipfile
 
         with zipfile.ZipFile(launcher.JAR_PATH) as jar:
             names = jar.namelist()
         assert "org/apache/arrow/vector/VectorSchemaRoot.class" in names
-        assert not [n for n in names if n.startswith(("com/fasterxml/", "io/netty/"))]
+        assert not [
+            n
+            for n in names
+            if n.startswith(
+                ("com/fasterxml/", "io/netty/", "org/apache/commons/codec/")
+            )
+        ]
         assert not [
             n
             for n in names
@@ -615,6 +622,132 @@ class TestServerJar:
             )
             session.stop()
         assert caplog.text == ""
+
+
+SLF4J_API = "org/slf4j/LoggerFactory.class"
+
+
+class TestTheApplicationsSlf4j:
+    """The fat JAR's slf4j-api is 2.x, which ignores the bindings of 1.7: in
+    front of the application's, the application's logging went nowhere."""
+
+    def test_none(self, tmp_path):
+        app = make_jar(tmp_path / "app.jar", ["com/example/App.class"])
+        assert launcher._application_slf4j([app]) is None
+        assert launcher._application_slf4j([str(tmp_path / "missing.jar")]) is None
+
+    def test_the_first_one_is_the_applications(self, tmp_path):
+        """The one the JVM would load without the server in front."""
+        app = make_jar(tmp_path / "app.jar", ["com/example/App.class"])
+        first = make_jar(tmp_path / "slf4j-api-1.7.36.jar", [SLF4J_API])
+        second = make_jar(tmp_path / "slf4j-api-2.0.9.jar", [SLF4J_API])
+        assert launcher._application_slf4j([app, first, second]) == first
+        assert launcher._application_slf4j([os.pathsep.join([second, first])]) == second
+
+    def test_in_a_folder_of_jars_or_of_classes(self, tmp_path):
+        jars = tmp_path / "jars"
+        jars.mkdir()
+        api = make_jar(jars / "slf4j-api.jar", [SLF4J_API])
+        make_jar(jars / "app.jar", ["com/example/App.class"])
+        # The JAR, not the folder: the others there stay behind the server
+        assert launcher._application_slf4j([str(jars / "*")]) == api
+
+        classes = tmp_path / "classes"
+        (classes / "org" / "slf4j").mkdir(parents=True)
+        (classes / SLF4J_API).write_bytes(b"")
+        assert launcher._application_slf4j([str(classes)]) == str(classes)
+
+    @pytest.mark.parametrize(
+        "own",
+        [
+            "org/apache/arrow/memory/BufferAllocator.class",
+            "com/google/flatbuffers/Table.class",
+            "org/gatun/server/GatunServer.class",
+        ],
+    )
+    def test_not_with_what_the_server_keeps_its_own_of(self, tmp_path, own):
+        """An uber JAR with slf4j and FlatBuffers in front would take the
+        server's FlatBuffers too."""
+        uber = make_jar(tmp_path / "uber.jar", [SLF4J_API, own])
+        api = make_jar(tmp_path / "slf4j-api.jar", [SLF4J_API])
+        assert launcher._application_slf4j([uber, api]) is None
+
+    def test_it_goes_in_front_of_the_fat_jar(
+        self, tmp_path, stand_in_server, started_processes
+    ):
+        stand_in_server()
+        app = make_jar(tmp_path / "app.jar", ["com/example/App.class"])
+        api = make_jar(tmp_path / "slf4j-api.jar", [SLF4J_API])
+
+        session = launch_gateway(classpath=[app, api])
+        session.stop()
+
+        (process,) = started_processes
+        command = process.args
+        classpath = command[command.index("-cp") + 1].split(os.pathsep)
+        assert classpath == [api, str(launcher.JAR_PATH), app, api]
+
+    def test_the_thin_jar_has_none_to_put_in_front(
+        self, tmp_path, stand_in_server, started_processes
+    ):
+        stand_in_server()
+        host = make_jar(tmp_path / "host.jar", [*ARROW_AND_FRIENDS, SLF4J_API])
+
+        session = launch_gateway(classpath=[host])
+        session.stop()
+
+        (process,) = started_processes
+        command = process.args
+        classpath = command[command.index("-cp") + 1].split(os.pathsep)
+        assert classpath == [str(launcher.THIN_JAR_PATH), host]
+
+    def test_the_server_runs_on_the_applications_libraries(self, compile_java):
+        """slf4j in front of the fat JAR, and commons-codec relocated in it:
+        a class of the application's under either name is the one loaded.
+        Arrow logs through the application's slf4j, which here is a stand-in
+        with only what slf4j 1.7 has."""
+        compile_java(
+            "LoggerFactory",
+            """
+            package org.slf4j;
+
+            import org.slf4j.helpers.NOPLogger;
+            import org.slf4j.helpers.NOPLoggerFactory;
+
+            public final class LoggerFactory {
+              public static Logger getLogger(String name) { return NOPLogger.NOP_LOGGER; }
+              public static Logger getLogger(Class<?> c) { return NOPLogger.NOP_LOGGER; }
+              public static ILoggerFactory getILoggerFactory() { return new NOPLoggerFactory(); }
+              public static String whose() { return "the application's"; }
+            }
+            """,
+            with_server=True,
+        )
+        classes = compile_java(
+            "Hex",
+            """
+            package org.apache.commons.codec.binary;
+
+            public final class Hex {
+              public static String whose() { return "the application's"; }
+            }
+            """,
+        )
+        client = connect(
+            memory="16MB",
+            classpath=[classes],
+            allowed_prefixes=["org.slf4j", "org.apache.commons.codec"],
+        )
+        try:
+            assert client.jvm.org.slf4j.LoggerFactory.whose() == "the application's"
+            assert (
+                client.jvm.org.apache.commons.codec.binary.Hex.whose()
+                == "the application's"
+            )
+            table = pa.table({"x": [1, 2, 3]})
+            assert client.arrow_from_java(client.arrow_to_java(table)).equals(table)
+        finally:
+            client.close()
 
 
 class TestSignalHandlers:
