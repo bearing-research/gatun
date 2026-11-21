@@ -4,8 +4,9 @@ What Gatun's operations cost, measured, and how single calls compare with Py4J (
 
 ## What the numbers say
 
-- **A call with plain arguments takes 31 to 39 μs, which is less than Py4J's.** An instance method call takes 33 μs through Gatun and 42 μs through Py4J on the test machine, a static call 39 μs against 113 μs (Py4J makes two round trips for it), and a loop of calls runs at about 27,000 a second against 18,000 to 23,000. A bare round trip between two processes takes 21 μs there.
-- **The gap is wider when a call carries a collection or a large return value.** A Python list of 100 integers as a constructor argument, with two calls on the result, takes 0.28 ms against 5.6 ms. `is_instance_of` is one round trip, not several (31 μs against 275 μs). Py4J takes about 40 ms to return a string of 8 KB or a byte array of 16 KB; Gatun takes 65 μs.
+- **A call with plain arguments takes 31 to 39 μs. For a plain instance call and for creating an object, that is about what Py4J takes.** An instance method call took 33 μs through Gatun and 42 μs through Py4J on the test machine, and a loop of calls ran at about 27,000 a second against 18,000 to 23,000; on a second machine Py4J was level or ahead on the same cases (see [A second machine](#a-second-machine)). A bare round trip between two processes takes 21 μs on the test machine.
+- **Gatun is ahead where Py4J makes more round trips.** A static call takes 39 μs against 113 μs (Py4J makes two round trips for it), and `is_instance_of` 31 μs against 275 μs. A Python list of 100 integers as a constructor argument, with two calls on the result, takes 0.28 ms against 5.6 ms.
+- **Stock Py4J takes about 40 ms to return a value of 8 KB or more, and the cause is Nagle's algorithm.** Its server does not set `TCP_NODELAY`. With the option set, Py4J returns such a value in 0.2 to 0.3 ms, about 3 times Gatun's time (see [Payload size](#payload-size)).
 - **An operation in a `batch()` costs about 5 μs.** A hundred method calls take 4.2 ms one at a time, 0.56 ms in a batch and 2.7 ms as one `invoke_methods()`.
 - **Bulk data belongs in Arrow.** 16 MB of columns reaches Java in 1.0 to 3.2 ms depending on the method, and 128 MiB in 8 to 27 ms, where an Arrow stream over a Unix socket takes 102 ms. Getting 500 integers into Java takes 21 ms as 500 calls, 2.4 ms as a batch of them, 0.22 ms as one Python list and 0.17 ms as one `pyarrow.Array` argument.
 - **A callback costs about 330 μs** with the default callback timeout, and 160 μs with `callback_timeout=None`.
@@ -51,6 +52,8 @@ uv run python benchmarks/benchmark_transport.py --classes benchmarks/java/out \
 
 Every script takes `--quick` for a run that checks it works and whose numbers mean nothing.
 
+`benchmark_comparison.py --py4j-nodelay` runs Py4J's server with `TCP_NODELAY` set on the connections it accepts, which Py4J does not do itself (see [Payload size](#payload-size)). It compiles `benchmarks/java/bench/NoDelayGateway.java` against the installed Py4J jar, so it needs `javac`.
+
 ## Results
 
 ### Single calls: Gatun and Py4J
@@ -93,11 +96,17 @@ Median microseconds unless marked. The last column compares Gatun with Py4J as P
 
 Three things explain most of the table:
 
-- **A call with plain arguments is one round trip on both bridges, and Gatun's is the shorter** (3.1 to 3.5, 4.1, 6.1 and 6.2): 33 to 36 μs against 41 to 67 μs. The round trip itself is 21 μs here; the rest is the client's Python and the server's work. See [Where a call's time goes](#where-a-calls-time-goes).
+- **A call with plain arguments is one round trip on both bridges** (3.1 to 3.5, 4.1, 6.1 and 6.2): 33 to 36 μs against 41 to 67 μs here. The round trip itself is 21 μs; the rest is the client's Python and the server's work. See [Where a call's time goes](#where-a-calls-time-goes). These rows are the ones a different machine can turn around: see [A second machine](#a-second-machine).
 - **A static call through Py4J is two round trips**, one to look the method up and one to call it (section 2), and a class reached through `jvm.` costs several more (section 9). Gatun asks the server what a dotted name is once and remembers.
 - **A collection as an argument is one message for Gatun and a round trip for each element for Py4J** (5.1 to 5.3). Those three cases, and the two with `bytes`, are the ones whose commands Gatun still writes with the FlatBuffers library; each also makes two or three calls on the result.
 
 The cases that make an object and drop it (section 1, and 6.3) are level at the median. Their means are not: Py4J releases dropped objects in bursts, so its `ArrayList()` case has a median of 47 μs and a mean of 92 μs, where Gatun's are 46 and 47. Gatun sends a release with the next call.
+
+### A second machine
+
+The comparison of plain calls rests on what a Unix socket round trip and a TCP loopback round trip cost, which the operating system and the machine decide. An independent run on a machine with 2 vCPUs had Py4J level with Gatun, or up to 1.4 times ahead, on `list.size()` (3.1) and on `ArrayList()` created and dropped (1.1). The same call on that machine took up to three times as long in one state of the scheduler as in another, which is more than the difference between the bridges.
+
+So the table above does not show that a plain instance call or an object creation is faster through Gatun: they cost about the same. What the second machine reproduced is the rest: static calls (section 2), `is_instance_of` (section 8), the full `jvm.` path (section 9), collections as arguments (5.1 to 5.3) and bulk data.
 
 ### Calls in a loop
 
@@ -137,7 +146,9 @@ One call each, by the size of what it carries.
 | | 16 KB | 65.7 μs | 42.0 ms | 640x faster |
 | | 32 KB | 70.3 μs | 43.0 ms | 612x faster |
 
-Gatun's time grows slowly with the size, since the value travels through shared memory. Py4J's grows faster, and a value of 8 KB (a string) or 16 KB (a byte array) returned from Java takes about 40 ms. That figure is the same in both runs and does not grow with the size, which is what a delayed acknowledgement on the TCP connection looks like; this benchmark does not establish the cause.
+Gatun's time grows slowly with the size, since the value travels through shared memory. Py4J's grows faster, and a value of 8 KB (a string) or 16 KB (a byte array) returned from Java takes about 40 ms, the same in both runs and whatever the size.
+
+That 40 ms is Nagle's algorithm meeting a delayed acknowledgement, and not the cost of Py4J's protocol. Py4J's server never sets `TCP_NODELAY` on the sockets it accepts (Py4J issue 516; pull request 517, which sets it, is open). A large return value leaves the server as more than one write, and the last of them waits until the client acknowledges the ones before, which the client's kernel puts off for about 40 ms. With the option set on the accepted socket, stock Py4J 0.10.9.9 returned strings of 8 to 32 KB in 0.2 to 0.3 ms, measured on the second machine described below. Against that, Gatun is about 3 times faster on these rows, not 600 times. Both figures are true of something: a program on Py4J as released, PySpark included, waits the 40 ms; the protocol itself does not need it. `benchmark_comparison.py --py4j-nodelay` runs the comparison with the option set.
 
 The string argument cases create a `StringBuilder` and drop it. A `byte[]` costs Gatun more than a string of the same size in both directions: `bytes` is not among the values packed by hand, so those commands and responses go through the FlatBuffers library.
 

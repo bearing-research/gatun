@@ -7,6 +7,7 @@ Usage:
     uv run python benchmarks/benchmark_comparison.py           # Full benchmark
     uv run python benchmarks/benchmark_comparison.py --quick   # Quick mode (~30s)
     uv run python benchmarks/benchmark_comparison.py --gatun-only  # Skip Py4J
+    uv run python benchmarks/benchmark_comparison.py --py4j-nodelay  # Py4J with TCP_NODELAY
 
 Categories tested:
     0. Baseline - Python overhead measurement for calibration
@@ -53,6 +54,12 @@ THROUGHPUT_PASSES = 3  # Timed passes of each throughput loop, after one untimed
 
 # The same for both servers. A fixed heap keeps resizing out of the timings.
 JVM_FLAGS = ["-Xms512m", "-Xmx512m"]
+
+# Set by --py4j-nodelay: run Py4J's server with TCP_NODELAY on its connections
+PY4J_NODELAY = False
+NODELAY_GATEWAY_SOURCE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "java", "bench", "NoDelayGateway.java"
+)
 
 # Quick mode settings
 QUICK_WARMUP_SECONDS = 0.5
@@ -1753,9 +1760,29 @@ print("PY4J_PORT:" + str(port))
 java_home = os.environ.get("JAVA_HOME")
 java_cmd = os.path.join(java_home, "bin", "java") if java_home else "java"
 
+# Py4J's own server, or the same server with TCP_NODELAY on the connections it
+# accepts (--py4j-nodelay), which needs a class of ours beside Py4J's
+class_path = jar_path
+main_class = "py4j.GatewayServer"
+nodelay_source = os.environ.get("BENCH_PY4J_NODELAY_SOURCE")
+if nodelay_source:
+    import tempfile
+    classes = tempfile.mkdtemp(prefix="py4j-nodelay-")
+    javac_cmd = os.path.join(java_home, "bin", "javac") if java_home else "javac"
+    compiled = subprocess.run(
+        [javac_cmd, "-cp", jar_path, "-d", classes, nodelay_source],
+        capture_output=True, text=True,
+    )
+    if compiled.returncode != 0:
+        print(json.dumps({"error": "Could not compile NoDelayGateway: " + compiled.stderr}))
+        sys.exit(1)
+    class_path = jar_path + os.pathsep + classes
+    main_class = "bench.NoDelayGateway"
+print("PY4J_SERVER:" + main_class)
+
 # The heap settings Gatun's server runs with
 proc = subprocess.Popen(
-    [java_cmd] + JVM_FLAGS + ["-cp", jar_path, "py4j.GatewayServer", str(port)],
+    [java_cmd] + JVM_FLAGS + ["-cp", class_path, main_class, str(port)],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,  # Avoid pipe blocking
 )
 
@@ -1830,6 +1857,11 @@ def run_py4j_benchmarks() -> dict:
             "BENCH_BULK_SIZE": str(BULK_SIZE),
             "BENCH_THROUGHPUT_PASSES": str(THROUGHPUT_PASSES),
             "BENCH_JVM_FLAGS": json.dumps(JVM_FLAGS),
+            **(
+                {"BENCH_PY4J_NODELAY_SOURCE": NODELAY_GATEWAY_SOURCE}
+                if PY4J_NODELAY
+                else {}
+            ),
         },
         cwd=cwd,
         timeout=1800,  # 30 minutes for full benchmark suite with warmup
@@ -1837,6 +1869,7 @@ def run_py4j_benchmarks() -> dict:
 
     if result.returncode != 0:
         print("  Py4J benchmark subprocess failed:")
+        print(f"  stdout: {result.stdout[-500:]}")
         print(f"  stderr: {result.stderr[:500]}")
         return {}
 
@@ -1848,6 +1881,8 @@ def run_py4j_benchmarks() -> dict:
             print(f"  Py4J JAR: {results['py4j_jar']}")
         elif line.startswith("PY4J_PORT:"):
             results["py4j_port"] = line[10:]
+        elif line.startswith("PY4J_SERVER:"):
+            print(f"  Py4J server: {line[12:]}")
         elif line.startswith("BASELINE:"):
             try:
                 results["baseline"] = json.loads(line[9:])
@@ -1921,6 +1956,14 @@ def parse_args():
         help="Skip Py4J benchmarks (useful if Py4J not installed)",
     )
     parser.add_argument(
+        "--py4j-nodelay",
+        action="store_true",
+        help=(
+            "Run Py4J's server with TCP_NODELAY set on its connections, which it "
+            "does not do itself. Needs javac."
+        ),
+    )
+    parser.add_argument(
         "--json",
         metavar="FILE",
         help="Save results to JSON file",
@@ -1934,9 +1977,11 @@ def main():
         WARMUP_MIN_ITERATIONS, \
         BENCHMARK_ITERATIONS, \
         BULK_SIZE, \
-        NUM_TRIALS
+        NUM_TRIALS, \
+        PY4J_NODELAY
 
     args = parse_args()
+    PY4J_NODELAY = args.py4j_nodelay
 
     # Apply quick mode settings
     if args.quick:
@@ -1977,6 +2022,10 @@ def main():
     print(
         "  - Py4J tested with both auto_convert=True (PySpark) and auto_convert=False"
     )
+    if PY4J_NODELAY:
+        print(
+            "  - Py4J's server runs with TCP_NODELAY on its connections (--py4j-nodelay)"
+        )
     print("  - Baseline measurements included for computing net bridge cost")
     print("  - Multiple trials aggregated using median-of-medians for robustness")
 
@@ -2119,6 +2168,7 @@ def main():
                         "bulk_size": BULK_SIZE,
                         "trials": NUM_TRIALS,
                         "jvm_flags": JVM_FLAGS,
+                        "py4j_tcp_nodelay": PY4J_NODELAY,
                     },
                     "baseline": {"gatun": gatun_baseline, "py4j": py4j_baseline},
                     "latency": {

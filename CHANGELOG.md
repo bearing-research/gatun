@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `benchmarks/benchmark_comparison.py --py4j-nodelay` runs Py4J's server with `TCP_NODELAY` set on the connections it accepts
+
+### Fixed
+- README and `docs/benchmarks.md` said a plain instance call is 1.3 times faster through Gatun than through Py4J. Plain instance calls and object creation cost about the same: a second machine had Py4J level or ahead on them. The claims for static calls, `is_instance_of`, collections as arguments and bulk data stand
+- The same two documents gave Py4J's 40 ms for returning a value of 8 KB or more without its cause. It is Nagle's algorithm with a delayed acknowledgement: Py4J's server does not set `TCP_NODELAY`. They now say so, and give the comparison with the option set as well, where Gatun is about 3 times faster and not 640 times
+- The 0.3.0 notes said a single call through Gatun takes about twice as long as one through Py4J. That was measured before single calls were packed by hand, and stood beside the entry that says the opposite
+
 ## [0.3.0] - 2026-11-20
 
 ### Added
@@ -78,7 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `gatun.bridge.JavaException` and its subclasses are the client's exception classes, not a second set with the same names. `except gatun.bridge.JavaException` let through every Java exception that did not come from one of the adapter's own methods: a call through `bridge.jvm`, or a method of an object the bridge returned. `str()` of one raised by an adapter method is now the Java stack trace, as everywhere else, where it was the class and the message
 - README: the async client's handles are garbage collected like the sync client's; the static field example used a call that raises; `StaleArenaError` has no `view_epoch` attribute; the payload zone's halves belong to `send_arrow_buffers` / `get_arrow_data` only
 - `docs/bridge_adapter_spec.md` described `BridgeAdapter` as a protocol with optional parts and carried a copy of the contract tests that had drifted from `tests/test_bridge_contract.py`
-- The performance numbers in the README and `docs/benchmarks.md` dated from 0.1.0 and a different machine. They are measured again, on Linux, with the corrected scripts: a single call through Gatun takes about twice as long as one through Py4J, where the README said a third to a half as long; Gatun is ahead for collections as arguments, large return values and bulk data
+- The performance numbers in the README and `docs/benchmarks.md` dated from 0.1.0 and a different machine. They are measured again, on Linux, with the corrected scripts, and again after single calls were packed by hand (see Changed)
 - Benchmark scripts: the Py4J comparison timed Gatun on a cold JVM with a default heap against a warm Py4J JVM with a fixed one, resolved the class path on every Gatun call only, and filled the heap in the byte-array sweep; the other scripts timed their set-up with the case and warmed up for ten calls. `benchmark_comparison.py --json` wrote nothing
 - `client.cancel()` during a batch ends the batch. It used to cancel only the command that was running: with `stop_on_error=False` the rest of the batch still ran. The batch now raises `CancelledException`
 - An Arrow transfer attempted inside a callback made by the request's own thread raises `ReentrancyError` at once. With a callback timeout set it used to wait for the channel the waiting request held, and failed only when the callback timed out
