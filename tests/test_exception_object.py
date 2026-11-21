@@ -331,6 +331,26 @@ class TestRelease:
         gc.collect()
         assert live_objects(client) == before
 
+    def test_an_error_raised_by_get_needs_no_collector(self, client):
+        """As a single call's exception goes with the exception, a batch's goes
+        with the batch: raising the stored one gave it a traceback that refers
+        back to the batch, a cycle only the garbage collector broke."""
+        gc.collect()
+        before = live_objects(client)
+        gc.disable()
+        try:
+            with client.batch() as b:
+                failed = b.call_static("Thrower", "fail", "x", 1)
+            for _ in range(3):
+                try:
+                    failed.get()
+                except JavaException:
+                    pass
+            del b, failed
+            assert live_objects(client) == before
+        finally:
+            gc.enable()
+
     def test_a_cancelled_request_keeps_nothing(self, thrower_classes):
         import threading
 
