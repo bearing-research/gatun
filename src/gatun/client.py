@@ -446,9 +446,8 @@ _JAVA_EXCEPTION_MAP: dict[str, type[Exception]] = {
 def _raise_java_exception_impl(
     error_type: str, error_msg: str, java_exception: Any = None
 ) -> None:
-    """Raise the appropriate Python exception for a Java error.
-
-    This is the core implementation used by both sync and async clients.
+    """Raise the appropriate Python exception for a Java error, for both the
+    sync and the async client (see `_java_exception`).
 
     Args:
         error_type: The fully qualified Java exception class name
@@ -456,6 +455,17 @@ def _raise_java_exception_impl(
         java_exception: The thrown exception as a Java object, if the server
             sent one
     """
+    # Raised without a name for it here: a local variable would make a cycle
+    # with the traceback, and the Java object would then wait for the garbage
+    # collector instead of going with the exception
+    raise _java_exception(error_type, error_msg, java_exception)
+
+
+def _java_exception(
+    error_type: str, error_msg: str, java_exception: Any = None
+) -> Exception:
+    """The Python exception for a Java error, for a single call and for a
+    batch's failed result alike, so that the two cannot drift apart."""
     import re
 
     # Handle PayloadTooLargeException specially - parse sizes from message
@@ -468,26 +478,24 @@ def _raise_java_exception_impl(
         else:
             payload_size = 0
             max_size = 0
-        raise PayloadTooLargeError(payload_size, max_size, "Response")
+        return PayloadTooLargeError(payload_size, max_size, "Response")
 
     # Handle InterruptedException specially - extract request ID
     if error_type == "java.lang.InterruptedException":
         # Message format: "Request X was cancelled"
         match = re.search(r"Request (\d+) was cancelled", error_msg)
-        raise CancelledException(int(match.group(1)) if match else None)
+        return CancelledException(int(match.group(1)) if match else None)
 
     # Get the exception class, defaulting to JavaException
     exc_class = _JAVA_EXCEPTION_MAP.get(error_type, JavaException)
 
-    # Extract just the message (first line before stack trace)
+    # The first line of a thrown exception's text is "<class>: <message>", the
+    # class being error_type. Errors of the server's own ("Malformed command:
+    # ...") name no class, and keep their whole first line.
     message = error_msg.split("\n")[0] if error_msg else ""
-    if ": " in message:
-        message = message.split(": ", 1)[1]
+    message = message.removeprefix(error_type + ": ")
 
-    # Raised without a name for it here: a local variable would make a cycle
-    # with the traceback, and the Java object would then wait for the garbage
-    # collector instead of going with the exception
-    raise exc_class(error_type, message, error_msg, java_exception)
+    return exc_class(error_type, message, error_msg, java_exception)
 
 
 class SocketTimeoutError(Exception):
@@ -6009,7 +6017,11 @@ class BatchResult:
             ) from self._batch._error
         result = self._batch._results[self._index]
         if isinstance(result, Exception):
-            raise result
+            # A new exception each time, as a single call raises one. Raising
+            # the stored one would give it a traceback, whose frame refers to
+            # this result, the batch and so the stored exception again: a cycle
+            # that keeps the Java exception until the garbage collector runs.
+            raise _java_exception(*self._batch._errors[self._index])
         return result
 
     @property
@@ -6048,6 +6060,8 @@ class BatchContext:
         # would be freed before the batch runs.
         self._targets: list[JavaObject] = []
         self._results: list = []
+        # What each failed command's exception was made from, by its index
+        self._errors: dict[int, tuple[str, str, Any]] = {}
         self._executed = False
         # Set when the batch was sent and no results came back
         self._error: BaseException | None = None
@@ -6255,10 +6269,19 @@ class BatchContext:
                     else "java.lang.RuntimeException"
                 )
                 # Store exception object instead of raising
-                exc = self._make_exception(
-                    error_type, error_msg, sub_resp.ErrorObject()
+                java_exception = (
+                    JavaObject(self._client, sub_resp.ErrorObject())
+                    if sub_resp.ErrorObject()
+                    else None
                 )
-                self._results.append(exc)
+                self._errors[len(self._results)] = (
+                    error_type,
+                    error_msg,
+                    java_exception,
+                )
+                self._results.append(
+                    _java_exception(error_type, error_msg, java_exception)
+                )
             else:
                 value = self._client._unpack_value(
                     sub_resp.ReturnValType(), sub_resp.ReturnVal()
@@ -6330,39 +6353,3 @@ class BatchContext:
         builder.Finish(cmd)
 
         return bytes(builder.Output())
-
-    def _make_exception(
-        self, error_type: str, error_msg: str, error_object: int = 0
-    ) -> Exception:
-        """Create an exception object without raising it.
-
-        `error_object` is the ID of the thrown exception, or 0. A class with no
-        place for it drops the wrapper, which releases the object.
-        """
-        import re
-
-        java_exception = (
-            JavaObject(self._client, error_object) if error_object else None
-        )
-
-        # Handle special exception types
-        if error_type == "org.gatun.PayloadTooLargeException":
-            match = re.search(r"(\d+) bytes exceeds (\d+) byte", error_msg)
-            if match:
-                return PayloadTooLargeError(
-                    int(match.group(1)), int(match.group(2)), "Response"
-                )
-            return PayloadTooLargeError(0, 0, "Response")
-
-        if error_type == "java.lang.InterruptedException":
-            match = re.search(r"Request (\d+) was cancelled", error_msg)
-            return CancelledException(int(match.group(1)) if match else None)
-
-        # Get exception class
-        exc_class = _JAVA_EXCEPTION_MAP.get(error_type, JavaException)
-
-        # Extract message
-        lines = error_msg.split("\n")
-        message = lines[0] if lines else error_msg
-
-        return exc_class(error_type, message, error_msg, java_exception)

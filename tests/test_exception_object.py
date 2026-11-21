@@ -247,6 +247,17 @@ class TestEveryKindOfCall:
         assert thrown_by(second.get).java_exception.getMessage() == "second"
         assert thrown_by(third.get).java_exception.getMessage() == "third"
 
+    def test_batch_gives_the_same_exception_as_a_single_call(self, client):
+        alone = thrown_by(client.jvm.Thrower.fail, "boom", 7)
+        with client.batch() as b:
+            failed = b.call_static("Thrower", "fail", "boom", 7)
+        in_batch = thrown_by(failed.get)
+
+        assert type(in_batch) is type(alone)
+        assert in_batch.java_class == alone.java_class
+        assert in_batch.message == alone.message == "boom"
+        assert in_batch.stack_trace.splitlines()[0] == alone.stack_trace.splitlines()[0]
+
     def test_batch_that_stops(self, client):
         with client.batch(stop_on_error=True) as b:
             b.call_static("java.lang.Integer", "parseInt", "1")
@@ -319,6 +330,26 @@ class TestRelease:
         del b, failed
         gc.collect()
         assert live_objects(client) == before
+
+    def test_an_error_raised_by_get_needs_no_collector(self, client):
+        """As a single call's exception goes with the exception, a batch's goes
+        with the batch: raising the stored one gave it a traceback that refers
+        back to the batch, a cycle only the garbage collector broke."""
+        gc.collect()
+        before = live_objects(client)
+        gc.disable()
+        try:
+            with client.batch() as b:
+                failed = b.call_static("Thrower", "fail", "x", 1)
+            for _ in range(3):
+                try:
+                    failed.get()
+                except JavaException:
+                    pass
+            del b, failed
+            assert live_objects(client) == before
+        finally:
+            gc.enable()
 
     def test_a_cancelled_request_keeps_nothing(self, thrower_classes):
         import threading

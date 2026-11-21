@@ -4,6 +4,7 @@ import pytest
 
 from gatun import (
     JavaException,
+    JavaIllegalArgumentException,
     JavaIndexOutOfBoundsException,
     JavaNoSuchFieldException,
     JavaNumberFormatException,
@@ -11,6 +12,21 @@ from gatun import (
 )
 
 # Uses the shared `client` fixture from conftest.py
+
+
+class TestMessage:
+    def test_the_class_name_is_taken_off(self, client):
+        with pytest.raises(JavaNumberFormatException) as excinfo:
+            client.invoke_static_method("java.lang.Integer", "parseInt", "x")
+        assert excinfo.value.message == 'For input string: "x"'
+
+    def test_an_error_of_the_servers_own_keeps_its_message(self, client):
+        """Its text names no class, and only a class name in front is taken
+        off: "Malformed command: ..." lost its first two words."""
+        with pytest.raises(JavaIllegalArgumentException) as excinfo:
+            client._send_raw(b"\xff" * 64)
+        assert excinfo.value.message.startswith("Malformed command: ")
+        assert client.ping() is True
 
 
 class TestExceptionTypes:
