@@ -19,7 +19,7 @@ import time
 import weakref
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, Self, cast, overload
+from typing import TYPE_CHECKING, Any, Generic, Literal, Self, TypeVar, cast, overload
 
 import flatbuffers
 import pyarrow as pa
@@ -1287,8 +1287,10 @@ class JVMView:
 # Maximum size for LRU caches to prevent unbounded memory growth
 _CACHE_MAX_SIZE = 10000
 
+V = TypeVar("V")
 
-class _LRUCache[V]:
+
+class _LRUCache(Generic[V]):
     """Simple LRU cache with bounded size.
 
     Uses OrderedDict to maintain insertion order. When the cache is full,
