@@ -61,7 +61,10 @@ class TestThreads:
         finally:
             sys.setswitchinterval(interval)
 
-        assert errors == []
+        # With what each error came from: a socket timeout that came long
+        # before its 30 seconds (seen on macOS runners) says "timed out" if
+        # Python's poll() gave up, and names an errno if the system did
+        assert errors == [], [f"{e!r} from {e.__context__!r}" for e in errors]
 
     def test_threads_sending_arrow_tables(self, client):
         """Writing the payload zone and sending the request are one step."""

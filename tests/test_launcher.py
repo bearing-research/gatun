@@ -1021,12 +1021,30 @@ sys.exit(3)
         not waited for, not killed if it ignored that, its pipes left open."""
         monkeypatch.setattr(config, "startup_timeout", 0.5)
         monkeypatch.setattr(launcher, "STOP_GRACE_SECONDS", 0.2)
+        ready = socket_dir / "ready"
         stand_in_server(
             f"{IGNORE_SIGTERM}\n"
             "print('still starting', file=sys.stderr, flush=True)\n"
+            f"open({str(ready)!r}, 'w').close()\n"
             f"{NEVER_LISTEN}"
         )
         socket_path = str(socket_dir / "s.sock")
+        # The timeout is to fall on a server that has started: one that has not
+        # yet set SIGTERM aside dies of it, and one that has not yet printed
+        # has nothing to report. On a busy machine that took longer than 0.5s.
+        accepts_connections = launcher._accepts_connections
+
+        def once_ready(*args, **kwargs):
+            # The launcher also asks before it starts the server, whether
+            # another one is listening there
+            deadline = time.monotonic() + 30
+            while (
+                started_processes and not ready.exists() and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            return accepts_connections(*args, **kwargs)
+
+        monkeypatch.setattr(launcher, "_accepts_connections", once_ready)
 
         with pytest.raises(RuntimeError) as exc_info:
             launch_gateway(socket_path=socket_path)
