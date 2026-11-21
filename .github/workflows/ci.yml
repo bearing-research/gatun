@@ -90,10 +90,14 @@ jobs:
         run: uv pip install pyspark==${{ matrix.spark-version }}
 
       - name: Run the Spark tests
+        env:
+          GATUN_REQUIRE_SPARK: ${{ matrix.spark-version }}
         run: uv run --no-sync pytest -v --no-cov tests/test_spark_integration.py
 
       - name: Run the suite with the server on Spark's classpath
         run: |
           jars="$(uv run --no-sync python -c 'import pathlib, pyspark; print(pathlib.Path(pyspark.__file__).parent / "jars")')"
           ls "$jars" | grep -c .
+          # The point of this step: the server runs on Spark's Arrow, not its own
+          uv run --no-sync python -c 'import sys; from gatun import launcher; assert launcher._server_jar([sys.argv[1]]) == launcher.THIN_JAR_PATH' "$jars/*"
           GATUN_TEST_CLASSPATH="$jars/*" uv run --no-sync pytest -v --no-cov

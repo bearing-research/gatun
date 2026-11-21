@@ -133,6 +133,7 @@ def connect(
     socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
     callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
     allow_all: bool | None = None,
+    server_jar: str | None = None,
 ):
     """Convenience: Launches server and returns connected client.
 
@@ -160,6 +161,10 @@ def connect(
                    objects included. `System.exit`, `System.load`, `System.loadLibrary`
                    and `Class.newInstance` stay refused. False keeps the list whatever
                    GATUN_ALLOW_ALL or pyproject.toml say; None leaves it to them.
+        server_jar: "auto" (the default), "thin" or "full": which server JAR to start.
+                    The thin one has no Arrow of its own and runs on the classpath's;
+                    "auto" takes it when the classpath brings an Arrow the server can
+                    run on. None leaves it to GATUN_SERVER_JAR or pyproject.toml.
 
     Configuration can be set in pyproject.toml:
         [tool.gatun]
@@ -194,6 +199,7 @@ def connect(
         allowed_classes=allowed_classes,
         allowed_prefixes=allowed_prefixes,
         allow_all=allow_all,
+        server_jar=server_jar,
     )
 
     client = GatunClient(
@@ -223,6 +229,7 @@ async def aconnect(
     socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
     callback_timeout: float | None = DEFAULT_CALLBACK_TIMEOUT,
     allow_all: bool | None = None,
+    server_jar: str | None = None,
 ) -> AsyncGatunClient:
     """Async convenience: Launches server and returns connected async client.
 
@@ -250,6 +257,10 @@ async def aconnect(
                    objects included. `System.exit`, `System.load`, `System.loadLibrary`
                    and `Class.newInstance` stay refused. False keeps the list whatever
                    GATUN_ALLOW_ALL or pyproject.toml say; None leaves it to them.
+        server_jar: "auto" (the default), "thin" or "full": which server JAR to start.
+                    The thin one has no Arrow of its own and runs on the classpath's;
+                    "auto" takes it when the classpath brings an Arrow the server can
+                    run on. None leaves it to GATUN_SERVER_JAR or pyproject.toml.
 
     Example:
         async with await aconnect() as client:
@@ -281,6 +292,7 @@ async def aconnect(
         allowed_classes=allowed_classes,
         allowed_prefixes=allowed_prefixes,
         allow_all=allow_all,
+        server_jar=server_jar,
     )
 
     client = AsyncGatunClient(

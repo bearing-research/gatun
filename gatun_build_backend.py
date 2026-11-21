@@ -228,7 +228,9 @@ def _build_java():
             dest = JAR_DEST_DIR / name
             if dest.exists():
                 dest.unlink()  # Clean replace
-            shutil.copy2(source, dest)
+            # Not copy2: a JAR whose task was up to date keeps its old time, and
+            # the copy would look older than the build script for ever after
+            shutil.copy(source, dest)
             logger.info(f"--- [Gatun Backend] Updated JAR at {dest} ---")
 
     else:

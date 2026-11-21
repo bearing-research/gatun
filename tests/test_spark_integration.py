@@ -1,12 +1,14 @@
 """Integration tests for Spark with Gatun.
 
 These tests verify that Gatun can load and use Apache Spark classes, on
-whatever Spark 4 they find. Tests are skipped if there is none.
+whatever Spark 4 they find. Tests are skipped if there is none, unless
+GATUN_REQUIRE_SPARK names the version that has to be there (CI does).
 """
 
 import glob
 import importlib.util
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -16,9 +18,20 @@ from gatun import JavaNoSuchMethodException, connect
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
+def spark_version(jars: Path) -> str | None:
+    """The version of the Spark in a `jars` directory, from spark-core's name."""
+    for jar in sorted(jars.glob("spark-core_*.jar")):
+        found = re.fullmatch(r"spark-core_[\d.]+-(\d+(?:\.\d+)*).*\.jar", jar.name)
+        if found:
+            return found[1]
+    return None
+
+
 def find_spark_jars() -> Path | None:
     """Spark's `jars` directory: of $SPARK_HOME, of a distribution extracted
-    in the repository root, or of an installed pyspark, in that order."""
+    in the repository root, or of an installed pyspark, in that order. The
+    first that is a Spark 4: an older one needs another Scala, another Arrow
+    and another JDK than these tests are written for."""
     candidates = []
     if os.environ.get("SPARK_HOME"):
         candidates.append(Path(os.environ["SPARK_HOME"]) / "jars")
@@ -27,12 +40,22 @@ def find_spark_jars() -> Path | None:
     if pyspark is not None and pyspark.origin:
         candidates.append(Path(pyspark.origin).parent / "jars")
     for jars in candidates:
-        if any(jars.glob("spark-core_*.jar")):
+        version = spark_version(jars)
+        if version is not None and int(version.split(".")[0]) >= 4:
             return jars
     return None
 
 
 SPARK_JARS = find_spark_jars()
+
+# Where the job exists to test one Spark, finding none, or another, is a
+# failure: every test here would be skipped and the job would pass
+_required = os.environ.get("GATUN_REQUIRE_SPARK")
+if _required and (SPARK_JARS is None or spark_version(SPARK_JARS) != _required):
+    raise RuntimeError(
+        f"GATUN_REQUIRE_SPARK={_required}, but the Spark found is "
+        f"{spark_version(SPARK_JARS) if SPARK_JARS else None} ({SPARK_JARS})"
+    )
 
 # Skip all tests in this module if Spark is not found
 pytestmark = pytest.mark.skipif(
