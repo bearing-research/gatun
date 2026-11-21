@@ -672,6 +672,33 @@ class TestTheApplicationsSlf4j:
         api = make_jar(tmp_path / "slf4j-api.jar", [SLF4J_API])
         assert launcher._application_slf4j([uber, api]) is None
 
+    def test_a_manifest_is_read_where_the_jvm_reads_it(self, tmp_path):
+        """The JARs a manifest names come right after the JAR that names
+        them, ahead of the next entry."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        old = make_jar(lib / "slf4j-api-1.7.36.jar", [SLF4J_API])
+        pathing = make_jar(
+            tmp_path / "pathing.jar", [], class_path=["lib/slf4j-api-1.7.36.jar"]
+        )
+        newer = make_jar(tmp_path / "slf4j-api-2.0.9.jar", [SLF4J_API])
+        assert launcher._application_slf4j([pathing, newer]) == old
+        assert launcher._application_slf4j([pathing]) == old
+
+    def test_not_with_what_its_manifest_brings(self, tmp_path, caplog):
+        """The JARs a moved JAR's manifest names move with it."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        make_jar(lib / "arrow-vector-12.0.1.jar", ARROW_AND_FRIENDS[:1])
+        app = make_jar(
+            tmp_path / "app.jar",
+            [SLF4J_API],
+            class_path=["lib/arrow-vector-12.0.1.jar"],
+        )
+        with caplog.at_level("WARNING", logger="gatun.launcher"):
+            assert launcher._application_slf4j([app]) is None
+        assert "stays in front" in caplog.text
+
     def test_it_goes_in_front_of_the_fat_jar(
         self, tmp_path, stand_in_server, started_processes
     ):

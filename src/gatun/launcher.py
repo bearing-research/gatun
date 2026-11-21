@@ -287,34 +287,61 @@ def _host_arrow(classpath: list[str]) -> tuple[set[bytes], str | None]:
 
 def _application_slf4j(classpath: list[str]) -> str | None:
     """The classpath entry whose slf4j API the application would use without
-    the server in front of it: the first that has one. None if there is none,
-    or if that entry also has a library the server must keep its own of.
+    the server in front of it: the first that has one, in the JVM's order. None
+    if there is none, or if that entry (with the JARs its manifest names, which
+    the JVM reads right after it) also has a library the server must keep its
+    own of.
 
     The fat JAR's slf4j-api (2.x) comes first otherwise, and slf4j 2.x ignores
     the bindings of 1.7 (slf4j-reload4j, slf4j-simple 1.7): the application's
     logging went nowhere. Arrow calls only what slf4j 1.7 has too, so with the
     application's API in front, Arrow logs where the application does.
     """
-    for entry in _classpath_entries(classpath):
-        directory: bytes | None = None
-        if not os.path.isdir(entry):
-            try:
-                directory = _central_directory(entry)
-            except (OSError, ValueError, OverflowError, struct.error):
-                continue
-        if _entry_has(entry, directory, _SLF4J_API):
-            if any(_entry_has(entry, directory, n) for n in _SERVER_OWN_CLASSES):
-                return None
-            return entry
+    for entry in _in_jvm_order(_classpath_entries(classpath), set()):
+        if not _entry_has(entry, _SLF4J_API):
+            continue
+        with_it = [entry, *_in_jvm_order(_manifest_entries(entry), {entry})]
+        if any(_entry_has(e, name) for e in with_it for name in _SERVER_OWN_CLASSES):
+            logger.warning(
+                "The classpath's slf4j API is in %s, which also has classes the "
+                "server keeps its own of (Arrow, FlatBuffers or the server), so "
+                "the server's slf4j 2.x stays in front of it; an slf4j 1.7 "
+                "binding there is ignored",
+                entry,
+            )
+            return None
+        return entry
     return None
 
 
-def _entry_has(entry: str, directory: bytes | None, name: bytes) -> bool:
-    """Whether a classpath entry has `name`: a JAR by its central directory,
-    a folder of classes when `directory` is None."""
-    if directory is None:
+def _manifest_entries(entry: str) -> list[str]:
+    return [] if os.path.isdir(entry) else _manifest_class_path(entry)
+
+
+def _in_jvm_order(entries: list[str], seen: set[str]) -> list[str]:
+    """The entries with the JARs each one's manifest names right after it, as
+    the JVM searches them. Each entry once."""
+    ordered: list[str] = []
+    stack = list(reversed(entries))
+    while stack and len(seen) < 4096:
+        entry = stack.pop()
+        if entry in seen:
+            continue
+        seen.add(entry)
+        ordered.append(entry)
+        stack.extend(reversed(_manifest_entries(entry)))
+    return ordered
+
+
+def _entry_has(entry: str, name: bytes) -> bool:
+    """Whether a classpath entry (a JAR or a folder of classes) has `name`. A
+    JAR that cannot be read has nothing: the JVM skips it, too."""
+    if os.path.isdir(entry):
         return os.path.exists(os.path.join(entry, os.fsdecode(name)))
-    return _jar_has(directory, name)
+    try:
+        return _jar_has(_central_directory(entry), name)
+    except (OSError, ValueError, OverflowError, struct.error):
+        return False
 
 
 def _arrow_version(entry: str) -> tuple[int, int] | None:
@@ -340,7 +367,8 @@ def _arrow_version(entry: str) -> tuple[int, int] | None:
 def _server_jar(classpath: list[str] | None, choice: str = "auto") -> Path:
     """The JAR to start the server from.
 
-    The fat JAR has Arrow in it (and Arrow's Netty and Jackson, both relocated).
+    The fat JAR has Arrow in it (and Arrow's Netty, Jackson and commons-codec,
+    relocated).
     In front of a classpath with an Arrow of its own it would shadow that Arrow
     class by class, and code on the classpath built for another version breaks:
     Spark 4.3 ships Arrow 19. Relocating the server's Arrow is no way out,
