@@ -1123,7 +1123,7 @@ The string, list and nesting limits apply to what Python sends: arguments, value
 | `datetime.datetime`, `date`, `time` | `java.sql.Timestamp`, `Date`, `Time` (as arguments; a naive datetime is local time) |
 | `None` | `null` |
 | `JavaObject` | Object reference (including Object arrays) |
-| numpy scalars and other `numbers.Integral` / `numbers.Real` values | as `int` / `float` |
+| numpy scalars and other `numbers.Integral` / `numbers.Real` values | as `int` / `float`; `numpy.bool_` as `bool` |
 
 ### Big Numbers
 
@@ -1143,7 +1143,7 @@ BigDecimal("1.50").add(Decimal("0.25"))    # Decimal('1.75')
 - An `int` that fits in 64 bits travels as an `int` or `long`, as before. Where the parameter is a `BigInteger` or `BigDecimal` it is converted, so `big.add(5)` works like `big.add(2**70)`. A `float` is never taken for a `BigDecimal`: pass a `Decimal`.
 - `Decimal("NaN")` and the infinities raise `ValueError`: `BigDecimal` has neither. `Decimal("-0")` arrives as `0`.
 - To get the Java object instead of the value, construct it (`BigDecimal("1.50")` is a `JavaObject`) or ask for it: `client.invoke_method(dec, "add", x, return_object_ref=True)`. `invoke_static_method`, `get_field`, `get_static_field` and a batch's `call`, `call_static` and `get_field` take the same argument. It works for every value that is otherwise converted, a `String` or a `List` included.
-- numpy is not needed and not imported. Its scalars are sent as what they say they are: `numpy.int64(5)` as `5`, `numpy.float32(1.5)` as `1.5`. `numpy.bool_` says nothing of the kind; pass `bool(x)`.
+- numpy is not needed and not imported. Its scalars are sent as what they say they are: `numpy.int64(5)` as `5`, `numpy.float32(1.5)` as `1.5`. `numpy.bool_` registers with neither number class and is recognized by its dtype: it is sent as a `bool`. Arrays are not values, a 0-d one included.
 
 ### Converters for Your Own Types
 

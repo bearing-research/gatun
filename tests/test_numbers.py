@@ -539,6 +539,41 @@ class TestNumbersOfOtherLibraries:
         }
         assert numbers.echo(list(np.arange(4))) == [0, 1, 2, 3]
 
+    def test_numpy_bool(self, numbers):
+        """numpy's bool registers with no number class, so it says what it is
+        through its dtype."""
+        assert numbers.describe(np.bool_(True)) == "java.lang.Boolean true"
+        assert numbers.echo(np.bool_(False)) is False
+        assert numbers.echo([np.bool_(True), np.bool_(False)]) == [True, False]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            np.array([True, False]),
+            np.array(True),
+            np.ma.array(True, mask=True),
+        ],
+        ids=["array", "0-d array", "masked"],
+    )
+    def test_an_array_of_bools_is_still_refused(self, numbers, value):
+        """Only the scalar: a masked value must not arrive as its data, and an
+        array of several has no one value."""
+        with pytest.raises(TypeError, match="Unsupported argument type"):
+            numbers.describe(value)
+
+    def test_a_class_handle_asks_java_nothing(self, client):
+        """A handle's attribute lookup asks Java; encoding an argument must not."""
+        ArrayList = client.jvm.java.util.ArrayList
+        asked = []
+        reflect = client._reflect_cached
+        client._reflect_cached = lambda *a, **k: asked.append(a) or reflect(*a, **k)
+        try:
+            with pytest.raises(TypeError, match="Unsupported argument type"):
+                client.jvm.java.lang.String.valueOf(ArrayList)
+        finally:
+            del client._reflect_cached
+        assert not [a for a in asked if "dtype" in str(a)]
+
     def test_a_fraction_is_a_real_number(self, numbers):
         assert numbers.which(fractions.Fraction(1, 2)) == "double"
         assert numbers.echo(fractions.Fraction(1, 4)) == 0.25
@@ -548,8 +583,9 @@ class TestNumbersOfOtherLibraries:
         with client.batch() as b:
             b.call(items, "add", np.int64(7))
             b.call(items, "add", np.float32(0.5))
+            b.call(items, "add", np.bool_(True))
         items.add(np.int16(9))
-        assert list(items) == [7, 0.5, 9]
+        assert list(items) == [7, 0.5, True, 9]
 
     def test_a_complex_number_is_still_refused(self, numbers):
         with pytest.raises(TypeError, match="Unsupported argument type"):
@@ -767,6 +803,7 @@ class TestAsyncClient:
         assert await invoke("Numbers", "which", 2**70) == "BigInteger"
         assert await invoke("Numbers", "which", Decimal("1.5")) == "BigDecimal"
         assert await invoke("Numbers", "which", np.int64(5)) == "long"
+        assert await invoke("Numbers", "echo", np.bool_(True)) is True
         result = await invoke("Numbers", "decimal", "1.50")
         assert result.as_tuple() == Decimal("1.50").as_tuple()
         assert await invoke("Numbers", "several") == [2**70, Decimal("1.50"), 7]
