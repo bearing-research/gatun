@@ -456,6 +456,17 @@ def _raise_java_exception_impl(
         java_exception: The thrown exception as a Java object, if the server
             sent one
     """
+    # Raised without a name for it here: a local variable would make a cycle
+    # with the traceback, and the Java object would then wait for the garbage
+    # collector instead of going with the exception
+    raise _java_exception(error_type, error_msg, java_exception)
+
+
+def _java_exception(
+    error_type: str, error_msg: str, java_exception: Any = None
+) -> Exception:
+    """The Python exception for a Java error, for a single call and for a
+    batch's failed result alike, so that the two cannot drift apart."""
     import re
 
     # Handle PayloadTooLargeException specially - parse sizes from message
@@ -468,13 +479,13 @@ def _raise_java_exception_impl(
         else:
             payload_size = 0
             max_size = 0
-        raise PayloadTooLargeError(payload_size, max_size, "Response")
+        return PayloadTooLargeError(payload_size, max_size, "Response")
 
     # Handle InterruptedException specially - extract request ID
     if error_type == "java.lang.InterruptedException":
         # Message format: "Request X was cancelled"
         match = re.search(r"Request (\d+) was cancelled", error_msg)
-        raise CancelledException(int(match.group(1)) if match else None)
+        return CancelledException(int(match.group(1)) if match else None)
 
     # Get the exception class, defaulting to JavaException
     exc_class = _JAVA_EXCEPTION_MAP.get(error_type, JavaException)
@@ -484,10 +495,7 @@ def _raise_java_exception_impl(
     if ": " in message:
         message = message.split(": ", 1)[1]
 
-    # Raised without a name for it here: a local variable would make a cycle
-    # with the traceback, and the Java object would then wait for the garbage
-    # collector instead of going with the exception
-    raise exc_class(error_type, message, error_msg, java_exception)
+    return exc_class(error_type, message, error_msg, java_exception)
 
 
 class SocketTimeoutError(Exception):
@@ -6339,30 +6347,7 @@ class BatchContext:
         `error_object` is the ID of the thrown exception, or 0. A class with no
         place for it drops the wrapper, which releases the object.
         """
-        import re
-
         java_exception = (
             JavaObject(self._client, error_object) if error_object else None
         )
-
-        # Handle special exception types
-        if error_type == "org.gatun.PayloadTooLargeException":
-            match = re.search(r"(\d+) bytes exceeds (\d+) byte", error_msg)
-            if match:
-                return PayloadTooLargeError(
-                    int(match.group(1)), int(match.group(2)), "Response"
-                )
-            return PayloadTooLargeError(0, 0, "Response")
-
-        if error_type == "java.lang.InterruptedException":
-            match = re.search(r"Request (\d+) was cancelled", error_msg)
-            return CancelledException(int(match.group(1)) if match else None)
-
-        # Get exception class
-        exc_class = _JAVA_EXCEPTION_MAP.get(error_type, JavaException)
-
-        # Extract message
-        lines = error_msg.split("\n")
-        message = lines[0] if lines else error_msg
-
-        return exc_class(error_type, message, error_msg, java_exception)
+        return _java_exception(error_type, error_msg, java_exception)
