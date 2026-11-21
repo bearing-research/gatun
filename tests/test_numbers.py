@@ -16,6 +16,7 @@ import pytest
 
 import gatun
 from gatun import (
+    JavaException,
     JavaNoSuchMethodException,
     JavaNumberFormatException,
     JavaObject,
@@ -435,6 +436,24 @@ class TestOverloads:
         assert numbers.onlyBigDecimal(2**70) == f"{2**70} scale 0"
         dec = client.create_object("java.math.BigDecimal", "1.5")
         assert dec.add(1) == Decimal("2.5")
+
+    def test_compare_to(self, client):
+        """compareTo(BigDecimal) has a twin that takes Object and casts, which
+        an int must not be given to."""
+        dec = client.create_object("java.math.BigDecimal", "1.5")
+        assert dec.compareTo(Decimal("1.5")) == 0
+        assert dec.compareTo(1) == 1
+        assert dec.compareTo(2**70) == -1
+        big = client.create_object("java.math.BigInteger", "10")
+        assert big.compareTo(5) == 1
+        assert big.compareTo(2**70) == -1
+
+    def test_the_twin_is_still_called_when_nothing_else_fits(self, client):
+        dec = client.create_object("java.math.BigDecimal", "1.5")
+        with pytest.raises(JavaException, match="ClassCastException"):
+            dec.compareTo("text")
+        assert dec.equals(Decimal("1.5")) is True
+        assert dec.equals(1) is False
 
     def test_a_float_is_not_a_decimal(self, numbers):
         """A double has no one decimal it stands for, so none is picked."""

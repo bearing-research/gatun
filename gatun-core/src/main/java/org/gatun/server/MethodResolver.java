@@ -89,6 +89,12 @@ public final class MethodResolver {
     // and methods with fewer fixed parameters
     java.lang.reflect.Method bestMatch = null;
     int bestScore = Integer.MIN_VALUE;
+    // A bridge method takes the erased types and casts them: compareTo(Object) beside
+    // compareTo(BigDecimal). Java never calls one by choice, and its Object parameter outscores
+    // every conversion the real method would need (a Python int for the BigDecimal), so it is
+    // kept apart and used only when nothing else matches. Its cast then says what was wrong.
+    java.lang.reflect.Method bridgeMatch = null;
+    int bridgeScore = Integer.MIN_VALUE;
 
     for (java.lang.reflect.Method m : ReflectionCache.getCachedMethods(clazz)) {
       if (!m.getName().equals(name)) continue;
@@ -112,7 +118,12 @@ public final class MethodResolver {
         if (match) {
           // Score: base 1000 for non-varargs, plus specificity bonus
           int score = 1000 + specificity;
-          if (isBetter(score, bestScore, paramTypes, bestMatch)) {
+          if (m.isBridge()) {
+            if (isBetter(score, bridgeScore, paramTypes, bridgeMatch)) {
+              bridgeMatch = m;
+              bridgeScore = score;
+            }
+          } else if (isBetter(score, bestScore, paramTypes, bestMatch)) {
             bestMatch = m;
             bestScore = score;
           }
@@ -133,6 +144,10 @@ public final class MethodResolver {
       }
     }
 
+    if (bestMatch == null) {
+      bestMatch = bridgeMatch;
+      bestScore = bridgeScore;
+    }
     if (bestMatch != null) {
       // Emit trace logging and JFR event for method resolution
       if (StructuredLogger.isTraceEnabled()) {
