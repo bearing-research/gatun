@@ -31,9 +31,12 @@ from gatun import (
 )
 
 CHANNELS_JAVA = """
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 public class Channels {
+    private static final AtomicInteger STARTED = new AtomicInteger();
+
     private static final ThreadLocal<String> LOCAL = new ThreadLocal<>();
 
     public static void set(String value) { LOCAL.set(value); }
@@ -43,9 +46,13 @@ public class Channels {
     public static String threadName() { return Thread.currentThread().getName(); }
 
     public static String sleep(long millis) throws InterruptedException {
+        STARTED.incrementAndGet();
         Thread.sleep(millis);
         return "slept";
     }
+
+    /** How many calls of sleep have begun; it only grows, whatever ends. */
+    public static int sleepsStarted() { return STARTED.get(); }
 
     /** Live threads of the server whose name starts with a prefix. */
     public static int threads(String prefix) {
@@ -1066,10 +1073,17 @@ class TestCancel:
             except BaseException as e:  # noqa: BLE001
                 outcomes[n] = e
 
+        before = client.jvm.Channels.sleepsStarted()
         threads = [threading.Thread(target=work, args=(n,)) for n in range(count)]
         for thread in threads:
             thread.start()
-        time.sleep(0.5)
+        # Each thread's first call opens a channel of its own, which can take
+        # longer than any fixed pause on a loaded machine: wait until every
+        # call is asleep in Java, so that a cancel finds it running
+        deadline = time.monotonic() + 30
+        while client.jvm.Channels.sleepsStarted() < before + count:
+            assert time.monotonic() < deadline, outcomes
+            time.sleep(0.01)
         return threads, outcomes
 
     def test_cancel_interrupts_every_request_in_flight(self, client):
