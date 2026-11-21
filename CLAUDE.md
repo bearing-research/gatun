@@ -932,10 +932,11 @@ Nothing in this repo or in stock PySpark switches PySpark over to Gatun; there i
 Gatun uses specificity scoring to resolve overloaded Java methods:
 1. Exact type matches get highest priority
 2. Compatible types (e.g., `String` matching `CharSequence`) get medium priority
-3. `Object` parameters get lowest priority, just below a supertype of the argument's wrapper: a Python `int`, `float` or `bool` matches a `Number`, `Comparable` or `Serializable` parameter as Java's boxing would, after every match that needs no boxing
+3. `Object` parameters get lowest priority
 4. Non-varargs methods are preferred over varargs
 5. A Python `int` matches a `BigInteger` or `BigDecimal` parameter below all of the above
-6. A bridge method (the compiler's `compareTo(Object)` beside `compareTo(BigDecimal)`) is called only when nothing else matches: its `Object` parameter would outscore every conversion the real method needs
+6. A Python `int`, `float` or `bool` matches a parameter typed as a supertype of its wrapper (`Number`, `Comparable`, `Serializable`), as Java's boxing does, but a method that needs this for an argument is chosen only when no method matches without it (`MethodResolver.BoxedTier`): scores add up over the arguments, and otherwise such a match could take a call from the method it resolved to before. Among those methods a tie that no parameter type breaks (`g(Comparable)` beside `g(Serializable)`) is refused as ambiguous
+7. A bridge method (the compiler's `compareTo(Object)` beside `compareTo(BigDecimal)`) is called only when nothing else matches: its `Object` parameter would outscore every conversion the real method needs
 
 Note: For methods with `double` parameters (like `Math.pow`), pass Python floats:
 ```python

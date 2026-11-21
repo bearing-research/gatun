@@ -88,6 +88,15 @@ public class Supertypes {
   public static String which(Number n) { return "Number"; }
   public static String which(Object o) { return "Object"; }
 
+  public static String pair(int a, Object b) { return "int, Object"; }
+  public static String pair(Number a, String b) { return "Number, String"; }
+
+  public static String either(Comparable<?> c) { return "Comparable"; }
+  public static String either(Serializable s) { return "Serializable"; }
+
+  public static String big(java.math.BigDecimal d) { return "BigDecimal"; }
+  public static String big(Number n) { return "Number"; }
+
   public static String closer(long x) { return "long"; }
   public static String closer(Number n) { return "Number"; }
 }
@@ -137,8 +146,25 @@ class TestBoxingToASupertype:
             result = b.call_static("Supertypes", "number", 5)
         assert result.get() == "Integer:5"
 
-    def test_the_box_is_preferred_to_object(self, supertypes):
-        assert supertypes.jvm.Supertypes.which(5) == "Number"
+    def test_a_method_that_matched_before_is_still_chosen(self, supertypes):
+        """Such matches are used only where nothing else matches, so no call
+        that resolved before resolves differently. Java would choose
+        `which(Number)` here; the call went to `which(Object)` and still does."""
+        Supertypes = supertypes.jvm.Supertypes
+        assert Supertypes.which(5) == "Object"
+        # Scores add up over the arguments: the boxed match must not win
+        # through the other one
+        assert Supertypes.pair(5, "x") == "int, Object"
+        # A conversion of Python's own is not displaced either
+        assert Supertypes.big(5) == "BigDecimal"
+
+    def test_unrelated_supertypes_are_ambiguous(self, supertypes):
+        """Java calls this ambiguous; a guess would be whichever method
+        reflection lists first."""
+        with pytest.raises(JavaIllegalArgumentException, match="Ambiguous call"):
+            supertypes.jvm.Supertypes.either(5)
+        hinted = TypeHint(5, "java.lang.Comparable")
+        assert supertypes.jvm.Supertypes.either(hinted) == "Comparable"
 
     def test_a_primitive_parameter_is_preferred_to_the_box(self, supertypes):
         """Java tries widening before boxing: `closer(long)` is chosen for an int."""

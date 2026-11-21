@@ -95,6 +95,7 @@ public final class MethodResolver {
     // kept apart and used only when nothing else matches. Its cast then says what was wrong.
     java.lang.reflect.Method bridgeMatch = null;
     int bridgeScore = Integer.MIN_VALUE;
+    BoxedTier<java.lang.reflect.Method> boxed = new BoxedTier<>();
 
     for (java.lang.reflect.Method m : ReflectionCache.getCachedMethods(clazz)) {
       if (!m.getName().equals(name)) continue;
@@ -123,6 +124,8 @@ public final class MethodResolver {
               bridgeMatch = m;
               bridgeScore = score;
             }
+          } else if (needsBoxingToSupertype(paramTypes, argTypes, false)) {
+            boxed.add(m, score);
           } else if (isBetter(score, bestScore, paramTypes, bestMatch)) {
             bestMatch = m;
             bestScore = score;
@@ -136,7 +139,9 @@ public final class MethodResolver {
           // Score varargs with specificity (but lower base than non-varargs)
           int fixedCount = paramTypes.length - 1;
           int score = getVarargsSpecificity(paramTypes, argTypes, fixedCount);
-          if (isBetter(score, bestScore, paramTypes, bestMatch)) {
+          if (needsBoxingToSupertype(paramTypes, argTypes, true)) {
+            boxed.add(m, score);
+          } else if (isBetter(score, bestScore, paramTypes, bestMatch)) {
             bestMatch = m;
             bestScore = score;
           }
@@ -144,6 +149,10 @@ public final class MethodResolver {
       }
     }
 
+    if (bestMatch == null) {
+      bestMatch = boxed.choose(name, argTypes);
+      bestScore = boxed.score();
+    }
     if (bestMatch == null) {
       bestMatch = bridgeMatch;
       bestScore = bridgeScore;
@@ -180,9 +189,13 @@ public final class MethodResolver {
   }
 
   /** Format method signature for logging. */
-  private static String formatMethod(java.lang.reflect.Method m) {
+  private static String formatMethod(java.lang.reflect.Executable m) {
     StringBuilder sb = new StringBuilder();
-    sb.append(m.getName()).append("(");
+    String name =
+        m instanceof java.lang.reflect.Constructor<?>
+            ? m.getDeclaringClass().getSimpleName()
+            : m.getName();
+    sb.append(name).append("(");
     Class<?>[] params = m.getParameterTypes();
     for (int i = 0; i < params.length; i++) {
       if (i > 0) sb.append(",");
@@ -258,6 +271,7 @@ public final class MethodResolver {
     // Search for compatible constructor with specificity scoring
     java.lang.reflect.Constructor<?> bestMatch = null;
     int bestScore = Integer.MIN_VALUE;
+    BoxedTier<java.lang.reflect.Constructor<?>> boxed = new BoxedTier<>();
 
     for (java.lang.reflect.Constructor<?> c : ReflectionCache.getCachedConstructors(clazz)) {
       Class<?>[] paramTypes = c.getParameterTypes();
@@ -267,7 +281,9 @@ public final class MethodResolver {
         if (isVarargsCompatible(paramTypes, argTypes)) {
           int fixedCount = paramTypes.length - 1;
           int score = getVarargsSpecificity(paramTypes, argTypes, fixedCount);
-          if (isBetter(score, bestScore, paramTypes, bestMatch)) {
+          if (needsBoxingToSupertype(paramTypes, argTypes, true)) {
+            boxed.add(c, score);
+          } else if (isBetter(score, bestScore, paramTypes, bestMatch)) {
             bestMatch = c;
             bestScore = score;
           }
@@ -291,11 +307,16 @@ public final class MethodResolver {
       }
       if (match) {
         int score = 1000 + specificity;
-        if (isBetter(score, bestScore, paramTypes, bestMatch)) {
+        if (needsBoxingToSupertype(paramTypes, argTypes, false)) {
+          boxed.add(c, score);
+        } else if (isBetter(score, bestScore, paramTypes, bestMatch)) {
           bestMatch = c;
           bestScore = score;
         }
       }
+    }
+    if (bestMatch == null) {
+      bestMatch = boxed.choose(clazz.getSimpleName(), argTypes);
     }
 
     if (bestMatch != null) {
@@ -587,6 +608,7 @@ public final class MethodResolver {
    *   <li>Primitive widening (byte -> short -> int -> long -> float -> double)
    *   <li>Reference widening (subclass -> superclass/interface)
    *   <li>Object accepts anything (except null to primitive)
+   *   <li>Boxing and then reference widening (int -> Number), see {@link #isBoxedToSupertype}
    * </ol>
    *
    * <p>Note: null (represented as Object.class with null value) cannot be assigned to primitives.
@@ -652,14 +674,108 @@ public final class MethodResolver {
    * Boxing followed by widening reference conversion (JLS 5.3): an {@code int} for a {@code
    * Number}, {@code Comparable} or {@code Serializable} parameter, as an {@code Integer}. Python
    * numbers and booleans arrive with primitive types, so without this they matched no supertype of
-   * their wrapper but {@code Object}.
+   * their wrapper but {@code Object}. {@code Object} and the wrapper itself have rules of their own
+   * and are not included.
+   *
+   * <p>A method that needs this for an argument is chosen only when no method matches without it
+   * ({@link BoxedTier}): scores are summed over the arguments, so otherwise a match found this way
+   * could outscore, through another argument, the method the call resolved to before.
    */
-  private static boolean isBoxedToSupertype(Class<?> paramType, Class<?> argType) {
-    if (!argType.isPrimitive() || paramType.isPrimitive()) {
+  static boolean isBoxedToSupertype(Class<?> paramType, Class<?> argType) {
+    if (!argType.isPrimitive() || paramType.isPrimitive() || paramType == Object.class) {
       return false;
     }
     Class<?> wrapper = PRIMITIVE_TO_WRAPPER.get(argType);
-    return wrapper != null && paramType.isAssignableFrom(wrapper);
+    return wrapper != null && wrapper != paramType && paramType.isAssignableFrom(wrapper);
+  }
+
+  /** Whether matching these arguments needs {@link #isBoxedToSupertype} for any of them. */
+  private static boolean needsBoxingToSupertype(
+      Class<?>[] paramTypes, Class<?>[] argTypes, boolean varargs) {
+    int fixed = varargs ? paramTypes.length - 1 : paramTypes.length;
+    for (int i = 0; i < fixed; i++) {
+      if (isBoxedToSupertype(paramTypes[i], argTypes[i])) return true;
+    }
+    if (!varargs) return false;
+    Class<?> arrayType = paramTypes[fixed];
+    if (argTypes.length == paramTypes.length && isAssignable(arrayType, argTypes[fixed])) {
+      return false; // the array itself, passed as it is
+    }
+    Class<?> component = arrayType.getComponentType();
+    for (int i = fixed; i < argTypes.length; i++) {
+      if (isBoxedToSupertype(component, argTypes[i])) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The methods (or constructors) that match only by {@link #isBoxedToSupertype}, kept apart and
+   * chosen from when nothing else matches. Every call that resolved before such matches were
+   * allowed resolves as it did. Among them the highest score wins, and of those one whose every
+   * parameter type is a subtype of the others'. Where there is none, Java would call the call
+   * ambiguous ({@code g(Comparable)} beside {@code g(Serializable)} for an int), and so does this,
+   * rather than take whichever one reflection happened to list first.
+   */
+  private static final class BoxedTier<T extends java.lang.reflect.Executable> {
+    private final java.util.List<T> best = new java.util.ArrayList<>();
+    private int bestScore = Integer.MIN_VALUE;
+
+    void add(T candidate, int score) {
+      if (score > bestScore) {
+        best.clear();
+        bestScore = score;
+      }
+      if (score == bestScore) {
+        best.add(candidate);
+      }
+    }
+
+    int score() {
+      return bestScore;
+    }
+
+    T choose(String name, Class<?>[] argTypes) {
+      if (best.isEmpty()) return null;
+      for (T candidate : best) {
+        boolean narrowest = true;
+        for (T other : best) {
+          if (other != candidate
+              && !atLeastAsSpecific(candidate.getParameterTypes(), other.getParameterTypes())) {
+            narrowest = false;
+            break;
+          }
+        }
+        if (narrowest) return candidate;
+      }
+      StringBuilder names = new StringBuilder();
+      for (T candidate : best) {
+        if (names.length() > 0) names.append(", ");
+        names.append(formatMethod(candidate));
+      }
+      StringBuilder args = new StringBuilder();
+      for (Class<?> type : argTypes) {
+        if (args.length() > 0) args.append(", ");
+        args.append(type.getSimpleName());
+      }
+      throw new IllegalArgumentException(
+          "Ambiguous call to "
+              + name
+              + "("
+              + args
+              + "): "
+              + names
+              + " all take the arguments once boxed, and none is more specific."
+              + " A TypeHint naming the parameter type chooses one");
+    }
+  }
+
+  /** Each parameter type of {@code a} is the same as, or a subtype of, the one of {@code b}. */
+  private static boolean atLeastAsSpecific(Class<?>[] a, Class<?>[] b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (!b[i].isAssignableFrom(a[i])) return false;
+    }
+    return true;
   }
 
   /**
@@ -745,6 +861,9 @@ public final class MethodResolver {
    *   <li>70: Boxed type widening
    *   <li>50: Specific interface/superclass match
    *   <li>10: Object parameter (least specific)
+   *   <li>15: A supertype of a primitive's wrapper (int -> Number); such methods are only compared
+   *       with each other, see {@link #isBoxedToSupertype}
+   *   <li>5, 4, 3: Python's own narrowing, then an int for a BigInteger or BigDecimal
    *   <li>0: No match
    * </ul>
    */
@@ -804,10 +923,11 @@ public final class MethodResolver {
       return 10; // Same as Object accepting reference types
     }
 
-    // A primitive boxed and the box widened (int -> Number): more specific than Object,
-    // and below every match that needs no boxing, as in Java
+    // A primitive boxed and the box widened (int -> Number). The method is chosen from apart
+    // (BoxedTier), so the score only ranks such methods among themselves. A class and an
+    // interface score the same: Java finds Number and Comparable equally specific for an int.
     if (isBoxedToSupertype(paramType, argType)) {
-      return paramType.isInterface() ? 15 : 20;
+      return 15;
     }
 
     // Object.class arg (null or untyped) to reference type
