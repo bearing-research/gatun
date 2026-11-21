@@ -370,10 +370,13 @@ class TestReflectionIsNotAWayAround:
             "enum Level { LOW;\n"
             '  static { System.setProperty("gatun.test.level", "ran"); } }\n'
             "@Retention(RetentionPolicy.RUNTIME) @interface Tag { Level value(); }\n"
-            "@Tag(Level.LOW) public class Quiet {}\n",
+            "@Tag(Level.LOW) public class Quiet {\n"
+            "  @Tag(Level.LOW) public void tagged() {} }\n",
         )
 
-        client = connect(memory="16MB", classpath=[classes])
+        # Method is allowed so that a method's annotations can be asked for
+        reflect = ["java.lang.reflect.Method"]
+        client = connect(memory="16MB", classpath=[classes], allowed_classes=reflect)
         try:
             Class = client.jvm.java.lang.Class
             with pytest.raises(JavaSecurityException, match="getEnumConstants"):
@@ -382,7 +385,9 @@ class TestReflectionIsNotAWayAround:
             for read in ("getAnnotations", "getDeclaredAnnotations"):
                 with pytest.raises(JavaSecurityException, match=read):
                     getattr(quiet, read)()
-            with pytest.raises(JavaSecurityException, match="getAnnotations"):
+            with pytest.raises(JavaSecurityException, match="member of class Quiet"):
+                quiet.getMethod("tagged").getAnnotations()
+            with pytest.raises(JavaSecurityException, match="allowed_prefixes"):
                 quiet.getPackage().getAnnotations()
             System = client.jvm.java.lang.System
             assert System.getProperty("gatun.test.noisy") is None
@@ -391,17 +396,30 @@ class TestReflectionIsNotAWayAround:
             allowed = Class.forName("java.util.ArrayList")
             assert allowed.getEnumConstants() is None
             assert len(allowed.getAnnotations()) == 0
+            assert len(allowed.getMethod("size").getAnnotations()) == 0
+            # Arrays and primitives have no initializer to run
+            strings = Class.forName("[Ljava.lang.String;")
+            assert strings.getEnumConstants() is None
+            assert len(client.jvm.java.lang.Integer.TYPE.getAnnotations()) == 0
         finally:
             client.close()
 
         # Allowed, they are what they are
         client = connect(
-            memory="16MB", classpath=[classes], allowed_classes=["Noisy", "Quiet"]
+            memory="16MB",
+            classpath=[classes],
+            allowed_classes=["Noisy", "Quiet", *reflect],
+            allowed_prefixes=["java.util"],
         )
         try:
             Class = client.jvm.java.lang.Class
             assert len(Class.forName("Noisy").getEnumConstants()) == 1
             assert len(Class.forName("Quiet").getAnnotations()) == 1
+            tagged = Class.forName("Quiet").getMethod("tagged")
+            assert len(tagged.getAnnotations()) == 1
+            # A package the prefixes cover
+            package = Class.forName("java.util.ArrayList").getPackage()
+            assert len(package.getAnnotations()) == 0
             System = client.jvm.java.lang.System
             assert System.getProperty("gatun.test.noisy") == "ran"
             assert System.getProperty("gatun.test.level") == "ran"
