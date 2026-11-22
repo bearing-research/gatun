@@ -525,6 +525,17 @@ class TestAsyncArrowTransfer:
         result = await async_client.send_arrow_table(table)
         assert "3 rows" in result
 
+    async def test_a_closed_table_cannot_be_read_back(self, async_client):
+        import pyarrow as pa
+
+        root = await async_client.arrow_to_java(pa.table({"x": [1, 2, 3]}))
+        produced = await root.slice(1, 2)
+        await produced.close()
+
+        with pytest.raises(JavaException, match="has been closed"):
+            await async_client.arrow_from_java(produced)
+        assert (await async_client.arrow_from_java(root)).num_rows == 3
+
     @pytest.mark.asyncio
     async def test_send_arrow_table_large(self, async_client):
         """Test sending a larger Arrow table."""

@@ -741,6 +741,8 @@ class TestArrow:
         # The memory it lay in went with the thread's channel, so the server
         # ended the loan: the table is closed, as after reset_payload_arena()
         assert wait_until(lambda: loan.root.getVector("n").getValueCount() == 0)
+        with pytest.raises(JavaException, match="loan has ended"):
+            shared.arrow_from_java(loan.root)
         loan.close()
         assert loan.closed
 
