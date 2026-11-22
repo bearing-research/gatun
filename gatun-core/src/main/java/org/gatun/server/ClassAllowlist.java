@@ -1,5 +1,10 @@
 package org.gatun.server;
 
+import java.lang.reflect.AnnotatedElement;
+import java.lang.reflect.Member;
+import java.lang.reflect.Parameter;
+import java.lang.reflect.RecordComponent;
+import java.lang.reflect.TypeVariable;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -86,6 +91,21 @@ final class ClassAllowlist {
           ProcessHandle.class,
           Thread.class,
           ThreadGroup.class);
+
+  // Members that run static initializers of classes the call does not name: getEnumConstants
+  // initializes the enum, and reading annotations initializes the enums their values are
+  // (AnnotationParser builds them with Enum.valueOf). Looking a class up never initializes it,
+  // so these would be the way to run one that is not allowed.
+  private static final Set<String> INITIALIZING_MEMBERS =
+      Set.of(
+          "getEnumConstants",
+          "getAnnotation",
+          "getAnnotations",
+          "getAnnotationsByType",
+          "getDeclaredAnnotation",
+          "getDeclaredAnnotations",
+          "getDeclaredAnnotationsByType",
+          "isAnnotationPresent");
 
   // Members of allowed classes that stay refused: they end the server for every session, load
   // native code, or create an object of a class that was never checked.
@@ -198,6 +218,64 @@ final class ClassAllowlist {
               + " system property.");
     }
     checkStaticMember(type.getName(), member);
+    if (target instanceof AnnotatedElement element && INITIALIZING_MEMBERS.contains(member)) {
+      checkInitializingMember(element, member);
+    }
+  }
+
+  /**
+   * A class's enum constants and annotations are for a class that is allowed; a member's,
+   * parameter's or type variable's for one whose declaring class is, and a package's for one the
+   * prefixes cover. An annotated type has no class to allow, and its annotations are read only with
+   * the list lifted.
+   */
+  private void checkInitializingMember(AnnotatedElement element, String member) {
+    if (allowAll) {
+      return;
+    }
+    Class<?> owner = ownerOf(element);
+    if (owner != null) {
+      while (owner.isArray()) {
+        owner = owner.getComponentType();
+      }
+      if (owner.isPrimitive() || isAllowed(owner.getName())) {
+        return;
+      }
+      throw new SecurityException(
+          member
+              + " on "
+              + (owner == element ? "class " : "a member of class ")
+              + owner.getName()
+              + " is not allowed: it can run the static initializers of classes that are not"
+              + " allowed. Allow the class to use it (allowed_classes, allowed_prefixes or"
+              + " allow_all).");
+    }
+    if (element instanceof Package p && isAllowed(p.getName() + ".package-info")) {
+      return;
+    }
+    throw new SecurityException(
+        member
+            + " on "
+            + (element instanceof Package p
+                ? "package " + p.getName()
+                : element.getClass().getName())
+            + " is not allowed: it can run the static initializers of classes that are not"
+            + " allowed. "
+            + (element instanceof Package
+                ? "Allow the package with allowed_prefixes, or set allow_all."
+                : "Only allow_all lifts this."));
+  }
+
+  // The class whose allowing covers an element's annotations, or null if it has none
+  private static Class<?> ownerOf(AnnotatedElement element) {
+    return switch (element) {
+      case Class<?> c -> c;
+      case Member m -> m.getDeclaringClass();
+      case Parameter p -> p.getDeclaringExecutable().getDeclaringClass();
+      case RecordComponent r -> r.getDeclaringRecord();
+      case TypeVariable<?> v -> ownerOf(v.getGenericDeclaration());
+      default -> null;
+    };
   }
 
   // The name to allow for a class whose instances are restricted, or "" if they are not. Cached
