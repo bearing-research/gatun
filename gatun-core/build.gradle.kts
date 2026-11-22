@@ -67,6 +67,11 @@ tasks {
         // classpath that has one and no Arrow. (With Arrow there, the thin JAR runs.)
         relocate("com.fasterxml.jackson", "gatun.shaded.com.fasterxml.jackson")
 
+        // Arrow's, for binary values in its JSON files, and in no signature. Under its own
+        // name it was in front of a classpath's: a library built for a newer one failed
+        // with NoSuchMethodError.
+        relocate("org.apache.commons.codec", "gatun.shaded.org.apache.commons.codec")
+
     }
 }
 
